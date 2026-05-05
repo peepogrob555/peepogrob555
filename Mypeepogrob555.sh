@@ -1,11 +1,19 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  vps-setup-complete.sh — All-in-one: 3x-ui + Full Optimization (100/100)
+#  vps-setup-complete-v2.sh — All-in-one: 3x-ui + Full Optimization (100/100)
 #  Target : Ubuntu 22.04 / 1 GB RAM / 1 vCPU / 2 users / VLESS Reality
 #  RTT    : 30–60 ms (Thai ISP → overseas)
 #
+#  v2 changes:
+#    - GRUB patch ใช้ Python แทน sed (ไม่ break quotes)
+#    - เพิ่ม Xray env tuning (GOMAXPROCS, ulimit)
+#    - เพิ่ม RAM optimization (swappiness=10, vfs_cache_pressure=50)
+#    - เพิ่ม systemd override ให้ 3x-ui ใช้ OOMScoreAdj
+#    - เพิ่ม zram swap สำหรับ 1GB RAM
+#    - ตรวจสอบ GRUB หลัง apply ได้ถูกต้อง
+#
 #  รันครั้งเดียวจบ:
-#    sudo bash vps-setup-complete.sh
+#    sudo bash vps-setup-complete-v2.sh
 # ==============================================================================
 set -euo pipefail
 
@@ -16,8 +24,8 @@ info()    { echo -e "${CYAN}[INFO]${RESET}  $*"; }
 ok()      { echo -e "${GREEN}[OK]${RESET}    $*"; }
 warn()    { echo -e "${YELLOW}[WARN]${RESET}  $*"; }
 fail()    { echo -e "${RED}[ERR]${RESET}   $*"; }
-section() { echo -e "\n${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; \
-            echo -e "${BOLD}${GREEN}  ▶ $*${RESET}"; \
+section() { echo -e "\n${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}";
+            echo -e "${BOLD}${GREEN}  ▶ $*${RESET}";
             echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"; }
 
 require_root() {
@@ -39,7 +47,8 @@ section "STEP 1 — Update System"
 
 apt update -y
 apt upgrade -y
-apt install -y ethtool curl socat cron
+apt install -y ethtool curl socat cron python3 zram-config 2>/dev/null || \
+  apt install -y ethtool curl socat cron python3
 ok "System updated"
 
 # ==============================================================================
@@ -110,6 +119,15 @@ net.ipv6.conf.all.forwarding    = 1
 # ── Security ──────────────────────────────────────────────────────────────────
 net.ipv4.conf.all.rp_filter     = 1
 net.ipv4.tcp_syncookies         = 1
+
+# ── Memory / RAM optimization ─────────────────────────────────────────────────
+# Swap ออกน้อยๆ (ใช้ zram แทน) — ลด latency spike จาก swap-to-disk
+vm.swappiness                   = 10
+# ให้ kernel reclaim page cache เร็วขึ้น → เหลือ RAM ให้ xray/3x-ui มากขึ้น
+vm.vfs_cache_pressure           = 50
+# ลด dirty page writeback lag
+vm.dirty_ratio                  = 10
+vm.dirty_background_ratio       = 5
 EOF
 
 # ── Conntrack + extra tuning ──────────────────────────────────────────────────
@@ -119,17 +137,15 @@ cat > /etc/sysctl.d/99-vps-patch.conf << 'EOF'
 # ==============================================================================
 
 # ── Conntrack Timeouts (tighter for VPN/proxy) ────────────────────────────────
-# Default ESTABLISHED = 432000s (5 days!) → wastes conntrack table entries
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 30
 net.netfilter.nf_conntrack_tcp_timeout_close_wait  = 60
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait    = 30
 
-# Conntrack table: 2 users × ~50 conns = 100 max; 8192 = 1 MB (vs default 10 MB)
+# Conntrack table: 2 users × ~50 conns = 100 max; 8192 = 1 MB
 net.netfilter.nf_conntrack_max  = 8192
 
 # ── Kernel Timer Jitter Reduction ────────────────────────────────────────────
-# NMI watchdog fires ~1s → preempts softirq → latency jitter
 kernel.nmi_watchdog             = 0
 kernel.softlockup_all_cpu_backtrace = 0
 kernel.hung_task_timeout_secs   = 0
@@ -291,45 +307,186 @@ UDEV
 ok "Coalescing udev rule written"
 
 # ==============================================================================
-# STEP 9 — GRUB: kernel cmdline parameters
+# STEP 9 — GRUB: kernel cmdline parameters (Python-based, safe)
 # ==============================================================================
-section "STEP 9 — GRUB Kernel Parameters"
+section "STEP 9 — GRUB Kernel Parameters (v2: Python-safe)"
 
 GRUB_FILE=/etc/default/grub
 
 if [[ ! -f "$GRUB_FILE" ]]; then
   warn "GRUB config not found — skipping (non-GRUB system?)"
 else
-  CURRENT_CMDLINE=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" | sed 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/\1/')
-  info "Current cmdline: $CURRENT_CMDLINE"
+  # ── ใช้ Python แทน sed เพื่อ parse quotes อย่างถูกต้อง ──────────────────────
+  PARAMS_TO_ADD='nowatchdog rcu_nocbs=0 skew_tick=1 mitigations=off'
 
-  ADDITIONS=""
-  for PARAM in "nowatchdog" "rcu_nocbs=0" "skew_tick=1"; do
-    echo "$CURRENT_CMDLINE" | grep -q "$PARAM" || ADDITIONS="$ADDITIONS $PARAM"
+  python3 << PYEOF
+import re, shutil, sys, os
+from datetime import datetime
+
+grub_file = "$GRUB_FILE"
+params_to_add = "$PARAMS_TO_ADD".split()
+
+with open(grub_file, 'r') as f:
+    content = f.read()
+
+# Find current GRUB_CMDLINE_LINUX_DEFAULT line
+pattern = r'^(GRUB_CMDLINE_LINUX_DEFAULT=)(["\'])(.*?)(\2)'
+match = re.search(pattern, content, re.MULTILINE)
+
+if not match:
+    print("[WARN] GRUB_CMDLINE_LINUX_DEFAULT not found — skipping")
+    sys.exit(0)
+
+prefix   = match.group(1)
+quote    = match.group(2)
+current  = match.group(3)
+
+print(f"[INFO] Current cmdline: {current}")
+
+# Add only missing params
+additions = [p for p in params_to_add if p.split('=')[0] not in current]
+
+if not additions:
+    print("[OK]   All GRUB params already present")
+    sys.exit(0)
+
+new_cmdline = (current.rstrip() + ' ' + ' '.join(additions)).strip()
+new_line = f'{prefix}{quote}{new_cmdline}{quote}'
+
+# Backup
+backup = f"{grub_file}.bak.{datetime.now().strftime('%Y%m%d%H%M%S')}"
+shutil.copy2(grub_file, backup)
+print(f"[INFO] Backup → {backup}")
+
+# Replace
+new_content = re.sub(pattern, new_line, content, flags=re.MULTILINE)
+with open(grub_file, 'w') as f:
+    f.write(new_content)
+
+print(f"[OK]   Added params: {' '.join(additions)}")
+print(f"[OK]   New cmdline: {new_cmdline}")
+PYEOF
+
+  # ── อัพเดท GRUB ──────────────────────────────────────────────────────────────
+  if command -v update-grub &>/dev/null; then
+    update-grub 2>/dev/null && ok "GRUB updated via update-grub"
+  elif command -v grub2-mkconfig &>/dev/null; then
+    grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null && ok "GRUB updated via grub2-mkconfig"
+  fi
+
+  # ── ตรวจสอบผลลัพธ์ ───────────────────────────────────────────────────────────
+  RESULT=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' "$GRUB_FILE" || echo "")
+  info "Verified GRUB line: $RESULT"
+
+  # ตรวจ params แต่ละตัว
+  ALL_OK=true
+  for PARAM in nowatchdog rcu_nocbs skew_tick mitigations; do
+    if echo "$RESULT" | grep -q "$PARAM"; then
+      ok "  ✓ $PARAM present"
+    else
+      warn "  ✗ $PARAM MISSING — check $GRUB_FILE manually"
+      ALL_OK=false
+    fi
   done
 
-  # mitigations=off — auto-apply (safe for single-tenant VPS)
-  # Comment out the block below if you want to skip this
-  if ! echo "$CURRENT_CMDLINE" | grep -q "mitigations"; then
-    warn "mitigations=off: disables Spectre/Meltdown guards → +3-8% CPU"
-    warn "Safe for single-tenant VPS. Remove from GRUB if unsure."
-    ADDITIONS="$ADDITIONS mitigations=off"
-  fi
+  $ALL_OK && ok "GRUB: all params verified ✓" || warn "GRUB: some params missing — see above"
+fi
 
-  if [[ -n "$ADDITIONS" ]]; then
-    cp "$GRUB_FILE" "${GRUB_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-    NEW_CMDLINE="${CURRENT_CMDLINE}${ADDITIONS}"
-    sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${NEW_CMDLINE}\"|" "$GRUB_FILE"
-    ok "GRUB params added:$ADDITIONS"
+# ==============================================================================
+# STEP 10 — Xray / 3x-ui Performance Tuning (NEW in v2)
+# ==============================================================================
+section "STEP 10 — Xray & 3x-ui Performance Tuning"
 
-    if command -v update-grub &>/dev/null; then
-      update-grub 2>/dev/null && ok "GRUB updated"
-    elif command -v grub2-mkconfig &>/dev/null; then
-      grub2-mkconfig -o /boot/grub2/grub.cfg 2>/dev/null && ok "GRUB2 updated"
+# ── GOMAXPROCS = 1 (single vCPU — ไม่ต้องให้ Go spawn extra threads) ──────────
+# 3x-ui ใช้ xray-core ซึ่งเป็น Go binary
+# ค่า default Go จะ detect CPU count → ถ้า VPS รายงาน host CPU มันจะ spawn เกิน
+XRAY_ENV_FILE=/etc/systemd/system/x-ui.service.d/override.conf
+mkdir -p "$(dirname "$XRAY_ENV_FILE")"
+cat > "$XRAY_ENV_FILE" << 'XRAYCONF'
+[Service]
+# ── Go runtime: 1 vCPU → 1 OS thread เพียงพอ ──────────────────────────────
+Environment=GOMAXPROCS=1
+# ── ลด GC pressure: เพิ่ม heap target → GC รันน้อยลง ──────────────────────
+Environment=GOGC=200
+# ── ulimit: เพิ่ม open files สำหรับ connections จำนวนมาก ──────────────────
+LimitNOFILE=1048576
+LimitNPROC=65536
+# ── OOM: ป้องกัน kernel kill 3x-ui ก่อน process อื่น ───────────────────────
+OOMScoreAdj=-500
+# ── Restart policy ──────────────────────────────────────────────────────────
+Restart=always
+RestartSec=3
+XRAYCONF
+
+systemctl daemon-reload
+# Reload ถ้า x-ui service มีอยู่แล้ว
+if systemctl is-active --quiet x-ui 2>/dev/null; then
+  systemctl restart x-ui && ok "x-ui restarted with new env"
+else
+  ok "x-ui override written (will apply on next start)"
+fi
+ok "Xray/3x-ui tuning applied"
+
+# ==============================================================================
+# STEP 11 — zram Swap (NEW in v2) — ลด RAM pressure แทน disk swap
+# ==============================================================================
+section "STEP 11 — zram Swap (RAM-based compressed swap)"
+
+# zram: ใช้ RAM ส่วนหนึ่งทำ compressed swap
+# → kernel จะ compress pages ที่ไม่ได้ใช้ แทนที่จะ swap ไป disk
+# → ลด latency spike จาก disk I/O, ให้ effective RAM มากขึ้น
+
+if ! grep -q "zram" /proc/modules 2>/dev/null && ! lsmod | grep -q zram 2>/dev/null; then
+  modprobe zram 2>/dev/null || warn "zram module not available — skipping"
+fi
+
+if lsmod | grep -q zram 2>/dev/null || modprobe zram 2>/dev/null; then
+  # ตั้งค่า zram: 256MB (25% ของ 1GB RAM) — เพียงพอสำหรับ 2 users
+  ZRAM_SETUP=/etc/systemd/system/zram-setup.service
+  cat > "$ZRAM_SETUP" << 'UNIT'
+[Unit]
+Description=Setup zram swap (256MB compressed)
+DefaultDependencies=no
+After=sysinit.target
+Before=swap.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash -c '\
+  modprobe zram; \
+  echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || \
+  echo lzo  > /sys/block/zram0/comp_algorithm 2>/dev/null || true; \
+  echo 268435456 > /sys/block/zram0/disksize; \
+  mkswap /dev/zram0; \
+  swapon -p 100 /dev/zram0'
+ExecStop=/bin/bash -c 'swapoff /dev/zram0 2>/dev/null || true'
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+  systemctl daemon-reload
+  systemctl enable zram-setup.service > /dev/null 2>&1
+
+  # Run now
+  bash -c '
+    modprobe zram 2>/dev/null
+    if [[ -e /sys/block/zram0 ]]; then
+      swapoff /dev/zram0 2>/dev/null || true
+      echo 1 > /sys/block/zram0/reset 2>/dev/null || true
+      echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null || \
+      echo lzo  > /sys/block/zram0/comp_algorithm 2>/dev/null || true
+      echo 268435456 > /sys/block/zram0/disksize
+      mkswap /dev/zram0 > /dev/null
+      swapon -p 100 /dev/zram0
+      echo "[OK]    zram0: 256MB compressed swap active ($(cat /sys/block/zram0/comp_algorithm))"
+    else
+      echo "[WARN]  /sys/block/zram0 not found — zram may not be available on this VPS"
     fi
-  else
-    ok "All GRUB params already present"
-  fi
+  '
+else
+  warn "zram not available on this kernel/VPS — skipping"
 fi
 
 # ==============================================================================
@@ -357,6 +514,8 @@ printf "  %-50s %s\n" "Default qdisc:" "$(sysctl -n net.core.default_qdisc 2>/de
 printf "  %-50s %s\n" "IP forwarding:" "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"
 printf "  %-50s %s\n" "tcp_autocorking:" "$(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null)"
 printf "  %-50s %s\n" "tcp_moderate_rcvbuf:" "$(sysctl -n net.ipv4.tcp_moderate_rcvbuf 2>/dev/null)"
+printf "  %-50s %s\n" "vm.swappiness:" "$(sysctl -n vm.swappiness 2>/dev/null)"
+printf "  %-50s %s\n" "vm.vfs_cache_pressure:" "$(sysctl -n vm.vfs_cache_pressure 2>/dev/null)"
 printf "  %-50s %s\n" "conntrack_max:" "$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null)"
 printf "  %-50s %s\n" "conntrack_established timeout:" "$(sysctl -n net.netfilter.nf_conntrack_tcp_timeout_established 2>/dev/null)s"
 printf "  %-50s %s\n" "nmi_watchdog:" "$(sysctl -n kernel.nmi_watchdog 2>/dev/null)"
@@ -385,6 +544,12 @@ printf "  %-50s %s\n" "BBR module:" "$(lsmod | grep bbr | awk '{print $1}' || ec
 GRUB_LINE=$(grep '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub 2>/dev/null | cut -c1-70 || echo "not found")
 printf "  %-50s %s\n" "GRUB cmdline:" "$GRUB_LINE..."
 
+ZRAM_STATUS=$(swapon --show=NAME,SIZE,PRIO 2>/dev/null | grep zram || echo "not active")
+printf "  %-50s %s\n" "zram swap:" "$ZRAM_STATUS"
+
+XRAY_ENV=$(systemctl cat x-ui 2>/dev/null | grep GOMAXPROCS || echo "override not loaded yet")
+printf "  %-50s %s\n" "Xray GOMAXPROCS:" "$XRAY_ENV"
+
 echo ""
 
 # ==============================================================================
@@ -392,28 +557,37 @@ echo ""
 # ==============================================================================
 echo ""
 echo -e "${BOLD}${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
-echo -e "${BOLD}  ✅  All done! Estimated score: 100/100${RESET}"
+echo -e "${BOLD}  ✅  All done! Estimated score: 100/100 (v2)${RESET}"
 echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}"
 echo ""
 echo -e "  ${CYAN}Applied:${RESET}"
 echo -e "  1.  System updated + packages installed"
 echo -e "  2.  3x-ui installed"
-echo -e "  3.  Sysctl: BBR + buffers + conntrack + latency tuning"
+echo -e "  3.  Sysctl: BBR + buffers + conntrack + latency + RAM tuning"
 echo -e "  4.  TC: fq priority queue (port 443 → band 1)"
 echo -e "  5.  NIC IRQ pinned to CPU 0"
 echo -e "  6.  CPU governor → performance"
 echo -e "  7.  Transparent HugePages disabled"
 echo -e "  8.  NIC rx-usecs → 20 μs"
 echo -e "  9.  GRUB: nowatchdog + rcu_nocbs + skew_tick + mitigations=off"
+echo -e "            ${GREEN}(Python-based parser — safe, verified after write)${RESET}"
+echo -e " 10.  Xray/3x-ui: GOMAXPROCS=1, GOGC=200, OOMScoreAdj=-500, ulimit"
+echo -e " 11.  zram: 256MB compressed swap (ลด RAM pressure + ไม่มี disk latency)"
 echo ""
-echo -e "  ${YELLOW}⚠  REBOOT REQUIRED for GRUB params to take effect${RESET}"
+echo -e "  ${YELLOW}⚠  REBOOT REQUIRED for GRUB params + zram to take full effect${RESET}"
 echo -e "  ${YELLOW}   All other changes are live immediately${RESET}"
 echo ""
 echo -e "  ${CYAN}After reboot, verify:${RESET}"
-echo -e "    cat /proc/cmdline"
+echo -e "    cat /proc/cmdline | grep -o 'nowatchdog\\|mitigations=off\\|skew_tick'"
 echo -e "    sysctl net.ipv4.tcp_congestion_control"
 echo -e "    tc qdisc show dev $IFACE"
-echo -e "    cat /proc/net/nf_conntrack | wc -l"
+echo -e "    swapon --show"
+echo -e "    systemctl status x-ui | grep GOMAX"
+echo ""
+echo -e "  ${CYAN}CPU 20-25% note:${RESET}"
+echo -e "    ปกติมากสำหรับ VLESS Reality 2 users"
+echo -e "    Reality ใช้ XTLS-Vision → offload TLS handshake ได้มาก"
+echo -e "    CPU จะขึ้นตาม bandwidth จริงๆ (streaming 4K จะเห็น 40-60%)"
 echo ""
 echo -e "  ${CYAN}Finished at: $(date)${RESET}"
 echo ""
