@@ -79,6 +79,20 @@ info "MTU (auto-detected) : $MTU_VAL"
 # ==============================================================================
 
 info "Installing packages..."
+
+# --- [FIX] หยุด systemd-resolved ก่อน apt install dnsmasq ---
+# apt จะ auto-start dnsmasq ทันทีหลัง install
+# ถ้า systemd-resolved ยังฟัง port 53 อยู่ → dnsmasq start failed
+# ต้อง stop ก่อน และเตรียม resolv.conf ชั่วคราว
+info "Stopping systemd-resolved before dnsmasq install..."
+systemctl stop systemd-resolved 2>/dev/null || true
+systemctl disable systemd-resolved 2>/dev/null || true
+
+# ตั้ง resolv.conf ชั่วคราวให้ใช้ Cloudflare โดยตรง
+# (ป้องกัน DNS break ระหว่างที่ dnsmasq ยังไม่พร้อม)
+rm -f /etc/resolv.conf
+echo "nameserver 1.1.1.1" > /etc/resolv.conf
+
 apt-get update -qq
 
 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
@@ -286,13 +300,16 @@ ok "nftables firewall active"
 # ==============================================================================
 # 9. DNSMASQ
 # ==============================================================================
+# หมายเหตุ: systemd-resolved ถูก stop/disable ไปแล้วใน section 1
+# ก่อน apt install dnsmasq เพื่อป้องกัน port 53 conflict
+# ==============================================================================
 
 info "Configuring dnsmasq..."
 
-systemctl stop systemd-resolved 2>/dev/null || true
-systemctl disable systemd-resolved 2>/dev/null || true
+# ตั้ง resolv.conf ให้ชี้มา 127.0.0.1 (dnsmasq local)
+# [FIX] ต้อง stop dnsmasq ก่อน chattr เพื่อให้ restart ได้หลัง config เปลี่ยน
+systemctl stop dnsmasq 2>/dev/null || true
 
-# ป้องกัน NetworkManager / DHCP overwrite resolv.conf
 rm -f /etc/resolv.conf
 cat > /etc/resolv.conf << 'RESOLV'
 nameserver 127.0.0.1
