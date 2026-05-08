@@ -7,7 +7,7 @@
 #   1 vCPU / 1 GB RAM
 #   2 users max
 #   VPS ในประเทศไทย 
-#   VMESS + WS + Port 80 (no TLS)
+#   VMESS/VLESS + WS + Port 80 (no TLS)
 #   AIS 4G/5G throttled 128 kbps
 #   speedtest host : th.speedtest.net  path : /Ais
 #
@@ -258,7 +258,7 @@ table inet filter {
         # SSH — จำกัด rate ป้องกัน brute force
         tcp dport 22 ct state new limit rate 10/minute accept
 
-        # VMESS WS
+        # VMESS/VLESS WS
         tcp dport 80 accept
 
         # x-ui web panel (เปลี่ยนได้ถ้าใช้ port อื่น)
