@@ -386,38 +386,135 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — 3X-UI
+# STEP 3 — 3X-UI  (interactive-safe)
 # ══════════════════════════════════════════════════════════════════════════════
 
 phase "3X-UI PANEL"
+step "Collect panel settings before installer runs"
+
+# ── รับค่าจากผู้ใช้ก่อนเรียก installer ────────────────────────────────────────
+# installer ของ 3x-ui มี interactive prompt (โดเมน, port, ฯลฯ)
+# เราถามเองก่อน แล้วตอบ prompt ผ่าน expect หรือ pipe อัตโนมัติ
+
+if ! "$DRY_RUN"; then
+    echo ""
+    _rule "─" "$BCYN"
+    printf "  ${BCYN}${BOLD}กรอกค่าสำหรับ 3X-UI Panel${RST}\n"
+    _rule "─" "$BCYN"
+    echo ""
+
+    # Panel port
+    while true; do
+        printf "  ${BWHT}Panel port${RST} ${DIM}(default: 2053):${RST} "
+        read -r XUI_PORT </dev/tty
+        XUI_PORT="${XUI_PORT:-2053}"
+        if [[ "$XUI_PORT" =~ ^[0-9]+$ ]] && (( XUI_PORT >= 1 && XUI_PORT <= 65535 )); then
+            break
+        fi
+        printf "  ${BRED}ต้องเป็นตัวเลข 1-65535${RST}\n"
+    done
+
+    # Panel path (web base path)
+    printf "  ${BWHT}Panel path${RST} ${DIM}(default: /):${RST} "
+    read -r XUI_PATH </dev/tty
+    XUI_PATH="${XUI_PATH:-/}"
+    # ทำให้ขึ้นต้นด้วย / เสมอ
+    [[ "$XUI_PATH" == /* ]] || XUI_PATH="/$XUI_PATH"
+
+    # Username
+    printf "  ${BWHT}Username${RST} ${DIM}(default: admin):${RST} "
+    read -r XUI_USER </dev/tty
+    XUI_USER="${XUI_USER:-admin}"
+
+    # Password (ซ่อน input)
+    while true; do
+        printf "  ${BWHT}Password${RST} ${DIM}(min 6 ตัว):${RST} "
+        read -rs XUI_PASS </dev/tty; echo ""
+        (( ${#XUI_PASS} >= 6 )) && break
+        printf "  ${BRED}รหัสผ่านสั้นเกินไป${RST}\n"
+    done
+
+    echo ""
+    printf "  ${DIM}Port  :${RST} ${BWHT}%s${RST}\n" "$XUI_PORT"
+    printf "  ${DIM}Path  :${RST} ${BWHT}%s${RST}\n" "$XUI_PATH"
+    printf "  ${DIM}User  :${RST} ${BWHT}%s${RST}\n" "$XUI_USER"
+    printf "  ${DIM}Pass  :${RST} ${BWHT}%s${RST}\n" "$(printf '%*s' ${#XUI_PASS} | tr ' ' '*')"
+    echo ""
+    printf "  ${BYLW}ยืนยันค่าข้างต้น? [Y/n]:${RST} "
+    read -r _confirm </dev/tty
+    [[ "${_confirm:-Y}" =~ ^[Yy]$ ]] || die "ยกเลิกโดยผู้ใช้ — รันใหม่เพื่อกรอกค่าอีกครั้ง"
+    _rule "─" "$DIM"
+    echo ""
+else
+    XUI_PORT=2053; XUI_PATH="/"; XUI_USER="admin"; XUI_PASS="admin123"
+    info "[DRY] Panel port=$XUI_PORT path=$XUI_PATH user=$XUI_USER"
+fi
+
 step "Install / update 3x-ui"
 
 if "$DRY_RUN"; then
     info "[DRY] bash <(curl -Ls .../install.sh)"
 else
-    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) &
-    spinner $! "3x-ui installer"
+    # ดาวน์โหลด installer ก่อน แล้วค่อยรัน foreground เต็มๆ (ไม่ background)
+    # เพื่อให้ TTY ส่งผ่านได้ปกติ — spinner ไม่ถูกใช้ที่นี่โดยตั้งใจ
+    XUI_INSTALL_SCRIPT=$(mktemp /tmp/xui-install-XXXXXX.sh)
+    curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh \
+        -o "$XUI_INSTALL_SCRIPT" 2>/dev/null \
+        || die "ดาวน์โหลด 3x-ui installer ล้มเหลว — ตรวจสอบ internet"
+    chmod +x "$XUI_INSTALL_SCRIPT"
+
+    info "กำลังรัน 3x-ui installer (foreground)..."
+    echo ""
+    bash "$XUI_INSTALL_SCRIPT"
+    rm -f "$XUI_INSTALL_SCRIPT"
 fi
 ok "3x-ui installed / updated"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — PANEL PORT
+# STEP 4 — PANEL PORT / USER / PATH (sqlite3 patch หลัง install)
 # ══════════════════════════════════════════════════════════════════════════════
 
-step "Set panel port → 2053"
+step "Apply panel settings → port:${XUI_PORT} path:${XUI_PATH} user:${XUI_USER}"
 X_UI_DB="/etc/x-ui/x-ui.db"
-if [[ -f "$X_UI_DB" ]]; then
-    run systemctl stop x-ui 2>/dev/null || true
-    if ! "$DRY_RUN"; then
-        if sqlite3 "$X_UI_DB" "SELECT key FROM settings WHERE key='webPort';" 2>/dev/null | grep -q webPort; then
-            sqlite3 "$X_UI_DB" "UPDATE settings SET value='2053' WHERE key='webPort';"
-            ok "Panel port → 2053 (sqlite3 updated)"
-        else
-            warn "webPort key not found in DB schema — set manually in panel"
-        fi
+
+if ! "$DRY_RUN"; then
+    # รอให้ x-ui สร้าง DB ถ้าเพิ่ง install ครั้งแรก (max 10 วิ)
+    for _i in $(seq 1 10); do
+        [[ -f "$X_UI_DB" ]] && break
+        sleep 1
+    done
+
+    if [[ -f "$X_UI_DB" ]]; then
+        run systemctl stop x-ui 2>/dev/null || true
+        sleep 1
+
+        # Patch settings ผ่าน sqlite3
+        _db_set() {
+            local key="$1" val="$2"
+            if sqlite3 "$X_UI_DB" "SELECT key FROM settings WHERE key='${key}';" 2>/dev/null \
+                    | grep -q "${key}"; then
+                sqlite3 "$X_UI_DB" "UPDATE settings SET value='${val}' WHERE key='${key}';"
+                ok "  DB: ${key} → ${val}"
+            else
+                # key ไม่มี → INSERT
+                sqlite3 "$X_UI_DB" "INSERT INTO settings(key,value) VALUES('${key}','${val}');" 2>/dev/null \
+                    && ok "  DB: ${key} → ${val} (inserted)" \
+                    || warn "  DB: ไม่พบ key '${key}' — ตั้งค่าใน panel เอง"
+            fi
+        }
+
+        _db_set "webPort"     "$XUI_PORT"
+        _db_set "webBasePath" "$XUI_PATH"
+        _db_set "webUsername" "$XUI_USER"
+        _db_set "webPassword" "$XUI_PASS"
+
+        run systemctl start x-ui
+        ok "Panel settings applied  [port:${XUI_PORT} · path:${XUI_PATH} · user:${XUI_USER}]"
+    else
+        warn "x-ui.db ยังไม่ถูกสร้าง — ตั้งค่า port/user ใน panel เอง"
     fi
 else
-    warn "x-ui.db not found — will be created on first run"
+    info "[DRY] sqlite3 patch: port=$XUI_PORT path=$XUI_PATH user=$XUI_USER"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
