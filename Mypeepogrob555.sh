@@ -317,22 +317,58 @@ ok "Backup saved → $BACKUP_DIR"
 phase "PACKAGES"
 step "Install dependencies"
 
+# ── Step 1a: stop resolved & set temporary resolver BEFORE touching apt ──────
 run systemctl stop systemd-resolved    2>/dev/null || true
 run systemctl disable systemd-resolved 2>/dev/null || true
 
 if ! "$DRY_RUN"; then
     chattr -i /etc/resolv.conf 2>/dev/null || true
-    if ! host -W2 cloudflare.com 1.1.1.1 &>/dev/null 2>&1; then
-        rm -f /etc/resolv.conf
-        echo "nameserver 1.1.1.1" > /etc/resolv.conf
-        info "Temporary resolver → 1.1.1.1"
-    fi
-    { apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-        curl wget ethtool dnsmasq sqlite3 jq cron socat at \
-        ca-certificates iproute2 iputils-ping nftables dnsutils; } &
-    spinner $! "apt install"
+    # Always write a known-good static resolver so apt can reach mirrors
+    rm -f /etc/resolv.conf
+    printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > /etc/resolv.conf
+    chattr +i /etc/resolv.conf 2>/dev/null || true   # pin — dnsmasq will unpin later
+    info "Temporary resolver → 1.1.1.1 / 1.0.0.1 (pinned for apt)"
+
+    # Flush any stale apt lists from a broken mirror session
+    rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
+fi
+
+# ── Step 1b: apt-get update + install ────────────────────────────────────────
+# Required packages: script will die if these are missing after install
+APT_REQUIRED="curl wget ethtool dnsmasq sqlite3 jq nftables dnsutils ca-certificates iproute2 iputils-ping"
+# Optional packages: installed if available; absence is warned, not fatal
+APT_OPTIONAL="cron socat at"
+
+if ! "$DRY_RUN"; then
+    APT_LOG=$(mktemp /tmp/ais-apt-XXXXXX.log)
+
+    # Update package index — retry once with main Ubuntu mirrors if custom mirror fails
+    { apt-get update -qq 2>&1 || \
+      { warn "apt update had errors — retrying with Ubuntu default mirrors"
+        sed -i 's|http://mirrors\.bangmod\.cloud/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
+            /etc/apt/sources.list 2>/dev/null || true
+        apt-get update -qq 2>&1; }
+    } >> "$APT_LOG" 2>&1 &
+    spinner $! "apt update"
+
+    # Install required packages — die on failure
+    { DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $APT_REQUIRED 2>&1; } \
+        >> "$APT_LOG" 2>&1 &
+    spinner $! "apt install (required)"
+    wait $! || { cat "$APT_LOG" >&2; die "apt install failed for required packages — see log above"; }
+
+    # Install optional packages — warn only
+    { DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $APT_OPTIONAL 2>&1; } \
+        >> "$APT_LOG" 2>&1 || \
+        warn "Optional packages ($APT_OPTIONAL) not fully installed — deadman timer may be unavailable"
+    rm -f "$APT_LOG"
+
+    # Verify critical binaries exist
+    for bin in nft dnsmasq sqlite3; do
+        command -v "$bin" &>/dev/null || die "Binary '$bin' not found after install — cannot continue"
+    done
 else
-    info "[DRY] apt-get install ..."
+    info "[DRY] apt-get install $APT_REQUIRED $APT_OPTIONAL"
 fi
 ok "Packages ready"
 
@@ -459,7 +495,7 @@ net.ipv4.ip_forward = 1
     echo "$SYSCTL_CONTENT" > /etc/sysctl.d/99-ais-128k.conf
 fi
 
-run sysctl --system -q
+run sysctl --system -q 2>/dev/null
 ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
 ok "sysctl applied  [CC=${ACTIVE_CC}  qdisc=${QD_CHOICE}]"
 
@@ -576,14 +612,45 @@ step "dnsmasq — resolver-safe migration"
 run systemctl stop dnsmasq 2>/dev/null || true
 
 if ! "$DRY_RUN"; then
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    [[ "$RESOLVER_MODE" == "symlink" ]] && { rm -f /etc/resolv.conf; info "Symlink broken (was → $RESOLVER_TARGET)"; }
-    printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:2\n' > /etc/resolv.conf
-    ok "resolv.conf → 127.0.0.1"
-fi
+    # Guard: dnsmasq binary must exist (apt install may have failed for optional pkgs)
+    if ! command -v dnsmasq &>/dev/null; then
+        warn "dnsmasq not installed — DNS step skipped; resolv.conf left pointing to 1.1.1.1"
+        _log WARN "dnsmasq missing — DNS phase skipped"
+    else
+        # Unpin resolv.conf that was locked during apt phase
+        chattr -i /etc/resolv.conf 2>/dev/null || true
+        # resolv.conf was already converted to static file in apt phase; just update it
+        printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:2\n' > /etc/resolv.conf
+        ok "resolv.conf → 127.0.0.1"
 
-run mkdir -p /etc/dnsmasq.d
-run bash -c "cat > /etc/dnsmasq.d/ais.conf << 'EOF'
+        mkdir -p /etc/dnsmasq.d
+        cat > /etc/dnsmasq.d/ais.conf << 'EOF'
+no-resolv
+server=1.1.1.1
+server=1.0.0.1
+cache-size=2000
+neg-ttl=30
+dns-forward-max=150
+no-poll
+bogus-priv
+domain-needed
+listen-address=127.0.0.1
+bind-interfaces
+EOF
+
+        # systemctl enable will error if unit file absent — check first
+        if systemctl list-unit-files dnsmasq.service &>/dev/null | grep -q dnsmasq; then
+            systemctl enable dnsmasq --quiet
+            systemctl restart dnsmasq
+            ok "dnsmasq ready  [127.0.0.1 → 1.1.1.1 / 1.0.0.1 · cache=2000]"
+        else
+            warn "dnsmasq.service unit not found — service not enabled (resolv.conf still → 1.1.1.1)"
+            printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > /etc/resolv.conf
+        fi
+    fi
+else
+    run mkdir -p /etc/dnsmasq.d
+    run bash -c "cat > /etc/dnsmasq.d/ais.conf << 'EOF'
 no-resolv
 server=1.1.1.1
 server=1.0.0.1
@@ -596,10 +663,10 @@ domain-needed
 listen-address=127.0.0.1
 bind-interfaces
 EOF"
-
-run systemctl enable dnsmasq --quiet
-run systemctl restart dnsmasq
-ok "dnsmasq ready  [127.0.0.1 → 1.1.1.1 / 1.0.0.1 · cache=2000]"
+    run systemctl enable dnsmasq --quiet
+    run systemctl restart dnsmasq
+    ok "dnsmasq ready  [127.0.0.1 → 1.1.1.1 / 1.0.0.1 · cache=2000]"
+fi
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 9 — ZRAM
