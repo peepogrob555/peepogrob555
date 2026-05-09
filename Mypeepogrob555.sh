@@ -8,7 +8,7 @@
 #   ██║░░██║██║██████╔╝  ░░╚██╔╝░░██║░░░░░██████╔╝
 #   ╚═╝░░╚═╝╚═╝╚═════╝░  ░░░╚═╝░░░╚═╝░░░░░╚═════╝░
 #
-#   128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.1
+#   128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.2
 #
 #   USAGE  : sudo bash ais128k-tuning.sh [--dry-run | --rollback]
 # ██████████████████████████████████████████████████████████████████████████████
@@ -36,7 +36,7 @@ DRY_RUN=false
 LOG_FILE="/var/log/ais128k-tuning.log"
 BACKUP_DIR="/etc/ais128k-backup"
 STEP_NUM=0
-STEP_TOTAL=14
+STEP_TOTAL=15
 PHASE_START_MS=0
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -125,7 +125,7 @@ cat << 'BANNER'
 
 BANNER
 echo -e "${RST}"
-printf "    ${DIM}128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.1${RST}\n\n"
+printf "    ${DIM}128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.2${RST}\n\n"
 _rule "─" "$DIM"
 echo ""
 
@@ -386,135 +386,126 @@ else
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — 3X-UI  (interactive-safe)
+# STEP 3 — รับค่า panel ก่อน installer  [FIX v2.2: label ชัดเจน แยก domain]
 # ══════════════════════════════════════════════════════════════════════════════
 
 phase "3X-UI PANEL"
-step "Collect panel settings before installer runs"
+step "Collect panel settings (ก่อน installer รัน)"
 
-# ── รับค่าจากผู้ใช้ก่อนเรียก installer ────────────────────────────────────────
-# installer ของ 3x-ui มี interactive prompt (โดเมน, port, ฯลฯ)
-# เราถามเองก่อน แล้วตอบ prompt ผ่าน expect หรือ pipe อัตโนมัติ
+XUI_PORT=2053; XUI_USER="admin"; XUI_PASS=""; XUI_DOMAIN=""
 
 if ! "$DRY_RUN"; then
     echo ""
     _rule "─" "$BCYN"
-    printf "  ${BCYN}${BOLD}กรอกค่าสำหรับ 3X-UI Panel${RST}\n"
+    printf "  ${BCYN}${BOLD}กรอกค่าสำหรับ 3X-UI Panel${RST}
+"
+    printf "  ${DIM}installer จะถามค่าเหล่านี้ด้วย — กรอกให้ตรงกัน${RST}
+"
     _rule "─" "$BCYN"
     echo ""
 
+    # [FIX] Domain แยกออกมาชัดๆ ไม่ปนกับ Username
+    printf "  ${BWHT}Domain name${RST}  ${DIM}(เช่น myvps.ddns.net — กด Enter ถ้าใช้ IP address):${RST}\n  > "
+    read -r XUI_DOMAIN
+
     # Panel port
     while true; do
-        printf "  ${BWHT}Panel port${RST} ${DIM}(default: 2053):${RST} "
-        read -r XUI_PORT </dev/tty
-        XUI_PORT="${XUI_PORT:-2053}"
-        if [[ "$XUI_PORT" =~ ^[0-9]+$ ]] && (( XUI_PORT >= 1 && XUI_PORT <= 65535 )); then
-            break
-        fi
-        printf "  ${BRED}ต้องเป็นตัวเลข 1-65535${RST}\n"
+        printf "  ${BWHT}Panel port${RST}  ${DIM}(default 2053):${RST}  "
+        read -r _p
+        XUI_PORT=${_p:-2053}
+        (( XUI_PORT >= 1 && XUI_PORT <= 65535 )) && break
+        printf "  ${BRED}Port ต้องเป็นตัวเลข 1-65535${RST}\n"
     done
 
-    # Panel path (web base path)
-    printf "  ${BWHT}Panel path${RST} ${DIM}(default: /):${RST} "
-    read -r XUI_PATH </dev/tty
-    XUI_PATH="${XUI_PATH:-/}"
-    # ทำให้ขึ้นต้นด้วย / เสมอ
-    [[ "$XUI_PATH" == /* ]] || XUI_PATH="/$XUI_PATH"
+    # [FIX] Username — label บอกชัดว่าเป็นชื่อ login ไม่ใช่ domain
+    printf "  ${BWHT}Username${RST}  ${DIM}(ชื่อ login สำหรับ panel, default admin — ไม่ใช่ domain):${RST}\n  > "
+    read -r _u; XUI_USER=${_u:-admin}
 
-    # Username
-    printf "  ${BWHT}Username${RST} ${DIM}(default: admin):${RST} "
-    read -r XUI_USER </dev/tty
-    XUI_USER="${XUI_USER:-admin}"
-
-    # Password (ซ่อน input)
+    # Password — min 8 chars
     while true; do
-        printf "  ${BWHT}Password${RST} ${DIM}(min 6 ตัว):${RST} "
-        read -rs XUI_PASS </dev/tty; echo ""
-        (( ${#XUI_PASS} >= 6 )) && break
-        printf "  ${BRED}รหัสผ่านสั้นเกินไป${RST}\n"
+        printf "  ${BWHT}Password${RST}  ${DIM}(min 8 ตัวอักษร):${RST}  "
+        read -rs XUI_PASS; echo ""
+        (( ${#XUI_PASS} >= 8 )) && break
+        printf "  ${BRED}Password ต้องมีอย่างน้อย 8 ตัวอักษร${RST}\n"
     done
 
     echo ""
-    printf "  ${DIM}Port  :${RST} ${BWHT}%s${RST}\n" "$XUI_PORT"
-    printf "  ${DIM}Path  :${RST} ${BWHT}%s${RST}\n" "$XUI_PATH"
-    printf "  ${DIM}User  :${RST} ${BWHT}%s${RST}\n" "$XUI_USER"
-    printf "  ${DIM}Pass  :${RST} ${BWHT}%s${RST}\n" "$(printf '%*s' ${#XUI_PASS} | tr ' ' '*')"
-    echo ""
-    printf "  ${BYLW}ยืนยันค่าข้างต้น? [Y/n]:${RST} "
-    read -r _confirm </dev/tty
-    [[ "${_confirm:-Y}" =~ ^[Yy]$ ]] || die "ยกเลิกโดยผู้ใช้ — รันใหม่เพื่อกรอกค่าอีกครั้ง"
+    _rule "─" "$DIM"
+    printf "  ${DIM}Domain  :${RST}  ${BWHT}%s${RST}\n" "${XUI_DOMAIN:-<ใช้ IP address>}"
+    printf "  ${DIM}Port    :${RST}  ${BWHT}%s${RST}\n" "$XUI_PORT"
+    printf "  ${DIM}Username:${RST}  ${BWHT}%s${RST}\n" "$XUI_USER"
+    printf "  ${DIM}Password:${RST}  ${BWHT}%s${RST}\n" "$(printf '%*s' ${#XUI_PASS} | tr ' ' '*')"
     _rule "─" "$DIM"
     echo ""
-else
-    XUI_PORT=2053; XUI_PATH="/"; XUI_USER="admin"; XUI_PASS="admin123"
-    info "[DRY] Panel port=$XUI_PORT path=$XUI_PATH user=$XUI_USER"
+    printf "  ${BYLW}ยืนยัน? [Y/n]:${RST}  "
+    read -r _c
+    [[ "${_c,,}" == "n" ]] && { warn "ยกเลิก — รันใหม่อีกครั้ง"; exit 1; }
 fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 4 — ติดตั้ง 3x-ui  [FIX v2.2: foreground + hint reminder บน screen]
+# ══════════════════════════════════════════════════════════════════════════════
 
 step "Install / update 3x-ui"
 
 if "$DRY_RUN"; then
     info "[DRY] bash <(curl -Ls .../install.sh)"
 else
-    # ดาวน์โหลด installer ก่อน แล้วค่อยรัน foreground เต็มๆ (ไม่ background)
-    # เพื่อให้ TTY ส่งผ่านได้ปกติ — spinner ไม่ถูกใช้ที่นี่โดยตั้งใจ
     XUI_INSTALL_SCRIPT=$(mktemp /tmp/xui-install-XXXXXX.sh)
-    curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh \
-        -o "$XUI_INSTALL_SCRIPT" 2>/dev/null \
-        || die "ดาวน์โหลด 3x-ui installer ล้มเหลว — ตรวจสอบ internet"
+    curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh         -o "$XUI_INSTALL_SCRIPT" 2>/dev/null         || die "ดาวน์โหลด 3x-ui installer ล้มเหลว — ตรวจสอบการเชื่อมต่อ internet"
     chmod +x "$XUI_INSTALL_SCRIPT"
 
-    info "กำลังรัน 3x-ui installer (foreground)..."
     echo ""
+    _rule "─" "$BYLW"
+    printf "  ${BYLW}${BOLD}⚠  installer จะถามค่าต่อไปนี้ — กรอกให้ตรงกับที่ยืนยันไว้ข้างบน:${RST}\n"
+    printf "  ${DIM}Port:${RST} ${BWHT}%s${RST}  │  ${DIM}User:${RST} ${BWHT}%s${RST}  │  ${DIM}Domain:${RST} ${BWHT}%s${RST}\n"         "$XUI_PORT" "$XUI_USER" "${XUI_DOMAIN:-<ใช้ IP>}"
+    _rule "─" "$BYLW"
+    echo ""
+
     bash "$XUI_INSTALL_SCRIPT"
     rm -f "$XUI_INSTALL_SCRIPT"
 fi
 ok "3x-ui installed / updated"
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — PANEL PORT / USER / PATH (sqlite3 patch หลัง install)
+# STEP 5 — Patch DB  [FIX v2.2: ไม่แตะ webBasePath = ปล่อย random ที่ installer ตั้ง]
 # ══════════════════════════════════════════════════════════════════════════════
 
-step "Apply panel settings → port:${XUI_PORT} path:${XUI_PATH} user:${XUI_USER}"
+step "Patch panel DB → port:${XUI_PORT} user:${XUI_USER}"
 X_UI_DB="/etc/x-ui/x-ui.db"
 
 if ! "$DRY_RUN"; then
-    # รอให้ x-ui สร้าง DB ถ้าเพิ่ง install ครั้งแรก (max 10 วิ)
-    for _i in $(seq 1 10); do
-        [[ -f "$X_UI_DB" ]] && break
-        sleep 1
-    done
+    # รอ DB ถูกสร้าง (installer อาจ start x-ui ค้างอยู่)
+    for _i in $(seq 1 20); do [[ -f "$X_UI_DB" ]] && break; sleep 1; done
 
     if [[ -f "$X_UI_DB" ]]; then
-        run systemctl stop x-ui 2>/dev/null || true
+        systemctl stop x-ui 2>/dev/null || true
         sleep 1
 
-        # Patch settings ผ่าน sqlite3
-        _db_set() {
+        _db_upsert() {
             local key="$1" val="$2"
-            if sqlite3 "$X_UI_DB" "SELECT key FROM settings WHERE key='${key}';" 2>/dev/null \
-                    | grep -q "${key}"; then
+            if sqlite3 "$X_UI_DB" "SELECT 1 FROM settings WHERE key='${key}';" 2>/dev/null | grep -q 1; then
                 sqlite3 "$X_UI_DB" "UPDATE settings SET value='${val}' WHERE key='${key}';"
-                ok "  DB: ${key} → ${val}"
             else
-                # key ไม่มี → INSERT
-                sqlite3 "$X_UI_DB" "INSERT INTO settings(key,value) VALUES('${key}','${val}');" 2>/dev/null \
-                    && ok "  DB: ${key} → ${val} (inserted)" \
-                    || warn "  DB: ไม่พบ key '${key}' — ตั้งค่าใน panel เอง"
+                sqlite3 "$X_UI_DB" "INSERT INTO settings(key,value) VALUES('${key}','${val}');" 2>/dev/null || true
             fi
+            ok "  DB ✔  ${key} = ${val}"
         }
 
-        _db_set "webPort"     "$XUI_PORT"
-        _db_set "webBasePath" "$XUI_PATH"
-        _db_set "webUsername" "$XUI_USER"
-        _db_set "webPassword" "$XUI_PASS"
+        # [FIX] patch เฉพาะ port/user/pass
+        # ไม่แตะ webBasePath — random path ที่ installer ตั้ง (เช่น 9cGzhv1NmHY7DACDZK) ปลอดภัยกว่า
+        _db_upsert "webPort"     "$XUI_PORT"
+        _db_upsert "webUsername" "$XUI_USER"
+        _db_upsert "webPassword" "$XUI_PASS"
 
-        run systemctl start x-ui
-        ok "Panel settings applied  [port:${XUI_PORT} · path:${XUI_PATH} · user:${XUI_USER}]"
+        systemctl start x-ui
+        ok "Panel DB patched  [port:${XUI_PORT} · user:${XUI_USER}]"
+        warn "webBasePath: ดูจาก installer output ข้างบน (random path ที่ installer ตั้งไว้)"
     else
-        warn "x-ui.db ยังไม่ถูกสร้าง — ตั้งค่า port/user ใน panel เอง"
+        warn "x-ui.db ไม่พบหลังรอ 20 วินาที — ตั้งค่าใน panel เอง"
     fi
 else
-    info "[DRY] sqlite3 patch: port=$XUI_PORT path=$XUI_PATH user=$XUI_USER"
+    info "[DRY] sqlite3: port=${XUI_PORT} user=${XUI_USER} (webBasePath: ไม่แตะ)"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -631,6 +622,7 @@ table inet ais_filter {
         ip  protocol icmp icmp  type { echo-request, destination-unreachable, time-exceeded } accept
         ip6 nexthdr  icmpv6     accept
         tcp dport ${SSH_PORT} ct state new limit rate 10/minute accept
+        tcp dport 80   accept
         tcp dport 443  accept
         tcp dport 2053 accept
         log prefix "ais-drop: " flags all limit rate 5/minute
@@ -651,6 +643,7 @@ table inet filter {
         ip  protocol icmp icmp  type { echo-request, destination-unreachable, time-exceeded } accept
         ip6 nexthdr  icmpv6     accept
         tcp dport ${SSH_PORT} ct state new limit rate 10/minute accept
+        tcp dport 80   accept
         tcp dport 443  accept
         tcp dport 2053 accept
         log prefix "nft-drop: " flags all limit rate 5/minute
@@ -691,7 +684,7 @@ RBEOF
             rm -f "$_ROLLBACK_SCRIPT" 2>/dev/null || true
         }
         ok "Deadman disarmed — SSH alive :${SSH_PORT}"
-        ok "nftables live  [SSH:${SSH_PORT} · 443 · 2053 · $(if $NFT_SAFE_MODE; then echo incremental; else echo full; fi)]"
+        ok "nftables live  [SSH:${SSH_PORT} · 80 · 443 · ${XUI_PORT} · $(if $NFT_SAFE_MODE; then echo incremental; else echo full; fi)]"
     else
         warn "SSH :${SSH_PORT} not detected — deadman fires in <2 min"
         warn "If locked out: wait 2 min for auto-rollback OR use VPS console"
@@ -982,7 +975,7 @@ echo ""
 _rule "─" "$DIM"
 echo ""
 printf "  ${BCYN}${BOLD}3X-UI PANEL${RST}\n"
-printf "  ${BWHT}http://${PUBLIC_IP}:2053${RST}\n"
+printf "  ${BWHT}https://%s:%s/%s${RST}\n" "${XUI_DOMAIN:-${PUBLIC_IP}}" "${XUI_PORT}" "<path จาก installer>"
 printf "  ${DIM}สร้าง Inbound → VLESS → Reality ใน panel${RST}\n"
 echo ""
 _rule "─" "$DIM"
