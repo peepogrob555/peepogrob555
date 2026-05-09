@@ -10,11 +10,6 @@
 #   ░░░░╚═╝░░░╚═╝░░░░░╚═╝░░╚══╝   ╚═╝░░╚═╝╚═╝╚═════╝░
 #
 ██████████████████████████████████████████████████████████████████████████████
-#
-#   128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.4
-#
-#   USAGE  : sudo bash ais128k-by peepogrob555.sh [--dry-run | --rollback]
-# ██████████████████████████████████████████████████████████████████████████████
 
 set -euo pipefail
 
@@ -128,7 +123,7 @@ cat << 'BANNER'
 
 BANNER
 echo -e "${RST}"
-printf "    ${DIM}128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.4${RST}\n\n"
+printf "    ${DIM}128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.5${RST}\n\n"
 _rule "─" "$DIM"
 echo ""
 
@@ -443,6 +438,78 @@ if ! "$DRY_RUN"; then
     printf "  ${BYLW}ยืนยัน? [Y/n]:${RST}  "
     read -r _c
     [[ "${_c,,}" == "n" ]] && { warn "ยกเลิก — รันใหม่อีกครั้ง"; exit 1; }
+
+    # ── Pre-flight: ตรวจ Let's Encrypt rate limit ก่อน installer รัน ────────
+    if [[ -n "${XUI_DOMAIN:-}" ]]; then
+        info "ตรวจสอบ Let's Encrypt rate limit สำหรับ ${XUI_DOMAIN} ..."
+        RL_CHECK=$(curl -s --max-time 8             "https://crt.sh/?q=${XUI_DOMAIN}&output=json" 2>/dev/null             | python3 -c "
+import sys, json, datetime
+try:
+    data = json.load(sys.stdin)
+    week_ago = datetime.datetime.utcnow() - datetime.timedelta(days=7)
+    recent = [d for d in data
+              if datetime.datetime.strptime(d['entry_timestamp'][:19],'%Y-%m-%dT%H:%M:%S') > week_ago]
+    print(len(recent))
+except:
+    print(0)
+" 2>/dev/null || echo 0)
+        RL_CHECK=${RL_CHECK:-0}
+        if (( RL_CHECK >= 5 )); then
+            echo ""
+            printf "  ${BRED}✖  RATE LIMIT DETECTED${RST}
+"
+            printf "  ${BYLW}⚠  ${XUI_DOMAIN} ออก cert ไปแล้ว %s ใบใน 7 วันที่ผ่านมา${RST}
+" "$RL_CHECK"
+            printf "  ${BYLW}   Let's Encrypt จะ block จนกว่า cert เก่าจะหมดอายุ 7 วัน${RST}
+"
+            echo ""
+            printf "  ${BCYN}เลือกวิธีรับมือ:${RST}
+"
+            printf "  ${BWHT}1)${RST} ใช้ IP cert แทน (6 วัน, auto-renew) — เหมาะถ้าไม่ได้ใช้ domain จริง
+"
+            printf "  ${BWHT}2)${RST} ข้ามการตั้ง SSL ตอนนี้ — ไปตั้งใน panel ทีหลัง
+"
+            printf "  ${BWHT}3)${RST} รันต่อไปเลย — installer จะเลือกเอง (อาจ fail)
+"
+            echo ""
+            printf "  ${BYLW}เลือก [1/2/3]:${RST}  "
+            read -r _rl
+            case "${_rl:-1}" in
+                1)
+                    warn "จะเลือก option 2 (IP cert) ใน installer — กด Enter ผ่านไป"
+                    XUI_SSL_MODE="ip"
+                    ;;
+                2)
+                    warn "จะเลือก option 3 (Custom/skip) ใน installer — ไปตั้ง SSL ใน panel ทีหลัง"
+                    XUI_SSL_MODE="skip"
+                    ;;
+                *)
+                    warn "รันต่อตามปกติ — installer อาจแสดง rate limit error"
+                    XUI_SSL_MODE="domain"
+                    ;;
+            esac
+            echo ""
+            _rule "─" "$BYLW"
+            printf "  ${BYLW}${BOLD}SSL mode ที่เลือก: %s${RST}
+" "$XUI_SSL_MODE"
+            case "$XUI_SSL_MODE" in
+                ip)   printf "  ${DIM}→ ใน installer: เลือก option 2 (IP Address)${RST}
+" ;;
+                skip) printf "  ${DIM}→ ใน installer: เลือก option 3 (Custom) แล้วกด Ctrl+C หรือกรอก path ว่าง${RST}
+" ;;
+                *)    printf "  ${DIM}→ ใน installer: เลือก option 1 (Domain) ตามปกติ${RST}
+" ;;
+            esac
+            _rule "─" "$BYLW"
+            echo ""
+        else
+            ok "Rate limit OK (${RL_CHECK}/5 cert ใน 7 วัน) — ใช้ domain cert ได้ปกติ"
+            XUI_SSL_MODE="domain"
+        fi
+    else
+        XUI_SSL_MODE="ip"
+        info "ไม่มี domain — installer จะใช้ IP cert (option 2)"
+    fi
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1004,6 +1071,7 @@ printf "          ${DIM}systemctl status x-ui dnsmasq${RST}\n"
 printf "          ${DIM}nft list ruleset · swapon --show${RST}\n"
 printf "  ${DIM}NOTE    ${RST}${DIM}'Reload error for acme.sh' = ปกติ — x-ui restart เองหลัง install${RST}\n"
 printf "          ${DIM}cert จะ renew auto ทุก 90 วัน port 80 เปิดไว้แล้ว${RST}\n"
+printf "  ${DIM}NOTE    ${RST}${DIM}rate limit (5 cert/7 วัน) → รอพรุ่งนี้ หรือเลือก IP cert (option 2) แทน${RST}\n"
 echo ""
 printf "  ${DIM}ROLLBACK  ${RST}sudo bash ais128k-tuning.sh --rollback\n"
 echo ""
