@@ -8,7 +8,7 @@
 #   ██║░░██║██║██████╔╝  ░░╚██╔╝░░██║░░░░░██████╔╝
 #   ╚═╝░░╚═╝╚═╝╚═════╝░  ░░░╚═╝░░░╚═╝░░░░░╚═════╝░
 #
-#   128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.2
+#   128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.4
 #
 #   USAGE  : sudo bash ais128k-tuning.sh [--dry-run | --rollback]
 # ██████████████████████████████████████████████████████████████████████████████
@@ -125,7 +125,7 @@ cat << 'BANNER'
 
 BANNER
 echo -e "${RST}"
-printf "    ${DIM}128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.2${RST}\n\n"
+printf "    ${DIM}128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.4${RST}\n\n"
 _rule "─" "$DIM"
 echo ""
 
@@ -583,7 +583,11 @@ net.ipv4.ip_forward = 1
     echo "$SYSCTL_CONTENT" > /etc/sysctl.d/99-ais-128k.conf
 fi
 
-run sysctl --system -q 2>/dev/null
+if "$DRY_RUN"; then
+    printf "  ${BYLW}○${RST}  ${DIM}[DRY]${RST} sysctl --system\n"
+else
+    sysctl --system 2>&1 | grep -E "^\* Applying" |         while IFS= read -r line; do printf "  ${DIM}%s${RST}\n" "$line"; done || true
+fi
 ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
 ok "sysctl applied  [CC=${ACTIVE_CC}  qdisc=${QD_CHOICE}]"
 
@@ -624,7 +628,7 @@ table inet ais_filter {
         tcp dport ${SSH_PORT} ct state new limit rate 10/minute accept
         tcp dport 80   accept
         tcp dport 443  accept
-        tcp dport 2053 accept
+        tcp dport ${XUI_PORT} accept
         log prefix "ais-drop: " flags all limit rate 5/minute
     }
     chain forward { type filter hook forward priority 1; policy accept; }
@@ -645,7 +649,7 @@ table inet filter {
         tcp dport ${SSH_PORT} ct state new limit rate 10/minute accept
         tcp dport 80   accept
         tcp dport 443  accept
-        tcp dport 2053 accept
+        tcp dport ${XUI_PORT} accept
         log prefix "nft-drop: " flags all limit rate 5/minute
         drop
     }
@@ -729,13 +733,20 @@ bind-interfaces
 EOF
 
         # systemctl enable will error if unit file absent — check first
-        if systemctl list-unit-files dnsmasq.service &>/dev/null | grep -q dnsmasq; then
+        # Reload systemd so it picks up the dnsmasq unit installed by apt
+        systemctl daemon-reload 2>/dev/null || true
+        if systemctl cat dnsmasq.service &>/dev/null; then
             systemctl enable dnsmasq --quiet
-            systemctl restart dnsmasq
-            ok "dnsmasq ready  [127.0.0.1 → 1.1.1.1 / 1.0.0.1 · cache=2000]"
+            systemctl restart dnsmasq &&                 ok "dnsmasq ready  [127.0.0.1 → 1.1.1.1 / 1.0.0.1 · cache=2000]" || {
+                warn "dnsmasq restart failed — check: journalctl -u dnsmasq -n 20"
+                printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > /etc/resolv.conf
+            }
         else
-            warn "dnsmasq.service unit not found — service not enabled (resolv.conf still → 1.1.1.1)"
-            printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > /etc/resolv.conf
+            # Unit file truly missing: reinstall dnsmasq in place
+            DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y -qq dnsmasq 2>/dev/null &&                 systemctl daemon-reload && systemctl enable dnsmasq --quiet &&                 systemctl restart dnsmasq &&                 ok "dnsmasq ready (reinstalled)  [127.0.0.1 → 1.1.1.1 / 1.0.0.1]" || {
+                warn "dnsmasq unavailable — resolv.conf → 1.1.1.1 direct"
+                printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > /etc/resolv.conf
+            }
         fi
     fi
 else
@@ -930,7 +941,7 @@ if ! "$DRY_RUN"; then
     _check "DNS resolving via dnsmasq"        "dig +short +timeout=3 google.com @127.0.0.1 | grep -qE '[0-9]'"
     _check "dnsmasq service active"           "systemctl is-active dnsmasq | grep -q '^active'"
     _check "x-ui service active"              "systemctl is-active x-ui | grep -q '^active'"
-    _check "x-ui panel :2053 listening"       "ss -ltn | grep -q ':2053'"
+    _check "x-ui panel :${XUI_PORT} listening"  "ss -ltn | grep -q ':${XUI_PORT}'"
     _check "Proxy :443 listening"             "ss -ltn | grep -q ':443'"
     _check "nftables ruleset loaded"          "nft list ruleset | grep -q 'chain'"
     _check "Congestion control (BBR/cubic)"   "sysctl -n net.ipv4.tcp_congestion_control | grep -qE 'bbr|cubic'"
@@ -975,7 +986,11 @@ echo ""
 _rule "─" "$DIM"
 echo ""
 printf "  ${BCYN}${BOLD}3X-UI PANEL${RST}\n"
-printf "  ${BWHT}https://%s:%s/%s${RST}\n" "${XUI_DOMAIN:-${PUBLIC_IP}}" "${XUI_PORT}" "<path จาก installer>"
+if [[ -n "${XUI_DOMAIN:-}" ]]; then
+    printf "  ${BWHT}https://%s:%s/<path>  ${DIM}(ดู webBasePath จาก installer output ข้างบน)${RST}\n"         "$XUI_DOMAIN" "$XUI_PORT"
+else
+    printf "  ${BWHT}https://%s:%s/<path>  ${DIM}(ดู webBasePath จาก installer output ข้างบน)${RST}\n"         "${PUBLIC_IP}" "$XUI_PORT"
+fi
 printf "  ${DIM}สร้าง Inbound → VLESS → Reality ใน panel${RST}\n"
 echo ""
 _rule "─" "$DIM"
@@ -984,6 +999,8 @@ printf "  ${DIM}VERIFY  ${RST}tc qdisc show dev ${IFACE}\n"
 printf "          ${DIM}sysctl net.ipv4.tcp_congestion_control${RST}\n"
 printf "          ${DIM}systemctl status x-ui dnsmasq${RST}\n"
 printf "          ${DIM}nft list ruleset · swapon --show${RST}\n"
+printf "  ${DIM}NOTE    ${RST}${DIM}'Reload error for acme.sh' = ปกติ — x-ui restart เองหลัง install${RST}\n"
+printf "          ${DIM}cert จะ renew auto ทุก 90 วัน port 80 เปิดไว้แล้ว${RST}\n"
 echo ""
 printf "  ${DIM}ROLLBACK  ${RST}sudo bash ais128k-tuning.sh --rollback\n"
 echo ""
