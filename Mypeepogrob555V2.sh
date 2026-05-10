@@ -8,7 +8,7 @@
 #   ██║░░██║██║██████╔╝  ░░╚██╔╝░░██║░░░░░██████╔╝
 #   ╚═╝░░╚═╝╚═╝╚═════╝░  ░░░╚═╝░░░╚═╝░░░░░╚═════╝░
 #
-#   128 kbps · Thailand VPS · VLESS Reality · Hiddify · v2.6
+#   128 kbps · Thailand VPS · VLESS Reality · Hiddify · v2.7
 #
 #   USAGE  : sudo bash ais128k-tuning.sh [--dry-run | --rollback]
 # ██████████████████████████████████████████████████████████████████████████████
@@ -125,7 +125,7 @@ cat << 'BANNER'
 
 BANNER
 echo -e "${RST}"
-printf "    ${DIM}128 kbps · Thailand VPS · VLESS Reality · Hiddify · v2.6${RST}\n\n"
+printf "    ${DIM}128 kbps · Thailand VPS · VLESS Reality · Hiddify · v2.7${RST}\n\n"
 _rule "─" "$DIM"
 echo ""
 
@@ -386,32 +386,26 @@ fi
 # STEP 3 — PIN verification ก่อนติดตั้ง Hiddify
 # ══════════════════════════════════════════════════════════════════════════════
 
+# ── helper: ถาม Y/N ก่อนทุก step ──────────────────────────────────────────
+_confirm() {
+    local msg="${1:-ดำเนินการต่อ?}"
+    printf "  ${BYLW}▶  %s [Y/n]:${RST}  " "$msg"
+    read -r _ans
+    [[ "${_ans,,}" != "n" ]]
+}
+
 phase "HIDDIFY MANAGER"
-step "PIN verification"
+step "ยืนยันก่อนติดตั้ง Hiddify"
 
 if ! "$DRY_RUN"; then
     echo ""
-    _rule "─" "$BRED"
-    printf "  ${BRED}${BOLD}🔐  ต้องยืนยัน PIN ก่อนติดตั้ง${RST}\n"
-    _rule "─" "$BRED"
+    printf "  ${BCYN}VPS นี้จะติดตั้ง Hiddify Manager${RST}\n"
+    printf "  ${DIM}IP: %s${RST}\n" "${PUBLIC_IP:-unknown}"
     echo ""
-    _ATTEMPTS=0
-    while true; do
-        printf "  ${BWHT}กรอก PIN (6 หลัก):${RST}  "
-        read -rs _PIN; echo ""
-        if [[ "$_PIN" == "270450" ]]; then
-            ok "PIN ถูกต้อง — ดำเนินการต่อ"
-            break
-        else
-            (( _ATTEMPTS++ )) || true
-            printf "  ${BRED}PIN ไม่ถูกต้อง (ครั้งที่ %d)${RST}\n" "$_ATTEMPTS"
-            if (( _ATTEMPTS >= 3 )); then
-                die "PIN ผิดเกิน 3 ครั้ง — หยุดการติดตั้ง"
-            fi
-        fi
-    done
+    _confirm "ติดตั้ง Hiddify Manager เลยไหม?" || { warn "ยกเลิก — รันใหม่อีกครั้ง"; exit 1; }
+    ok "ยืนยันแล้ว — ดำเนินการต่อ"
 else
-    info "[DRY] PIN verification skipped"
+    info "[DRY] confirm skipped"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -431,7 +425,7 @@ else
     echo ""
 
     HIDDIFY_SCRIPT=$(mktemp /tmp/hiddify-install-XXXXXX.sh)
-    curl -Ls https://raw.githubusercontent.com/hiddify/hiddify-manager/main/common/download_install.sh \
+    curl -Ls https://i.hiddify.com/release \
         -o "$HIDDIFY_SCRIPT" 2>/dev/null \
         || die "ดาวน์โหลด Hiddify installer ล้มเหลว — ตรวจสอบการเชื่อมต่อ internet"
     chmod +x "$HIDDIFY_SCRIPT"
@@ -469,7 +463,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 
 phase "KERNEL TUNING"
-step "Write sysctl (kernel-aware)"
+_confirm "ปรับ kernel sysctl?" || { warn "ข้าม kernel tuning"; } && step "Write sysctl (kernel-aware)"
 
 CC_CHOICE=$(if $CAP_BBR; then echo bbr; else echo cubic; fi)
 QD_CHOICE=$(if $CAP_FQCODEL; then echo fq_codel; else echo fq; fi)
@@ -567,7 +561,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 
 phase "FIREWALL"
-step "nftables — transactional apply"
+_confirm "ตั้ง nftables firewall?" || { warn "ข้าม firewall — SSH อาจไม่ปลอดภัย"; } && step "nftables — transactional apply"
 
 NFT_TMP=$(mktemp /tmp/nft-ais-XXXXXX.conf)
 
@@ -657,7 +651,7 @@ rm -f "$NFT_TMP"
 # ══════════════════════════════════════════════════════════════════════════════
 
 phase "DNS"
-step "dnsmasq — resolver-safe migration"
+_confirm "ตั้ง dnsmasq DNS cache?" || { warn "ข้าม DNS"; } && step "dnsmasq — resolver-safe migration"
 
 run systemctl stop dnsmasq 2>/dev/null || true
 
@@ -730,7 +724,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 
 phase "MEMORY"
-step "ZRAM compressed swap (256 MB)"
+_confirm "เปิด ZRAM swap?" || { warn "ข้าม ZRAM"; } && step "ZRAM compressed swap (256 MB)"
 
 if $CAP_ZRAM; then
     if swapon --show 2>/dev/null | grep -q zram0; then
@@ -824,7 +818,7 @@ fi
 # ══════════════════════════════════════════════════════════════════════════════
 
 phase "BOOT PERSISTENCE"
-step "ais-net.service"
+_confirm "ตั้ง boot persistence?" || { warn "ข้าม boot persistence"; } && step "ais-net.service"
 
 QDISC_CMD=$(if $CAP_FQCODEL; then
     echo "tc qdisc add dev ${IFACE} root fq_codel limit 1024 flows 1024 target 10ms interval 100ms ecn"
