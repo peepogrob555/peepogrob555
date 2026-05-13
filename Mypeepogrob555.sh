@@ -1,1083 +1,308 @@
 #!/usr/bin/env bash
-# ██████████████████████████████████████████████████████████████████████████████
-███████████████████████████████████████████████████████████████████████████████
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║              VPS SETUP SCRIPT — File 1/2                        ║
+# ║  Ubuntu 22.04 | Xver Cloud TH | VLESS Reality | 3x-ui           ║
+# ║  Author: AI-Generated for AIS 128kbps Low-Latency Profile       ║
+# ╚══════════════════════════════════════════════════════════════════╝
+# Usage:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/YOUR/REPO/main/setup.sh)
 #
-#   ░██╗░░░██╗██████╗░███╗░░██╗    ░█████╗░██╗░██████╗
-#   ░██║░░░██║██╔══██╗████╗░██║   ██╔══██╗██║██╔════╝
-#   ░╚██╗░██╔╝██████╔╝██╔██╗██║   ███████║██║╚█████╗░
-#   ░░╚████╔╝░██╔═══╝░██║╚████║   ██╔══██║██║░╚═══██╗
-#   ░░░╚██╔╝░░██║░░░░░██║░╚███║   ██║░░██║██║██████╔╝
-#   ░░░░╚═╝░░░╚═╝░░░░░╚═╝░░╚══╝   ╚═╝░░╚═╝╚═╝╚═════╝░
-#
-██████████████████████████████████████████████████████████████████████████████
+# หลังรันไฟล์นี้เสร็จ → รัน tune.sh เพื่อ optimize kernel/CAKE/BBR
 
 set -euo pipefail
 
-# ══════════════════════════════════════════════════════════════════════════════
-# TERMINAL PALETTE
-# ══════════════════════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────
+#  COLORS & HELPERS
+# ─────────────────────────────────────────
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-RST='\033[0m'; BOLD='\033[1m'; DIM='\033[2m'
-RED='\033[0;31m'; BRED='\033[1;31m'
-GRN='\033[0;32m'; BGRN='\033[1;32m'
-YLW='\033[0;33m'; BYLW='\033[1;33m'
-CYN='\033[0;36m'; BCYN='\033[1;36m'
-WHT='\033[0;37m'; BWHT='\033[1;37m'
-BG_BLK='\033[40m'; BG_YLW='\033[43m'
-BLK='\033[0;30m'
+LOG_FILE="/var/log/vps-setup.log"
+exec > >(tee -a "$LOG_FILE") 2>&1
 
-# ══════════════════════════════════════════════════════════════════════════════
-# GLOBALS
-# ══════════════════════════════════════════════════════════════════════════════
-
-DRY_RUN=false
-LOG_FILE="/var/log/ais128k-tuning.log"
-BACKUP_DIR="/etc/ais128k-backup"
-STEP_NUM=0
-STEP_TOTAL=15
-PHASE_START_MS=0
-
-# ══════════════════════════════════════════════════════════════════════════════
-# TUI ENGINE
-# ══════════════════════════════════════════════════════════════════════════════
-
-_now_ms() { date +%s%3N; }
-_log()    { echo "$(date '+%Y-%m-%d %H:%M:%S') [$1] ${*:2}" >> "$LOG_FILE" 2>/dev/null || true; }
-
-_cols()   { tput cols 2>/dev/null || echo 80; }
-
-_rule() {
-    local char="${1:--}" color="${2:-$DIM}"
-    local line; line=$(printf "%$(_cols)s" | tr ' ' "$char")
-    echo -e "${color}${line}${RST}"
+info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
+ok()      { echo -e "${GREEN}[OK]${NC}    $*"; }
+warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+err()     { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
+step()    { echo -e "\n${BOLD}${CYAN}━━━ $* ${NC}"; }
+pause()   {
+  echo -e "\n${YELLOW}▶ กด [Enter] เพื่อดำเนินการต่อ ...${NC}"
+  read -r
 }
 
-phase() {
-    PHASE_START_MS=$(_now_ms)
-    local title="$1"
-    local cols; cols=$(_cols)
-    local inner=$(( cols - 4 ))
-    local pad=$(( (inner - ${#title} - 6) / 2 ))
-    echo ""
-    _rule "═" "$BCYN"
-    printf "${BG_BLK}${BCYN}${BOLD}%${pad}s  ◈  %s  ◈  %${pad}s${RST}\n" "" "$title" ""
-    _rule "═" "$BCYN"
-    _log INFO "=== PHASE: $title ==="
-}
+# ─────────────────────────────────────────
+#  ROOT CHECK
+# ─────────────────────────────────────────
+[[ "$EUID" -ne 0 ]] && err "ต้องรันด้วย root: sudo bash setup.sh"
 
-step() {
-    (( STEP_NUM++ )) || true
-    local pct=$(( STEP_NUM * 100 / STEP_TOTAL ))
-    local filled=$(( pct * 24 / 100 ))
-    local bar="" i
-    for (( i=0; i<filled; i++ ));      do bar+="█"; done
-    for (( i=filled; i<24; i++ ));   do bar+="░"; done
-    printf "\n${BCYN}  [%02d/%02d]${RST}  ${BOLD}%s${RST}\n" "$STEP_NUM" "$STEP_TOTAL" "$1"
-    printf "          ${DIM}[${RST}${BGRN}%s${RST}${DIM}] %3d%%${RST}\n" "$bar" "$pct"
-    _log INFO "STEP $STEP_NUM/$STEP_TOTAL: $1"
-}
-
-ok() {
-    local elapsed=$(( $(_now_ms) - PHASE_START_MS ))
-    printf "  ${BGRN}✔${RST}  %-50s ${DIM}+%dms${RST}\n" "$*" "$elapsed"
-    _log OK "$*"
-}
-info() { printf "  ${BCYN}·${RST}  %s\n" "$*"; _log INFO "$*"; }
-warn() { printf "  ${BYLW}⚠${RST}  ${BYLW}%s${RST}\n" "$*"; _log WARN "$*"; }
-die()  { printf "\n  ${BRED}✖  FATAL: %s${RST}\n\n" "$*" >&2; _log FAIL "$*"; exit 1; }
-
-spinner() {
-    local pid=$1 label="${2:-working}"
-    local frames=('⠋' '⠙' '⠹' '⠸' '⠼' '⠴' '⠦' '⠧' '⠇' '⠏')
-    local i=0
-    while kill -0 "$pid" 2>/dev/null; do
-        printf "\r  ${BCYN}%s${RST}  %s..." "${frames[$((i % 10))]}" "$label"
-        (( i++ )) || true
-        sleep 0.08
-    done
-    printf "\r%-70s\r" ""
-}
-
-run() {
-    if "$DRY_RUN"; then
-        printf "  ${BYLW}○${RST}  ${DIM}[DRY]${RST} %s\n" "$*"
-        return 0
-    fi
-    "$@"
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BOOT SCREEN
-# ══════════════════════════════════════════════════════════════════════════════
-
+# ─────────────────────────────────────────
+#  BANNER
+# ─────────────────────────────────────────
 clear
-echo -e "${BCYN}"
+echo -e "${BOLD}${GREEN}"
 cat << 'BANNER'
-
-    ░█████╗░██╗░██████╗   ██╗░░░██╗██████╗░░██████╗
-    ██╔══██╗██║██╔════╝   ██║░░░██║██╔══██╗██╔════╝
-    ███████║██║╚█████╗░   ╚██╗░██╔╝██████╔╝╚█████╗░
-    ██╔══██║██║░╚═══██╗   ░╚████╔╝░██╔═══╝░░╚═══██╗
-    ██║░░██║██║██████╔╝   ░░╚██╔╝░░██║░░░░░██████╔╝
-    ╚═╝░░╚═╝╚═╝╚═════╝░   ░░░╚═╝░░░╚═╝░░░░░╚═════╝░
-
+ ██╗   ██╗██████╗ ███████╗    ███████╗███████╗████████╗██╗   ██╗██████╗ 
+ ██║   ██║██╔══██╗██╔════╝    ██╔════╝██╔════╝╚══██╔══╝██║   ██║██╔══██╗
+ ██║   ██║██████╔╝███████╗    ███████╗█████╗     ██║   ██║   ██║██████╔╝
+ ╚██╗ ██╔╝██╔═══╝ ╚════██║    ╚════██║██╔══╝     ██║   ██║   ██║██╔═══╝ 
+  ╚████╔╝ ██║     ███████║    ███████║███████╗   ██║   ╚██████╔╝██║     
+   ╚═══╝  ╚═╝     ╚══════╝    ╚══════╝╚══════╝   ╚═╝    ╚═════╝ ╚═╝     
 BANNER
-echo -e "${RST}"
-printf "    ${DIM}128 kbps · Thailand VPS · VLESS Reality · 3x-ui · v2.5${RST}\n\n"
-_rule "─" "$DIM"
+echo -e "${NC}"
+echo -e "${CYAN}  VPS Setup Script — Xver Cloud TH | VLESS Reality | Ubuntu 22.04${NC}"
+echo -e "${CYAN}  Log: $LOG_FILE${NC}"
+echo -e "  $(date)"
 echo ""
 
-[[ $EUID -eq 0 ]] || die "Run as root: sudo bash $0"
-
-touch "$LOG_FILE" 2>/dev/null || { LOG_FILE="/tmp/ais128k-tuning.log"; touch "$LOG_FILE"; }
-info "Session log → $LOG_FILE"
-sleep 0.2
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ARG PARSING
-# ══════════════════════════════════════════════════════════════════════════════
-
-case "${1:-}" in
-    --dry-run)
-        DRY_RUN=true
-        printf "\n  ${BG_YLW}${BLK}  DRY RUN — no changes will be written  ${RST}\n\n"
-        sleep 0.4
-        ;;
-    --rollback) : ;;
-    "") : ;;
-    *) die "Usage: $0 [--dry-run|--rollback]" ;;
-esac
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ROLLBACK
-# ══════════════════════════════════════════════════════════════════════════════
-
-if [[ "${1:-}" == "--rollback" ]]; then
-    phase "ROLLBACK"
-    [[ -d "$BACKUP_DIR" ]] || die "No backup at $BACKUP_DIR"
-
-    local_job=$(atq 2>/dev/null | awk '{print $1}' | head -1)
-    [[ -n "${local_job:-}" ]] && { atrm "$local_job" 2>/dev/null; ok "Deadman timer cancelled (job #$local_job)"; }
-
-    if [[ -f "$BACKUP_DIR/resolv.conf.meta" ]]; then
-        mode=$(cat "$BACKUP_DIR/resolv.conf.meta")
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        case "$mode" in
-            symlink:*)
-                target="${mode#symlink:}"
-                rm -f /etc/resolv.conf
-                ln -sf "$target" /etc/resolv.conf
-                ok "resolv.conf symlink restored → $target"
-                ;;
-            file)
-                cp "$BACKUP_DIR/resolv.conf" /etc/resolv.conf
-                ok "resolv.conf static file restored"
-                ;;
-        esac
-    fi
-
-    [[ -f "$BACKUP_DIR/nftables.conf" ]] && {
-        cp "$BACKUP_DIR/nftables.conf" /etc/nftables.conf
-        systemctl restart nftables 2>/dev/null || true
-        ok "nftables restored"
-    }
-
-    [[ -f "$BACKUP_DIR/99-ais-128k.conf" ]] && {
-        rm -f /etc/sysctl.d/99-ais-128k.conf
-        sysctl --system -q 2>/dev/null || true
-        ok "sysctl config removed"
-    }
-
-    IFACE_RB=$(ip route show default | awk '/default/ {print $5; exit}')
-    [[ -n "${IFACE_RB:-}" ]] && {
-        tc qdisc del dev "$IFACE_RB" root 2>/dev/null || true
-        ok "qdisc cleared on $IFACE_RB"
-    }
-
-    for svc in ais-net.service zram.service; do
-        systemctl disable --now "$svc" 2>/dev/null || true
-    done
-    ok "ais-net + zram services disabled"
-
-    [[ -f /etc/systemd/system/x-ui.service.d/override.conf ]] && {
-        rm -f /etc/systemd/system/x-ui.service.d/override.conf
-        systemctl daemon-reload
-        systemctl restart x-ui 2>/dev/null || true
-        ok "x-ui override removed"
-    }
-
-    echo ""
-    _rule "═" "$BGRN"
-    printf "${BGRN}${BOLD}  ROLLBACK COMPLETE${RST}  — reboot recommended\n"
-    _rule "═" "$BGRN"
-    echo ""
-    exit 0
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# ENVIRONMENT SCAN
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "ENVIRONMENT SCAN"
-
-IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
-[[ -n "$IFACE" ]] || die "Cannot detect default network interface"
-
-SSH_PORT=$(ss -tnp 2>/dev/null | awk '/sshd/ {n=split($4,a,":"); print a[n]; exit}')
-SSH_PORT=${SSH_PORT:-22}
-
-PUBLIC_IP=$(curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null \
-    || ip -4 addr show "$IFACE" | awk '/inet / {print $2}' | cut -d/ -f1)
-
-echo ""
-printf "  ${DIM}%-20s${RST}  ${BWHT}%s${RST}\n" "Interface"   "$IFACE"
-printf "  ${DIM}%-20s${RST}  ${BWHT}%s${RST}\n" "Public IP"   "${PUBLIC_IP:-unknown}"
-printf "  ${DIM}%-20s${RST}  ${BWHT}%s${RST}\n" "SSH Port"    "$SSH_PORT"
-printf "  ${DIM}%-20s${RST}  ${BWHT}%s${RST}\n" "Kernel"      "$(uname -r)"
-printf "  ${DIM}%-20s${RST}  ${BWHT}%s${RST}\n" "OS"          "$(lsb_release -ds 2>/dev/null || uname -s)"
-printf "  ${DIM}%-20s${RST}  ${BWHT}%s${RST}\n" "RAM"         "$(awk '/MemTotal/ {printf "%.0f MB", $2/1024}' /proc/meminfo)"
-printf "  ${DIM}%-20s${RST}  ${BWHT}%s${RST}\n" "vCPU"        "$(nproc) × $(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
-echo ""
-
-HAS_DOCKER=false; HAS_WIREGUARD=false; HAS_TAILSCALE=false
-systemctl is-active docker     &>/dev/null && HAS_DOCKER=true
-systemctl is-active wg-quick@* &>/dev/null && HAS_WIREGUARD=true
-systemctl is-active tailscaled &>/dev/null && HAS_TAILSCALE=true
-
-NFT_SAFE_MODE=false
-$HAS_DOCKER    && { warn "Docker detected    → nftables incremental mode"; NFT_SAFE_MODE=true; }
-$HAS_WIREGUARD && { warn "WireGuard detected → nftables incremental mode"; NFT_SAFE_MODE=true; }
-$HAS_TAILSCALE && { warn "Tailscale detected → nftables incremental mode"; NFT_SAFE_MODE=true; }
-$NFT_SAFE_MODE || info "No conflicting stacks → full nftables ruleset"
-
-if [[ -L /etc/resolv.conf ]]; then
-    RESOLVER_MODE="symlink"
-    RESOLVER_TARGET=$(readlink -f /etc/resolv.conf)
-    info "Resolver: systemd-resolved symlink → $RESOLVER_TARGET"
-else
-    RESOLVER_MODE="file"; RESOLVER_TARGET=""
-    info "Resolver: static file"
-fi
-ok "Scan complete"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# CAPABILITY PROBE
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "KERNEL CAPABILITY PROBE"
-
-CAP_BBR=false; CAP_FQCODEL=false; CAP_ZRAM=false
-
-_cap() {
-    local name="$1" cmd="$2"
-    if eval "$cmd" &>/dev/null 2>&1; then
-        printf "  ${BGRN}✔${RST}  %-22s ${BGRN}AVAILABLE${RST}\n" "$name"
-        return 0
-    else
-        printf "  ${BYLW}–${RST}  %-22s ${DIM}not supported${RST}\n" "$name"
-        return 1
-    fi
-}
-
-echo ""
-_cap "BBR"      "sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -q bbr" && CAP_BBR=true
-_cap "fq_codel" "tc qdisc add dev lo root fq_codel 2>/dev/null; tc qdisc del dev lo root 2>/dev/null" && CAP_FQCODEL=true
-_cap "ZRAM"     "modprobe -n zram" && CAP_ZRAM=true
-_cap "nftables" "command -v nft"
-echo ""
-ok "Probe complete"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# BACKUP
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "BACKUP"
-run mkdir -p "$BACKUP_DIR"
-
-if ! "$DRY_RUN"; then
-    if [[ "$RESOLVER_MODE" == "symlink" ]]; then
-        echo "symlink:$RESOLVER_TARGET" > "$BACKUP_DIR/resolv.conf.meta"
-        cp -L /etc/resolv.conf "$BACKUP_DIR/resolv.conf" 2>/dev/null || true
-    else
-        echo "file" > "$BACKUP_DIR/resolv.conf.meta"
-        cp /etc/resolv.conf "$BACKUP_DIR/resolv.conf" 2>/dev/null || true
-    fi
-fi
-
-[[ -f /etc/nftables.conf ]]             && run cp /etc/nftables.conf "$BACKUP_DIR/nftables.conf" || true
-[[ -f /etc/sysctl.d/99-ais-128k.conf ]] && run cp /etc/sysctl.d/99-ais-128k.conf "$BACKUP_DIR/99-ais-128k.conf" || true
-ok "Backup saved → $BACKUP_DIR"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — PACKAGES
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "PACKAGES"
-step "Install dependencies"
-
-# ── Step 1a: stop resolved & set temporary resolver BEFORE touching apt ──────
-run systemctl stop systemd-resolved    2>/dev/null || true
-run systemctl disable systemd-resolved 2>/dev/null || true
-
-if ! "$DRY_RUN"; then
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    # Always write a known-good static resolver so apt can reach mirrors
-    rm -f /etc/resolv.conf
-    printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > /etc/resolv.conf
-    chattr +i /etc/resolv.conf 2>/dev/null || true   # pin — dnsmasq will unpin later
-    info "Temporary resolver → 1.1.1.1 / 1.0.0.1 (pinned for apt)"
-
-    # Flush any stale apt lists from a broken mirror session
-    rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
-fi
-
-# ── Step 1b: apt-get update + install ────────────────────────────────────────
-# Required packages: script will die if these are missing after install
-APT_REQUIRED="curl wget ethtool dnsmasq sqlite3 jq nftables dnsutils ca-certificates iproute2 iputils-ping"
-# Optional packages: installed if available; absence is warned, not fatal
-APT_OPTIONAL="cron socat at"
-
-if ! "$DRY_RUN"; then
-    APT_LOG=$(mktemp /tmp/ais-apt-XXXXXX.log)
-
-    # Update package index — retry once with main Ubuntu mirrors if custom mirror fails
-    { apt-get update -qq 2>&1 || \
-      { warn "apt update had errors — retrying with Ubuntu default mirrors"
-        sed -i 's|http://mirrors\.bangmod\.cloud/ubuntu|http://archive.ubuntu.com/ubuntu|g' \
-            /etc/apt/sources.list 2>/dev/null || true
-        apt-get update -qq 2>&1; }
-    } >> "$APT_LOG" 2>&1 &
-    spinner $! "apt update"
-
-    # Install required packages — die on failure
-    { DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $APT_REQUIRED 2>&1; } \
-        >> "$APT_LOG" 2>&1 &
-    spinner $! "apt install (required)"
-    wait $! || { cat "$APT_LOG" >&2; die "apt install failed for required packages — see log above"; }
-
-    # Install optional packages — warn only
-    { DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $APT_OPTIONAL 2>&1; } \
-        >> "$APT_LOG" 2>&1 || \
-        warn "Optional packages ($APT_OPTIONAL) not fully installed — deadman timer may be unavailable"
-    rm -f "$APT_LOG"
-
-    # Verify critical binaries exist
-    for bin in nft dnsmasq sqlite3; do
-        command -v "$bin" &>/dev/null || die "Binary '$bin' not found after install — cannot continue"
-    done
-else
-    info "[DRY] apt-get install $APT_REQUIRED $APT_OPTIONAL"
-fi
-ok "Packages ready"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — HOSTNAME
-# ══════════════════════════════════════════════════════════════════════════════
-
-step "Fix hostname in /etc/hosts"
-HOSTNAME_NOW=$(hostname)
-if ! grep -qF "$HOSTNAME_NOW" /etc/hosts 2>/dev/null; then
-    run bash -c "echo '127.0.1.1 $HOSTNAME_NOW' >> /etc/hosts"
-    ok "Added: 127.0.1.1 $HOSTNAME_NOW"
-else
-    ok "Already present — skipped"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — รับค่า panel ก่อน installer  [FIX v2.2: label ชัดเจน แยก domain]
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "3X-UI PANEL"
-step "Collect panel settings (ก่อน installer รัน)"
-
-XUI_PORT=2053; XUI_USER="admin"; XUI_PASS=""; XUI_DOMAIN=""
-
-if ! "$DRY_RUN"; then
-    echo ""
-    _rule "─" "$BCYN"
-    printf "  ${BCYN}${BOLD}กรอกค่าสำหรับ 3X-UI Panel${RST}
-"
-    printf "  ${DIM}installer จะถามค่าเหล่านี้ด้วย — กรอกให้ตรงกัน${RST}
-"
-    _rule "─" "$BCYN"
-    echo ""
-
-    # [FIX] Domain แยกออกมาชัดๆ ไม่ปนกับ Username
-    printf "  ${BWHT}Domain name${RST}  ${DIM}(เช่น myvps.ddns.net — กด Enter ถ้าใช้ IP address):${RST}\n  > "
-    read -r XUI_DOMAIN
-
-    # Panel port
-    while true; do
-        printf "  ${BWHT}Panel port${RST}  ${DIM}(default 2053):${RST}  "
-        read -r _p
-        XUI_PORT=${_p:-2053}
-        (( XUI_PORT >= 1 && XUI_PORT <= 65535 )) && break
-        printf "  ${BRED}Port ต้องเป็นตัวเลข 1-65535${RST}\n"
-    done
-
-    # [FIX] Username — label บอกชัดว่าเป็นชื่อ login ไม่ใช่ domain
-    printf "  ${BWHT}Username${RST}  ${DIM}(ชื่อ login สำหรับ panel, default admin — ไม่ใช่ domain):${RST}\n  > "
-    read -r _u; XUI_USER=${_u:-admin}
-
-    # Password — min 8 chars
-    while true; do
-        printf "  ${BWHT}Password${RST}  ${DIM}(min 8 ตัวอักษร):${RST}  "
-        read -rs XUI_PASS; echo ""
-        (( ${#XUI_PASS} >= 8 )) && break
-        printf "  ${BRED}Password ต้องมีอย่างน้อย 8 ตัวอักษร${RST}\n"
-    done
-
-    echo ""
-    _rule "─" "$DIM"
-    printf "  ${DIM}Domain  :${RST}  ${BWHT}%s${RST}\n" "${XUI_DOMAIN:-<ใช้ IP address>}"
-    printf "  ${DIM}Port    :${RST}  ${BWHT}%s${RST}\n" "$XUI_PORT"
-    printf "  ${DIM}Username:${RST}  ${BWHT}%s${RST}\n" "$XUI_USER"
-    printf "  ${DIM}Password:${RST}  ${BWHT}%s${RST}\n" "$(printf '%*s' ${#XUI_PASS} | tr ' ' '*')"
-    _rule "─" "$DIM"
-    echo ""
-    printf "  ${BYLW}ยืนยัน? [Y/n]:${RST}  "
-    read -r _c
-    [[ "${_c,,}" == "n" ]] && { warn "ยกเลิก — รันใหม่อีกครั้ง"; exit 1; }
-
-    # ── Pre-flight: ตรวจ Let's Encrypt rate limit ก่อน installer รัน ────────
-    if [[ -n "${XUI_DOMAIN:-}" ]]; then
-        info "ตรวจสอบ Let's Encrypt rate limit สำหรับ ${XUI_DOMAIN} ..."
-        RL_CHECK=$(curl -s --max-time 8             "https://crt.sh/?q=${XUI_DOMAIN}&output=json" 2>/dev/null             | python3 -c "
-import sys, json, datetime
-try:
-    data = json.load(sys.stdin)
-    week_ago = datetime.datetime.utcnow() - datetime.timedelta(days=7)
-    recent = [d for d in data
-              if datetime.datetime.strptime(d['entry_timestamp'][:19],'%Y-%m-%dT%H:%M:%S') > week_ago]
-    print(len(recent))
-except:
-    print(0)
-" 2>/dev/null || echo 0)
-        RL_CHECK=${RL_CHECK:-0}
-        if (( RL_CHECK >= 5 )); then
-            echo ""
-            printf "  ${BRED}✖  RATE LIMIT DETECTED${RST}
-"
-            printf "  ${BYLW}⚠  ${XUI_DOMAIN} ออก cert ไปแล้ว %s ใบใน 7 วันที่ผ่านมา${RST}
-" "$RL_CHECK"
-            printf "  ${BYLW}   Let's Encrypt จะ block จนกว่า cert เก่าจะหมดอายุ 7 วัน${RST}
-"
-            echo ""
-            printf "  ${BCYN}เลือกวิธีรับมือ:${RST}
-"
-            printf "  ${BWHT}1)${RST} ใช้ IP cert แทน (6 วัน, auto-renew) — เหมาะถ้าไม่ได้ใช้ domain จริง
-"
-            printf "  ${BWHT}2)${RST} ข้ามการตั้ง SSL ตอนนี้ — ไปตั้งใน panel ทีหลัง
-"
-            printf "  ${BWHT}3)${RST} รันต่อไปเลย — installer จะเลือกเอง (อาจ fail)
-"
-            echo ""
-            printf "  ${BYLW}เลือก [1/2/3]:${RST}  "
-            read -r _rl
-            case "${_rl:-1}" in
-                1)
-                    warn "จะเลือก option 2 (IP cert) ใน installer — กด Enter ผ่านไป"
-                    XUI_SSL_MODE="ip"
-                    ;;
-                2)
-                    warn "จะเลือก option 3 (Custom/skip) ใน installer — ไปตั้ง SSL ใน panel ทีหลัง"
-                    XUI_SSL_MODE="skip"
-                    ;;
-                *)
-                    warn "รันต่อตามปกติ — installer อาจแสดง rate limit error"
-                    XUI_SSL_MODE="domain"
-                    ;;
-            esac
-            echo ""
-            _rule "─" "$BYLW"
-            printf "  ${BYLW}${BOLD}SSL mode ที่เลือก: %s${RST}
-" "$XUI_SSL_MODE"
-            case "$XUI_SSL_MODE" in
-                ip)   printf "  ${DIM}→ ใน installer: เลือก option 2 (IP Address)${RST}
-" ;;
-                skip) printf "  ${DIM}→ ใน installer: เลือก option 3 (Custom) แล้วกด Ctrl+C หรือกรอก path ว่าง${RST}
-" ;;
-                *)    printf "  ${DIM}→ ใน installer: เลือก option 1 (Domain) ตามปกติ${RST}
-" ;;
-            esac
-            _rule "─" "$BYLW"
-            echo ""
-        else
-            ok "Rate limit OK (${RL_CHECK}/5 cert ใน 7 วัน) — ใช้ domain cert ได้ปกติ"
-            XUI_SSL_MODE="domain"
-        fi
-    else
-        XUI_SSL_MODE="ip"
-        info "ไม่มี domain — installer จะใช้ IP cert (option 2)"
-    fi
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — ติดตั้ง 3x-ui  [FIX v2.2: foreground + hint reminder บน screen]
-# ══════════════════════════════════════════════════════════════════════════════
-
-step "Install / update 3x-ui"
-
-if "$DRY_RUN"; then
-    info "[DRY] bash <(curl -Ls .../install.sh)"
-else
-    XUI_INSTALL_SCRIPT=$(mktemp /tmp/xui-install-XXXXXX.sh)
-    curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh         -o "$XUI_INSTALL_SCRIPT" 2>/dev/null         || die "ดาวน์โหลด 3x-ui installer ล้มเหลว — ตรวจสอบการเชื่อมต่อ internet"
-    chmod +x "$XUI_INSTALL_SCRIPT"
-
-    echo ""
-    _rule "─" "$BYLW"
-    printf "  ${BYLW}${BOLD}⚠  installer จะถามค่าต่อไปนี้ — กรอกให้ตรงกับที่ยืนยันไว้ข้างบน:${RST}\n"
-    printf "  ${DIM}Port:${RST} ${BWHT}%s${RST}  │  ${DIM}User:${RST} ${BWHT}%s${RST}  │  ${DIM}Domain:${RST} ${BWHT}%s${RST}\n"         "$XUI_PORT" "$XUI_USER" "${XUI_DOMAIN:-<ใช้ IP>}"
-    _rule "─" "$BYLW"
-    echo ""
-
-    bash "$XUI_INSTALL_SCRIPT"
-    rm -f "$XUI_INSTALL_SCRIPT"
-fi
-ok "3x-ui installed / updated"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — Patch DB  [FIX v2.2: ไม่แตะ webBasePath = ปล่อย random ที่ installer ตั้ง]
-# ══════════════════════════════════════════════════════════════════════════════
-
-step "Patch panel DB → port:${XUI_PORT} user:${XUI_USER}"
-X_UI_DB="/etc/x-ui/x-ui.db"
-
-if ! "$DRY_RUN"; then
-    # รอ DB ถูกสร้าง (installer อาจ start x-ui ค้างอยู่)
-    for _i in $(seq 1 20); do [[ -f "$X_UI_DB" ]] && break; sleep 1; done
-
-    if [[ -f "$X_UI_DB" ]]; then
-        systemctl stop x-ui 2>/dev/null || true
-        sleep 1
-
-        _db_upsert() {
-            local key="$1" val="$2"
-            if sqlite3 "$X_UI_DB" "SELECT 1 FROM settings WHERE key='${key}';" 2>/dev/null | grep -q 1; then
-                sqlite3 "$X_UI_DB" "UPDATE settings SET value='${val}' WHERE key='${key}';"
-            else
-                sqlite3 "$X_UI_DB" "INSERT INTO settings(key,value) VALUES('${key}','${val}');" 2>/dev/null || true
-            fi
-            ok "  DB ✔  ${key} = ${val}"
-        }
-
-        # [FIX] patch เฉพาะ port/user/pass
-        # ไม่แตะ webBasePath — random path ที่ installer ตั้ง (เช่น 9cGzhv1NmHY7DACDZK) ปลอดภัยกว่า
-        _db_upsert "webPort"     "$XUI_PORT"
-        _db_upsert "webUsername" "$XUI_USER"
-        _db_upsert "webPassword" "$XUI_PASS"
-
-        systemctl start x-ui
-        ok "Panel DB patched  [port:${XUI_PORT} · user:${XUI_USER}]"
-        warn "webBasePath: ดูจาก installer output ข้างบน (random path ที่ installer ตั้งไว้)"
-    else
-        warn "x-ui.db ไม่พบหลังรอ 20 วินาที — ตั้งค่าใน panel เอง"
-    fi
-else
-    info "[DRY] sqlite3: port=${XUI_PORT} user=${XUI_USER} (webBasePath: ไม่แตะ)"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — SYSCTL
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "KERNEL TUNING"
-step "Write sysctl (kernel-aware)"
-
-CC_CHOICE=$(if $CAP_BBR; then echo bbr; else echo cubic; fi)
-QD_CHOICE=$(if $CAP_FQCODEL; then echo fq_codel; else echo fq; fi)
-
-if ! "$DRY_RUN"; then
-SYSCTL_CONTENT="# AIS 128kbps VPS — Low Latency Tuning
-# Generated: $(date)
-# Keys verified against running kernel
-
-# ── Congestion Control ──────────────────────────────
-net.core.default_qdisc          = ${QD_CHOICE}
-net.ipv4.tcp_congestion_control = ${CC_CHOICE}
-
-# ── TCP Buffers ─────────────────────────────────────
-net.core.rmem_max     = 16777216
-net.core.wmem_max     = 16777216
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.ipv4.tcp_rmem     = 4096 87380 16777216
-net.ipv4.tcp_wmem     = 4096 65536 16777216
-
-# ── TCP Latency ─────────────────────────────────────
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing           = 1
-net.ipv4.tcp_notsent_lowat         = 16384
-net.ipv4.tcp_autocorking           = 0
-net.ipv4.tcp_moderate_rcvbuf       = 1
-net.ipv4.tcp_sack                  = 1
-net.ipv4.tcp_timestamps            = 1
-net.ipv4.tcp_tw_reuse              = 1
-net.ipv4.tcp_rfc1337               = 1
-
-# ── Connections ─────────────────────────────────────
-net.core.somaxconn            = 4096
-net.core.netdev_max_backlog   = 4096
-net.ipv4.tcp_max_syn_backlog  = 4096
-net.ipv4.tcp_fin_timeout      = 15
-net.ipv4.tcp_keepalive_time   = 60
-net.ipv4.tcp_keepalive_intvl  = 10
-net.ipv4.tcp_keepalive_probes = 3
-
-# ── Conntrack (VPN / proxy) ─────────────────────────
-net.netfilter.nf_conntrack_max                     = 65535
-net.netfilter.nf_conntrack_tcp_timeout_established = 600
-net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 30
-
-# ── Memory (1 GB RAM) ───────────────────────────────
-vm.swappiness             = 10
-vm.vfs_cache_pressure     = 50
-vm.dirty_ratio            = 15
-vm.dirty_background_ratio = 5
-
-# ── Security ────────────────────────────────────────
-net.ipv4.tcp_syncookies              = 1
-net.ipv4.conf.all.rp_filter          = 1
-net.ipv4.conf.default.rp_filter      = 1
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-
-# ── Forwarding (proxy / VPN) ────────────────────────
-net.ipv4.ip_forward = 1
-"
-    if sysctl -n net.ipv4.tcp_fastopen &>/dev/null 2>&1; then
-        SYSCTL_CONTENT+=$'\nnet.ipv4.tcp_fastopen = 3\n'
-    else
-        warn "tcp_fastopen unavailable on this kernel — skipped"
-    fi
-    echo "$SYSCTL_CONTENT" > /etc/sysctl.d/99-ais-128k.conf
-fi
-
-if "$DRY_RUN"; then
-    printf "  ${BYLW}○${RST}  ${DIM}[DRY]${RST} sysctl --system\n"
-else
-    sysctl --system 2>&1 | grep -E "^\* Applying" |         while IFS= read -r line; do printf "  ${DIM}%s${RST}\n" "$line"; done || true
-fi
-ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
-ok "sysctl applied  [CC=${ACTIVE_CC}  qdisc=${QD_CHOICE}]"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 6 — QDISC
-# ══════════════════════════════════════════════════════════════════════════════
-
-step "Set qdisc → $QD_CHOICE"
-run tc qdisc del dev "$IFACE" root 2>/dev/null || true
-
-if $CAP_FQCODEL; then
-    run tc qdisc add dev "$IFACE" root fq_codel limit 1024 flows 1024 target 10ms interval 100ms ecn
-    ok "fq_codel  target=10ms · ecn=on · no bandwidth cap"
-else
-    run tc qdisc add dev "$IFACE" root fq limit 1024 flow_limit 100
-    warn "fq_codel unavailable → fq fallback"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 7 — NFTABLES (transactional + deadman)
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "FIREWALL"
-step "nftables — transactional apply"
-
-NFT_TMP=$(mktemp /tmp/nft-ais-XXXXXX.conf)
-
-if $NFT_SAFE_MODE; then
-    cat > "$NFT_TMP" << NFTEOF
-# AIS VPS — incremental table (Docker/WG/Tailscale preserved)
-table inet ais_filter {
-    chain input {
-        type filter hook input priority 1; policy drop;
-        iif lo accept
-        ct state established,related accept
-        ip  protocol icmp icmp  type { echo-request, destination-unreachable, time-exceeded } accept
-        ip6 nexthdr  icmpv6     accept
-        tcp dport ${SSH_PORT} ct state new limit rate 10/minute accept
-        tcp dport 80   accept
-        tcp dport 443  accept
-        tcp dport ${XUI_PORT} accept
-        log prefix "ais-drop: " flags all limit rate 5/minute
-    }
-    chain forward { type filter hook forward priority 1; policy accept; }
-    chain output  { type filter hook output  priority 1; policy accept; }
-}
-NFTEOF
-else
-    cat > "$NFT_TMP" << NFTEOF
-#!/usr/sbin/nft -f
-flush ruleset
-table inet filter {
-    chain input {
-        type filter hook input priority 0; policy drop;
-        iif lo accept
-        ct state established,related accept
-        ip  protocol icmp icmp  type { echo-request, destination-unreachable, time-exceeded } accept
-        ip6 nexthdr  icmpv6     accept
-        tcp dport ${SSH_PORT} ct state new limit rate 10/minute accept
-        tcp dport 80   accept
-        tcp dport 443  accept
-        tcp dport ${XUI_PORT} accept
-        log prefix "nft-drop: " flags all limit rate 5/minute
-        drop
-    }
-    chain forward { type filter hook forward priority 0; policy accept; }
-    chain output  { type filter hook output  priority 0; policy accept; }
-}
-NFTEOF
-fi
-
-if ! "$DRY_RUN"; then
-    nft -c -f "$NFT_TMP" 2>/dev/null || { rm -f "$NFT_TMP"; die "nftables syntax validation failed — ruleset NOT applied"; }
-    ok "Syntax validated (nft -c)"
-
-    # ── Deadman rollback ──────────────────────────────────────────────────
-    DEADMAN_JOB=""; _ROLLBACK_SCRIPT="/tmp/ais-rollback-$$.sh"
-    if command -v at &>/dev/null; then
-        cat > "$_ROLLBACK_SCRIPT" << RBEOF
-#!/bin/bash
-nft flush ruleset 2>/dev/null || true
-[[ -f "${BACKUP_DIR}/nftables.conf" ]] && nft -f "${BACKUP_DIR}/nftables.conf" 2>/dev/null || true
-rm -f "$_ROLLBACK_SCRIPT"
-RBEOF
-        chmod +x "$_ROLLBACK_SCRIPT"
-        DEADMAN_JOB=$(at now + 2 minutes < "$_ROLLBACK_SCRIPT" 2>&1 | awk '/job/ {print $2}')
-        info "Deadman armed  (at job #${DEADMAN_JOB} · fires in 2 min if SSH lost)"
-    fi
-
-    cp "$NFT_TMP" /etc/nftables.conf
-    systemctl enable nftables --quiet
-    systemctl restart nftables
-    sleep 3
-
-    if ss -ltn 2>/dev/null | grep -q ":${SSH_PORT}"; then
-        [[ -n "$DEADMAN_JOB" ]] && {
-            atrm "$DEADMAN_JOB" 2>/dev/null
-            rm -f "$_ROLLBACK_SCRIPT" 2>/dev/null || true
-        }
-        ok "Deadman disarmed — SSH alive :${SSH_PORT}"
-        ok "nftables live  [SSH:${SSH_PORT} · 80 · 443 · ${XUI_PORT} · $(if $NFT_SAFE_MODE; then echo incremental; else echo full; fi)]"
-    else
-        warn "SSH :${SSH_PORT} not detected — deadman fires in <2 min"
-        warn "If locked out: wait 2 min for auto-rollback OR use VPS console"
-    fi
-fi
-rm -f "$NFT_TMP"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 8 — DNSMASQ
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "DNS"
-step "dnsmasq — resolver-safe migration"
-
-run systemctl stop dnsmasq 2>/dev/null || true
-
-if ! "$DRY_RUN"; then
-    # Guard: dnsmasq binary must exist (apt install may have failed for optional pkgs)
-    if ! command -v dnsmasq &>/dev/null; then
-        warn "dnsmasq not installed — DNS step skipped; resolv.conf left pointing to 1.1.1.1"
-        _log WARN "dnsmasq missing — DNS phase skipped"
-    else
-        # Unpin resolv.conf that was locked during apt phase
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        # resolv.conf was already converted to static file in apt phase; just update it
-        printf 'nameserver 127.0.0.1\noptions timeout:1 attempts:2\n' > /etc/resolv.conf
-        ok "resolv.conf → 127.0.0.1"
-
-        mkdir -p /etc/dnsmasq.d
-        cat > /etc/dnsmasq.d/ais.conf << 'EOF'
-no-resolv
-server=1.1.1.1
-server=1.0.0.1
-cache-size=2000
-neg-ttl=30
-dns-forward-max=150
-no-poll
-bogus-priv
-domain-needed
-listen-address=127.0.0.1
-bind-interfaces
-EOF
-
-        # systemctl enable will error if unit file absent — check first
-        # Reload systemd so it picks up the dnsmasq unit installed by apt
-        systemctl daemon-reload 2>/dev/null || true
-        if systemctl cat dnsmasq.service &>/dev/null; then
-            systemctl enable dnsmasq --quiet
-            systemctl restart dnsmasq &&                 ok "dnsmasq ready  [127.0.0.1 → 1.1.1.1 / 1.0.0.1 · cache=2000]" || {
-                warn "dnsmasq restart failed — check: journalctl -u dnsmasq -n 20"
-                printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > /etc/resolv.conf
-            }
-        else
-            # Unit file truly missing: reinstall dnsmasq in place
-            DEBIAN_FRONTEND=noninteractive apt-get install --reinstall -y -qq dnsmasq 2>/dev/null &&                 systemctl daemon-reload && systemctl enable dnsmasq --quiet &&                 systemctl restart dnsmasq &&                 ok "dnsmasq ready (reinstalled)  [127.0.0.1 → 1.1.1.1 / 1.0.0.1]" || {
-                warn "dnsmasq unavailable — resolv.conf → 1.1.1.1 direct"
-                printf 'nameserver 1.1.1.1\nnameserver 1.0.0.1\n' > /etc/resolv.conf
-            }
-        fi
-    fi
-else
-    run mkdir -p /etc/dnsmasq.d
-    run bash -c "cat > /etc/dnsmasq.d/ais.conf << 'EOF'
-no-resolv
-server=1.1.1.1
-server=1.0.0.1
-cache-size=2000
-neg-ttl=30
-dns-forward-max=150
-no-poll
-bogus-priv
-domain-needed
-listen-address=127.0.0.1
-bind-interfaces
-EOF"
-    run systemctl enable dnsmasq --quiet
-    run systemctl restart dnsmasq
-    ok "dnsmasq ready  [127.0.0.1 → 1.1.1.1 / 1.0.0.1 · cache=2000]"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 9 — ZRAM
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "MEMORY"
-step "ZRAM compressed swap (256 MB)"
-
-if $CAP_ZRAM; then
-    if swapon --show 2>/dev/null | grep -q zram0; then
-        ok "ZRAM already active — skipped (idempotent)"
-    else
-        run modprobe zram 2>/dev/null || true
-
-        if ! "$DRY_RUN" && [[ -b /dev/zram0 ]]; then
-            swapon --show 2>/dev/null | grep -q /dev/zram0 || \
-                echo 1 > /sys/block/zram0/reset 2>/dev/null || true
-        fi
-
-        run bash -c "cat > /etc/systemd/system/zram.service << 'EOF'
-[Unit]
-Description=ZRAM compressed swap (256MB)
-After=multi-user.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/bash -c '\
-    modprobe zram 2>/dev/null || true; \
-    swapon --show 2>/dev/null | grep -q zram0 && exit 0; \
-    [[ -b /dev/zram0 ]] && echo 1 > /sys/block/zram0/reset 2>/dev/null || true; \
-    echo lz4 > /sys/block/zram0/comp_algorithm 2>/dev/null \
-        || echo lzo > /sys/block/zram0/comp_algorithm 2>/dev/null \
-        || true; \
-    echo 268435456 > /sys/block/zram0/disksize; \
-    mkswap /dev/zram0 && swapon -p 100 /dev/zram0'
-ExecStop=/bin/bash -c 'swapoff /dev/zram0 2>/dev/null || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF"
-        run systemctl daemon-reload
-        run systemctl enable zram --quiet
-        run systemctl start zram || warn "ZRAM start failed — activates on next reboot"
-        ok "ZRAM online  [256 MB · lz4/lzo · priority=100]"
-    fi
-else
-    warn "ZRAM: kernel module unavailable — skipped"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 10 — X-UI TUNING
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "X-UI / XRAY"
-step "Tune x-ui systemd unit"
-
-run mkdir -p /etc/systemd/system/x-ui.service.d
-run bash -c "cat > /etc/systemd/system/x-ui.service.d/override.conf << 'EOF'
-[Service]
-Environment=GOMAXPROCS=1
-Environment=GOGC=80
-LimitNOFILE=65536
-LimitNPROC=4096
-OOMScoreAdjust=-500
-Restart=always
-RestartSec=3
-EOF"
-
-run systemctl daemon-reload
-run systemctl enable x-ui --quiet
-run systemctl restart x-ui
-ok "x-ui tuned  [GOMAXPROCS=1 · GOGC=80 · LimitNOFILE=65536 · Restart=3s]"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 11 — THP
-# ══════════════════════════════════════════════════════════════════════════════
-
-step "Transparent HugePage → never"
-run bash -c "echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true"
-run bash -c "echo never > /sys/kernel/mm/transparent_hugepage/defrag  2>/dev/null || true"
-ok "THP disabled"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 12 — CPU GOVERNOR
-# ══════════════════════════════════════════════════════════════════════════════
-
-step "CPU governor → performance"
-if [[ -f /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor ]]; then
-    run bash -c "echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || true"
-    ok "CPU governor: performance"
-else
-    ok "CPU governor not exposed (hypervisor-managed — normal for KVM VPS)"
-fi
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 13 — BOOT PERSISTENCE
-# ══════════════════════════════════════════════════════════════════════════════
-
-phase "BOOT PERSISTENCE"
-step "ais-net.service"
-
-QDISC_CMD=$(if $CAP_FQCODEL; then
-    echo "tc qdisc add dev ${IFACE} root fq_codel limit 1024 flows 1024 target 10ms interval 100ms ecn"
-else
-    echo "tc qdisc add dev ${IFACE} root fq limit 1024 flow_limit 100"
-fi)
-
-run bash -c "cat > /etc/systemd/system/ais-net.service << EOF
-[Unit]
-Description=AIS VPS Network Tuning (qdisc + THP)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-ExecStart=/bin/bash -c 'tc qdisc del dev ${IFACE} root 2>/dev/null || true; \\
-    ${QDISC_CMD}; \\
-    echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true; \\
-    echo never > /sys/kernel/mm/transparent_hugepage/defrag  2>/dev/null || true'
-
-[Install]
-WantedBy=multi-user.target
-EOF"
-
-run systemctl daemon-reload
-run systemctl enable ais-net.service --quiet
-ok "ais-net.service enabled (survives reboot)"
-
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 14 — HOUSEKEEPING
-# ══════════════════════════════════════════════════════════════════════════════
-
-step "Housekeeping"
-run mkdir -p /etc/systemd/journald.conf.d
-run bash -c "printf '[Journal]\nSystemMaxUse=50M\nRuntimeMaxUse=20M\n' > /etc/systemd/journald.conf.d/limit.conf"
-run systemctl restart systemd-journald
-for svc in apport ufw; do
-    systemctl disable "$svc" 2>/dev/null || true
-    systemctl stop    "$svc" 2>/dev/null || true
+# ─────────────────────────────────────────
+#  STEP 0 — SYSTEM INFO SNAPSHOT
+# ─────────────────────────────────────────
+step "STEP 0 — System Snapshot"
+info "OS      : $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY | cut -d= -f2)"
+info "Kernel  : $(uname -r)"
+info "CPU     : $(nproc) core(s)"
+info "RAM     : $(free -h | awk '/^Mem:/{print $2}')"
+info "Disk    : $(df -h / | awk 'NR==2{print $4}') free"
+info "IP      : $(curl -s --max-time 5 ifconfig.me || hostname -I | awk '{print $1}')"
+info "Interface: $(ip route | grep default | awk '{print $5}' | head -1)"
+IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
+[ -z "$IFACE" ] && err "ไม่พบ default interface — ตรวจสอบ network"
+ok "Interface: $IFACE"
+
+# ─────────────────────────────────────────
+#  STEP 1 — APT UPDATE & UPGRADE
+# ─────────────────────────────────────────
+step "STEP 1 — APT Update & Upgrade"
+info "กำลัง update apt package list..."
+pause
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq && ok "apt update สำเร็จ"
+
+info "กำลัง upgrade packages (อาจใช้เวลา 1-3 นาที)..."
+apt-get upgrade -y -qq \
+  -o Dpkg::Options::="--force-confdef" \
+  -o Dpkg::Options::="--force-confold" \
+  && ok "apt upgrade สำเร็จ"
+
+apt-get autoremove -y -qq && apt-get autoclean -qq
+ok "Cleanup เสร็จ"
+
+# ─────────────────────────────────────────
+#  STEP 2 — INSTALL REQUIRED PACKAGES
+# ─────────────────────────────────────────
+step "STEP 2 — Install Required Packages"
+info "ติดตั้ง packages ที่จำเป็น..."
+pause
+
+PKGS=(
+  curl wget git unzip tar
+  ca-certificates gnupg lsb-release
+  ufw fail2ban
+  iproute2 iputils-ping
+  net-tools tcpdump
+  htop iotop iftop
+  cron logrotate
+  # CAKE/Traffic shaping
+  iproute2            # tc command
+  linux-modules-extra-$(uname -r) # CAKE, ifb modules
+  # Utilities
+  jq bc
+)
+
+for pkg in "${PKGS[@]}"; do
+  if ! dpkg -l "$pkg" &>/dev/null 2>&1; then
+    apt-get install -y -qq "$pkg" && ok "ติดตั้ง $pkg" || warn "ไม่สามารถติดตั้ง $pkg (ข้ามไป)"
+  else
+    info "$pkg — มีอยู่แล้ว"
+  fi
 done
-ok "Journal ≤50MB · apport/ufw disabled"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# HEALTH CHECKS
-# ══════════════════════════════════════════════════════════════════════════════
+# ตรวจ CAKE module
+info "ตรวจสอบ CAKE module..."
+if modprobe sch_cake 2>/dev/null; then
+  ok "CAKE module พร้อมใช้งาน"
+else
+  warn "CAKE module ไม่พบ — จะลองติดตั้ง kernel extras..."
+  apt-get install -y -qq "linux-modules-extra-$(uname -r)" 2>/dev/null || \
+    warn "ติดตั้ง kernel extras ไม่ได้ — CAKE อาจต้องการ kernel upgrade"
+fi
 
-phase "HEALTH CHECKS"
+# ตรวจ ifb module
+if modprobe ifb numifbs=1 2>/dev/null; then
+  ok "IFB module พร้อมใช้งาน"
+  ip link add ifb0 type ifb 2>/dev/null || true
+  ip link set ifb0 up 2>/dev/null || true
+else
+  warn "IFB module ไม่พบ — Ingress CAKE จะถูกข้ามใน tune.sh"
+fi
 
-FAIL_COUNT=0; PASS_COUNT=0
+# ─────────────────────────────────────────
+#  STEP 3 — SWAP (ถ้า RAM ≤ 1GB)
+# ─────────────────────────────────────────
+step "STEP 3 — Swap Setup"
+TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
+SWAP_CURRENT=$(swapon --show | wc -l)
 
-_check() {
-    local label="$1" cmd="$2"
-    local t0; t0=$(_now_ms)
-    if eval "$cmd" &>/dev/null 2>&1; then
-        printf "  ${BGRN}✔${RST}  %-42s ${DIM}%dms${RST}\n" "$label" "$(( $(_now_ms) - t0 ))"
-        (( PASS_COUNT++ )) || true
-        _log OK "HEALTH: $label"
-    else
-        printf "  ${BRED}✖${RST}  %-42s ${BRED}FAIL — verify manually${RST}\n" "$label"
-        (( FAIL_COUNT++ )) || true
-        _log WARN "HEALTH FAIL: $label"
-    fi
+if [ "$SWAP_CURRENT" -le 1 ] && [ "$TOTAL_RAM_MB" -le 1024 ]; then
+  info "RAM ${TOTAL_RAM_MB}MB และไม่มี Swap — กำลังสร้าง 512MB Swap..."
+  pause
+  fallocate -l 512M /swapfile
+  chmod 600 /swapfile
+  mkswap /swapfile -q
+  swapon /swapfile
+  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+  sysctl -w vm.swappiness=10
+  echo "vm.swappiness=10" >> /etc/sysctl.d/99-swap.conf
+  ok "Swap 512MB สร้างเสร็จ (swappiness=10)"
+else
+  info "Swap มีอยู่แล้ว หรือ RAM เพียงพอ — ข้ามขั้นตอนนี้"
+fi
+
+# ─────────────────────────────────────────
+#  STEP 4 — UFW FIREWALL
+# ─────────────────────────────────────────
+step "STEP 4 — UFW Firewall"
+info "จะตั้งค่า UFW เปิด port: 22 (SSH), 80 (HTTP/ACME), 443 (VLESS), 2053 (3x-ui)"
+info "⚠️  UFW จะ enable หลังจากตั้งค่า — SSH port 22 จะเปิดไว้เสมอ"
+pause
+
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+
+# SSH — สำคัญมาก อย่าลืม
+ufw allow 22/tcp comment "SSH"
+
+# HTTP (ACME cert / Xray fallback)
+ufw allow 80/tcp comment "HTTP-ACME"
+
+# VLESS Reality
+ufw allow 443/tcp comment "VLESS-Reality"
+ufw allow 443/udp comment "VLESS-Reality-UDP"
+
+# 3x-ui Panel
+ufw allow 2053/tcp comment "3x-ui-Panel"
+
+# Enable
+ufw --force enable
+ok "UFW เปิดใช้งาน"
+ufw status numbered
+
+# ─────────────────────────────────────────
+#  STEP 5 — FAIL2BAN (SSH protection)
+# ─────────────────────────────────────────
+step "STEP 5 — Fail2Ban"
+info "ตั้งค่า fail2ban ป้องกัน SSH brute force..."
+
+cat > /etc/fail2ban/jail.local << 'F2B'
+[DEFAULT]
+bantime  = 3600
+findtime = 600
+maxretry = 5
+ignoreip = 127.0.0.1/8
+
+[sshd]
+enabled  = true
+port     = ssh
+logpath  = %(sshd_log)s
+backend  = %(syslog_backend)s
+F2B
+
+systemctl enable fail2ban --quiet
+systemctl restart fail2ban
+ok "Fail2Ban เปิดใช้งาน"
+
+# ─────────────────────────────────────────
+#  STEP 6 — 3x-ui INSTALL
+# ─────────────────────────────────────────
+step "STEP 6 — 3x-ui Installation"
+echo ""
+echo -e "${YELLOW}┌──────────────────────────────────────────────────────┐${NC}"
+echo -e "${YELLOW}│  จะติดตั้ง 3x-ui (MHSanaei) — Official Latest        │${NC}"
+echo -e "${YELLOW}│  Source: github.com/MHSanaei/3x-ui                   │${NC}"
+echo -e "${YELLOW}│  Panel จะอยู่ที่: http://YOUR-IP:2053                 │${NC}"
+echo -e "${YELLOW}│  ระบบจะถามตั้ง username/password ระหว่างติดตั้ง       │${NC}"
+echo -e "${YELLOW}└──────────────────────────────────────────────────────┘${NC}"
+echo ""
+echo -e "${BOLD}ติดตั้ง 3x-ui ไหม?${NC}"
+echo -e "  [Enter]  = ใช่ ติดตั้งเลย"
+echo -e "  [Ctrl+C] = ออกจาก script"
+echo ""
+read -rp "▶ กด Enter เพื่อติดตั้ง 3x-ui: "
+
+info "กำลังดาวน์โหลดและติดตั้ง 3x-ui..."
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) || \
+  err "ติดตั้ง 3x-ui ไม่สำเร็จ — ตรวจสอบ internet connection"
+
+ok "3x-ui ติดตั้งสำเร็จ"
+
+# รอให้ service start
+sleep 3
+if systemctl is-active --quiet x-ui; then
+  ok "x-ui service กำลังทำงาน"
+else
+  warn "x-ui service ยังไม่ start — ลอง: systemctl start x-ui"
+fi
+
+# ─────────────────────────────────────────
+#  STEP 7 — LOGROTATE
+# ─────────────────────────────────────────
+step "STEP 7 — Log Rotation"
+cat > /etc/logrotate.d/vps-setup << 'LR'
+/var/log/vps-setup.log
+/var/log/vps-tune.log {
+    weekly
+    rotate 4
+    compress
+    missingok
+    notifempty
+}
+LR
+ok "Logrotate ตั้งค่าเสร็จ"
+
+# ─────────────────────────────────────────
+#  STEP 8 — PRE-CHECK สำหรับ tune.sh
+# ─────────────────────────────────────────
+step "STEP 8 — Pre-check ก่อนรัน tune.sh"
+
+echo ""
+echo -e "${BOLD}ตรวจสอบ modules ที่ tune.sh ต้องการ:${NC}"
+
+check_module() {
+  local mod="$1"
+  if modprobe "$mod" 2>/dev/null; then
+    echo -e "  ${GREEN}✅ $mod${NC}"
+  else
+    echo -e "  ${RED}❌ $mod — ไม่พบ (tune.sh จะ handle เอง)${NC}"
+  fi
 }
 
-echo ""
-if ! "$DRY_RUN"; then
-    sleep 2
-    _check "Network reachable (1.1.1.1)"     "ping -c1 -W3 1.1.1.1"
-    _check "DNS resolving via dnsmasq"        "dig +short +timeout=3 google.com @127.0.0.1 | grep -qE '[0-9]'"
-    _check "dnsmasq service active"           "systemctl is-active dnsmasq | grep -q '^active'"
-    _check "x-ui service active"              "systemctl is-active x-ui | grep -q '^active'"
-    _check "x-ui panel :${XUI_PORT} listening"  "ss -ltn | grep -q ':${XUI_PORT}'"
-    _check "Proxy :443 listening"             "ss -ltn | grep -q ':443'"
-    _check "nftables ruleset loaded"          "nft list ruleset | grep -q 'chain'"
-    _check "Congestion control (BBR/cubic)"   "sysctl -n net.ipv4.tcp_congestion_control | grep -qE 'bbr|cubic'"
-    _check "qdisc (fq_codel/fq) applied"     "tc qdisc show dev $IFACE | grep -qE 'fq_codel|fq'"
-    _check "ZRAM swap active"                 "swapon --show 2>/dev/null | grep -q zram || ! ${CAP_ZRAM}"
-else
-    info "[DRY] Health checks skipped"
-fi
-echo ""
-
-# ══════════════════════════════════════════════════════════════════════════════
-# MISSION COMPLETE
-# ══════════════════════════════════════════════════════════════════════════════
-
-ACTIVE_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)
-ACTIVE_QDISC=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1{print $2}' || echo unknown)
+check_module tcp_bbr
+check_module sch_cake
+check_module ifb
 
 echo ""
-_rule "═" "$BCYN"
-printf "${BG_BLK}${BCYN}${BOLD}%*s  ◈  MISSION COMPLETE — VPS ONLINE  ◈  %*s${RST}\n" \
-    "$(( ($(_cols) - 38) / 2 ))" "" "$(( ($(_cols) - 38) / 2 ))" ""
-_rule "═" "$BCYN"
-echo ""
+CC_AVAIL=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "unknown")
+echo -e "  CC Available: ${CYAN}$CC_AVAIL${NC}"
 
-printf "  ${DIM}%-22s${RST}  ${BWHT}%s${RST}  ${DIM}CC=%s · qdisc=%s${RST}\n" \
-    "Network" "$IFACE" "$ACTIVE_CC" "$ACTIVE_QDISC"
-printf "  ${DIM}%-22s${RST}  ${BWHT}nftables${RST}  ${DIM}SSH:%s · 443 · 2053 · %s${RST}\n" \
-    "Firewall" "$SSH_PORT" "$(if $NFT_SAFE_MODE; then echo incremental; else echo full; fi)"
-printf "  ${DIM}%-22s${RST}  ${BWHT}dnsmasq${RST}  ${DIM}127.0.0.1 → 1.1.1.1 / 1.0.0.1${RST}\n" \
-    "DNS"
-printf "  ${DIM}%-22s${RST}  ${BWHT}%s${RST}\n" \
-    "ZRAM" "$(if $CAP_ZRAM; then echo '256 MB (lz4/lzo · priority=100)'; else echo 'unavailable on this VPS'; fi)"
-printf "  ${DIM}%-22s${RST}  " "Health"
-if [[ $FAIL_COUNT -eq 0 ]]; then
-    printf "${BGRN}✔ all %d checks passed${RST}\n" "$PASS_COUNT"
-else
-    printf "${BRED}✖ %d failed · %d passed — see above${RST}\n" "$FAIL_COUNT" "$PASS_COUNT"
-fi
-printf "  ${DIM}%-22s${RST}  ${DIM}%s${RST}\n" "Log" "$LOG_FILE"
+# ─────────────────────────────────────────
+#  COMPLETE SUMMARY
+# ─────────────────────────────────────────
+VPS_IP=$(curl -s --max-time 5 ifconfig.me || hostname -I | awk '{print $1}')
 
 echo ""
-_rule "─" "$DIM"
-echo ""
-printf "  ${BCYN}${BOLD}3X-UI PANEL${RST}\n"
-if [[ -n "${XUI_DOMAIN:-}" ]]; then
-    printf "  ${BWHT}https://%s:%s/<path>  ${DIM}(ดู webBasePath จาก installer output ข้างบน)${RST}\n"         "$XUI_DOMAIN" "$XUI_PORT"
-else
-    printf "  ${BWHT}https://%s:%s/<path>  ${DIM}(ดู webBasePath จาก installer output ข้างบน)${RST}\n"         "${PUBLIC_IP}" "$XUI_PORT"
-fi
-printf "  ${DIM}สร้าง Inbound → VLESS → Reality ใน panel${RST}\n"
-echo ""
-_rule "─" "$DIM"
-echo ""
-printf "  ${DIM}VERIFY  ${RST}tc qdisc show dev ${IFACE}\n"
-printf "          ${DIM}sysctl net.ipv4.tcp_congestion_control${RST}\n"
-printf "          ${DIM}systemctl status x-ui dnsmasq${RST}\n"
-printf "          ${DIM}nft list ruleset · swapon --show${RST}\n"
-printf "  ${DIM}NOTE    ${RST}${DIM}'Reload error for acme.sh' = ปกติ — x-ui restart เองหลัง install${RST}\n"
-printf "          ${DIM}cert จะ renew auto ทุก 90 วัน port 80 เปิดไว้แล้ว${RST}\n"
-printf "  ${DIM}NOTE    ${RST}${DIM}rate limit (5 cert/7 วัน) → รอพรุ่งนี้ หรือเลือก IP cert (option 2) แทน${RST}\n"
-echo ""
-printf "  ${DIM}ROLLBACK  ${RST}sudo bash ais128k-tuning.sh --rollback\n"
-echo ""
-_rule "─" "$DIM"
-printf "\n  ${BYLW}⚠  REBOOT เพื่อให้ sysctl + ZRAM + ais-net.service มีผลสมบูรณ์${RST}\n\n"
-_rule "═" "$BCYN"
-echo ""
-
-printf '\a'   # terminal bell
+echo -e "${GREEN}${BOLD}"
+echo "╔══════════════════════════════════════════════════════════╗"
+echo "║            ✅  SETUP COMPLETE — File 1/2                ║"
+echo "╠══════════════════════════════════════════════════════════╣"
+printf "║  3x-ui Panel  : http://%-33s║\n" "${VPS_IP}:2053"
+echo "║  Log file     : /var/log/vps-setup.log                  ║"
+echo "╠══════════════════════════════════════════════════════════╣"
+echo "║  ขั้นตอนถัดไป:                                            ║"
+echo "║  รัน tune.sh เพื่อ Optimize BBR + CAKE + Kernel          ║"
+echo "║                                                          ║"
+echo "║  bash <(curl -fsSL https://YOUR_REPO/tune.sh)           ║"
+echo "╚══════════════════════════════════════════════════════════╝"
+echo -e "${NC}"
+echo "[$(date)] Setup complete" >> "$LOG_FILE"
