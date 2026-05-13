@@ -26,17 +26,17 @@ DRY_RUN=false
 LOG_FILE="/var/log/ais128k-tuning.log"
 BACKUP_DIR="/etc/ais128k-backup"
 STEP_NUM=0
-STEP_TOTAL=12
+STEP_TOTAL=13
 PHASE_START_MS=0
 
-# ── Tuning constants — คำนวณจากสภาพเน็ตจริง ──────────────────────────────────
-# BDP = 128 kbps × 50 ms = 6 400 bytes
-# Buffer = 4× BDP ≈ 32 KB / conn  (latency-first: เล็กพอ ไม่ bloat)
+# ── Tuning constants ──────────────────────────────────────────────────────────
 CLIENT_BW_KBIT=128       # AIS uplink ของ client
-RTT_MS=50                # worst-case RTT client→VPS (4G Thailand)
-TCP_BUF_MAX=4194304      # 4 MB — รองรับหลาย session พร้อมกัน
-CAKE_TARGET_MS=5         # AQM target sojourn time
-CAKE_INTERVAL_MS=100     # AQM interval ≈ 2× RTT
+CLIENT_UP_KBIT=120       # ingress shaping client→VPS (120kbps ≈ AIS 128k จริง)
+VPS_SHAPE_MBIT=80        # egress cap VPS→client
+RTT_MS=50                # worst-case RTT 4G Thailand
+TCP_BUF_MAX=1048576      # 1 MB
+CAKE_TARGET_MS=5
+CAKE_INTERVAL_MS=100
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TUI ENGINE
@@ -254,7 +254,7 @@ ok "Scan complete"
 # ══════════════════════════════════════════════════════════════════════════════
 phase "KERNEL CAPABILITY PROBE"
 
-CAP_BBR=false; CAP_CAKE=false; CAP_ZRAM=false
+CAP_BBR=false; CAP_CAKE=false
 
 _cap() {
     local name="$1"
@@ -266,6 +266,25 @@ _cap() {
 }
 
 echo ""
+
+# ── BBR: load module ก่อน probe เสมอ ────────────────────────────────────────
+# kernel 5.15 มี BBR built-in แต่ต้อง modprobe ก่อนถึงจะขึ้น available
+# ทำทุกครั้ง — idempotent ถ้า load แล้วก็ไม่มีผลเสีย
+if ! "$DRY_RUN"; then
+    modprobe tcp_bbr 2>/dev/null && info "tcp_bbr module loaded" \
+        || warn "modprobe tcp_bbr ล้มเหลว — kernel อาจไม่รองรับ"
+
+    # persist: load tcp_bbr ทุก boot
+    if ! grep -q "tcp_bbr" /etc/modules-load.d/bbr.conf 2>/dev/null; then
+        echo "tcp_bbr" >> /etc/modules-load.d/bbr.conf
+        info "tcp_bbr → /etc/modules-load.d/bbr.conf (persist)"
+    else
+        info "tcp_bbr already in modules-load.d — skipped"
+    fi
+else
+    info "[DRY] modprobe tcp_bbr + persist /etc/modules-load.d/bbr.conf"
+fi
+
 _cap "BBR (congestion ctrl)" \
     "sysctl net.ipv4.tcp_available_congestion_control | grep -q bbr" && CAP_BBR=true
 
@@ -274,17 +293,16 @@ _cap "CAKE (qdisc)" \
     "tc qdisc add dev lo root cake 2>/dev/null; tc qdisc del dev lo root 2>/dev/null" \
     && CAP_CAKE=true
 
-_cap "ZRAM"     "modprobe -n zram"    && CAP_ZRAM=true
 _cap "nftables" "command -v nft"
 _cap "ethtool"  "command -v ethtool"
 echo ""
 
 # fallback logic
 if $CAP_CAKE; then
-    QDISC_MODE="cake"; info "CAKE ✓ — ใช้ CAKE (latency-first)"
+    QDISC_MODE="cake"; info "CAKE ✓"
 else
     QDISC_MODE="fq_codel"
-    warn "CAKE ไม่พร้อม → fallback fq_codel (ลอง: apt install iproute2)"
+    warn "CAKE ไม่พร้อม → fallback fq_codel"
 fi
 
 if $CAP_BBR; then
@@ -326,11 +344,12 @@ run systemctl stop    systemd-resolved 2>/dev/null || true
 run systemctl disable systemd-resolved 2>/dev/null || true
 
 if ! "$DRY_RUN"; then
+    # ไม่ใช้ chattr +i — ลบออกทั้งหมดตาม review
+    # เพียงแค่ unpin ก่อนแล้วเขียน temp resolver สำหรับ apt
     chattr -i /etc/resolv.conf 2>/dev/null || true
     rm -f /etc/resolv.conf
     printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /etc/resolv.conf
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-    info "Temp resolver → 1.1.1.1 / 8.8.8.8 (pinned)"
+    info "Temp resolver → 1.1.1.1 / 8.8.8.8 (ไม่ pin — dnsmasq จะดูแลทีหลัง)"
     rm -f /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null || true
 fi
 
@@ -387,41 +406,47 @@ fi
 #   • Keepalive สั้น → detect link drop เร็ว (สำคัญสำหรับ VLESS long-conn)
 #   • Retransmit เร็ว → ไม่รอนานเมื่อ 4G packet drop
 # ══════════════════════════════════════════════════════════════════════════════
-step "sysctl — latency-first (overwrite)"
+step "sysctl — latency-first · buffer@80Mbps×50ms (overwrite)"
 
 SYSCTL_FILE="/etc/sysctl.d/99-ais-128k.conf"
 
 run bash -c "cat > '$SYSCTL_FILE'" << EOF
 # ╔══════════════════════════════════════════════════════════════╗
-#  AIS 128kbps VPS · Latency-First · v3.0
+#  AIS 128kbps VPS · Latency-First · v3.1
 #  Generated : $(date '+%Y-%m-%d %H:%M:%S')
-#  BDP       : ${CLIENT_BW_KBIT}kbps × ${RTT_MS}ms = $(( CLIENT_BW_KBIT * 1000 / 8 * RTT_MS / 1000 )) bytes/conn
-#  Stack     : ${CC_MODE} + ${QDISC_MODE}
+#  BDP@cap   : ${VPS_SHAPE_MBIT}Mbps × ${RTT_MS}ms = 500 000 bytes
+#  Buffer cap: 4× BDP = 2 MB  (ping-first, ไม่ bloat)
+#  Stack     : ${CC_MODE} + ${QDISC_MODE} · cap ${VPS_SHAPE_MBIT}Mbps
 # ╚══════════════════════════════════════════════════════════════╝
 
 # ── Congestion Control ────────────────────────────────────────
 net.ipv4.tcp_congestion_control = ${CC_MODE}
 net.core.default_qdisc          = ${QDISC_MODE}
 
-# ── TCP Buffers (latency-first: cap ที่ 4MB รองรับหลาย session) ──
-# ไม่ตั้งใหญ่เกิน → ป้องกัน bufferbloat ฝั่ง VPS egress
-net.core.rmem_max               = ${TCP_BUF_MAX}
-net.core.wmem_max               = ${TCP_BUF_MAX}
+# ── TCP Buffers — conservative สำหรับ mobile + 1vCPU ────────────
+# เปิด autotuning ไว้ (moderate_rcvbuf=1) แต่ลดเพดานเหลือ 1MB
+# เหตุผล: ปิด autotuning ทำให้ TLS stall, YouTube seek กระตุก
+#          paradox: latency แย่ลงด้วยเมื่อ sender ตัน window เล็กเกิน
+net.core.rmem_max               = 1048576
+net.core.wmem_max               = 1048576
 net.core.rmem_default           = 131072
 net.core.wmem_default           = 131072
-net.ipv4.tcp_rmem               = 4096 87380 ${TCP_BUF_MAX}
-net.ipv4.tcp_wmem               = 4096 16384 ${TCP_BUF_MAX}
+net.ipv4.tcp_rmem               = 4096 87380 1048576
+net.ipv4.tcp_wmem               = 4096 65536 1048576
 
-# ปิด auto-scale buffer ใหญ่เกิน (สำคัญ: ป้องกัน bloat)
-net.ipv4.tcp_moderate_rcvbuf    = 0
+# เปิด autotuning — kernel ปรับ buffer ตาม RTT จริง (mobile RTT แกว่งเยอะ)
+net.ipv4.tcp_moderate_rcvbuf    = 1
 
-# ── ACK & Delay (ยิ่ง ACK เร็ว RTT ยิ่งต่ำ) ──────────────────
-net.ipv4.tcp_no_delay_ack        = 1
+# ── ACK & Delay ───────────────────────────────────────────────
+# ไม่ใช้ tcp_no_delay_ack — AIS 128kbps uplink แคบมาก
+# ACK ถี่เกินทำให้ uplink ตันเอง → latency แย่ลง (paradox)
 net.ipv4.tcp_thin_linear_timeouts = 1
 
-# ── Keepalive — detect VLESS long-conn drop เร็ว ─────────────
-net.ipv4.tcp_keepalive_time     = 30
-net.ipv4.tcp_keepalive_intvl    = 5
+# ── Keepalive — balanced สำหรับ mobile NAT ───────────────────
+# 30s aggressive เกินไป → mobile NAT churn + battery drain client
+# 60s = สมดุลระหว่าง detect drop เร็ว vs ไม่สร้าง extra packet มาก
+net.ipv4.tcp_keepalive_time     = 60
+net.ipv4.tcp_keepalive_intvl    = 10
 net.ipv4.tcp_keepalive_probes   = 3
 
 # ── Retransmit เร็ว (4G packet loss ไม่รอนาน) ───────────────
@@ -463,6 +488,22 @@ net.ipv4.conf.all.accept_redirects     = 0
 net.ipv4.conf.default.accept_redirects = 0
 net.ipv4.conf.all.send_redirects       = 0
 net.ipv4.icmp_echo_ignore_broadcasts   = 1
+
+# ── Conntrack — สำคัญมากสำหรับ Reality + mobile NAT ─────────
+# mobile NAT สร้าง conn เยอะ → conntrack เต็มเร็ว → packet drop
+# เพิ่ม max + ลด timeout conn เก่าที่ค้างไม่ได้ใช้
+net.netfilter.nf_conntrack_max                        = 131072
+net.netfilter.nf_conntrack_tcp_timeout_established    = 3600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait      = 15
+net.netfilter.nf_conntrack_tcp_timeout_close_wait     = 5
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait       = 10
+net.netfilter.nf_conntrack_udp_timeout                = 30
+net.netfilter.nf_conntrack_udp_timeout_stream         = 60
+
+# ── TCP Pacing (BBR + CAKE ทำงานร่วมกัน smooth ขึ้น) ─────────
+# tcp_notsent_lowat: ลด burst / microstutter ใน video/game stream
+# ส่ง data เฉพาะเมื่อ send buffer ต่ำกว่า 16KB → ไม่สะสม data ใน kernel
+net.ipv4.tcp_notsent_lowat = 16384
 EOF
 
 run sysctl --system -q 2>/dev/null || true
@@ -476,50 +517,129 @@ ok "sysctl applied → ${CC_MODE} + ${QDISC_MODE}"
 #   CAKE ทำหน้าที่แค่ควบคุม latency / fairness
 #   bottleneck จริงอยู่ที่ AIS 128kbps ฝั่ง client (CAKE ฝั่งนั้นทำไม่ได้จาก VPS)
 # ══════════════════════════════════════════════════════════════════════════════
-step "tc qdisc — ${QDISC_MODE} egress (VPS→client)"
+step "tc qdisc — ${QDISC_MODE} egress · cap ${VPS_SHAPE_MBIT}Mbit (VPS→client)"
 
 if "$DRY_RUN"; then
-    info "[DRY] tc qdisc replace dev $IFACE root $QDISC_MODE ..."
+    info "[DRY] tc qdisc add dev $IFACE root $QDISC_MODE bandwidth ${VPS_SHAPE_MBIT}Mbit ..."
 else
     tc qdisc del dev "$IFACE" root 2>/dev/null || true
 
     if [[ "$QDISC_MODE" == "cake" ]]; then
-        tc qdisc add dev "$IFACE" root cake  \
-            rtt "${RTT_MS}ms"                \
-            besteffort                       \
-            nat                              \
-            wash                             \
+        # Profile: diffserv4 dual-srchost dual-dsthost
+        #   diffserv4      = แบ่ง 4 tiers (bulk/best-effort/video/voice)
+        #                    → VLESS/Reality traffic ไม่โดน bulk เบียด
+        #   dual-srchost   = fairness ต่อ client IP ขาออก
+        #   dual-dsthost   = fairness ต่อ client IP ขาเข้า
+        #   ดีกว่า besteffort เมื่อมีหลายเครื่องใช้ VPS พร้อมกัน
+        #   wash           = ล้าง DSCP garbage จาก AIS QoS
+        #   no-ack-filter  = ไม่ยุบ ACK (ดีกับ Reality TLS)
+        tc qdisc add dev "$IFACE" root cake      \
+            bandwidth "${VPS_SHAPE_MBIT}Mbit"    \
+            rtt "${RTT_MS}ms"                    \
+            diffserv4                            \
+            dual-srchost                         \
+            dual-dsthost                         \
+            nat                                  \
+            wash                                 \
             no-ack-filter
-        info "CAKE: rtt=${RTT_MS}ms · besteffort · nat · wash · no-ack-filter"
+        info "CAKE: ${VPS_SHAPE_MBIT}Mbit · rtt=${RTT_MS}ms · diffserv4 · dual-host · wash"
     else
-        # fq_codel fallback
+        # fq_codel fallback — ไม่มี bandwidth parameter จึงใช้ limit แทน
         tc qdisc add dev "$IFACE" root fq_codel \
             limit 1000                           \
             target "${CAKE_TARGET_MS}ms"         \
             interval "${CAKE_INTERVAL_MS}ms"     \
             quantum 1514
         info "fq_codel: target=${CAKE_TARGET_MS}ms · interval=${CAKE_INTERVAL_MS}ms"
+        warn "fq_codel ไม่รองรับ bandwidth cap — ติดตั้ง CAKE เพื่อล็อค ${VPS_SHAPE_MBIT}Mbps"
     fi
 
     tc qdisc show dev "$IFACE" | grep -E "cake|fq_codel" &>/dev/null \
-        && ok "qdisc verified on $IFACE" \
+        && ok "qdisc egress verified on $IFACE" \
         || warn "ตรวจ qdisc ด้วย: tc qdisc show dev $IFACE"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — ETHTOOL: ลด NIC interrupt coalescing
+# STEP 5 — INGRESS SHAPING (client→VPS) ด้วย IFB + CAKE
+# ──────────────────────────────────────────────────────────────────────────────
+# สำคัญมาก: bufferbloat ใหญ่สุดมักเกิดฝั่ง client→VPS (AIS 128kbps uplink)
+# ใช้ IFB redirect ingress → shape ด้วย CAKE 120kbps
+# 120kbps (ต่ำกว่า 128 นิด) = หยุด burst ก่อนที่ AIS shaper จะเข้ามายุ่ง
 # ══════════════════════════════════════════════════════════════════════════════
-step "ethtool — reduce interrupt coalescing delay"
+step "tc ingress shaping — IFB + CAKE ${CLIENT_UP_KBIT}kbps (client→VPS)"
 
-if ! "$DRY_RUN"; then
-    # rx-usecs/tx-usecs ต่ำ = interrupt เร็ว = latency ต่ำ
-    # Virtual NIC บางตัวไม่รองรับ — warn แล้วผ่านไป
-    ethtool -C "$IFACE" rx-usecs 50 tx-usecs 50 2>/dev/null \
-        && info "coalesce: rx-usecs=50 tx-usecs=50 ✓" \
-        || info "coalesce: virtual NIC ไม่รองรับ — ข้ามได้ (ไม่กระทบ)"
-    ok "ethtool done"
+if "$DRY_RUN"; then
+    info "[DRY] modprobe ifb + tc ingress redirect → cake bandwidth ${CLIENT_UP_KBIT}kbit"
 else
-    info "[DRY] ethtool -C $IFACE rx-usecs 50 tx-usecs 50"
+    if $CAP_CAKE; then
+        # load IFB module
+        modprobe ifb 2>/dev/null || { warn "modprobe ifb ล้มเหลว — ข้าม ingress shaping"; }
+
+        if ip link show ifb0 &>/dev/null 2>&1 || ip link add ifb0 type ifb 2>/dev/null; then
+            ip link set ifb0 up 2>/dev/null || true
+
+            # ลบ ingress qdisc เดิม
+            tc qdisc del dev "$IFACE" handle ffff: ingress 2>/dev/null || true
+            tc qdisc del dev ifb0 root 2>/dev/null || true
+
+            # redirect ingress → ifb0
+            tc qdisc add dev "$IFACE" handle ffff: ingress
+            tc filter add dev "$IFACE" parent ffff: \
+                protocol ip u32 match u32 0 0 \
+                action mirred egress redirect dev ifb0 2>/dev/null || \
+            tc filter add dev "$IFACE" parent ffff: \
+                protocol all u32 match u32 0 0 \
+                action mirred egress redirect dev ifb0
+
+            # CAKE ingress — shape ขาเข้าจาก client
+            # rtt เดิม 50ms แต่ ingress ใช้ besteffort เพราะ traffic ฝั่งนี้ไม่ต้องแยก tier
+            tc qdisc add dev ifb0 root cake          \
+                bandwidth "${CLIENT_UP_KBIT}kbit"    \
+                rtt "${RTT_MS}ms"                    \
+                besteffort                           \
+                wash
+
+            ip link show ifb0 | grep -q "UP" \
+                && ok "Ingress CAKE: ${CLIENT_UP_KBIT}kbps · ifb0 UP" \
+                || warn "ifb0 อาจไม่ UP — ตรวจ: ip link show ifb0"
+        else
+            warn "สร้าง ifb0 ไม่ได้ — ข้าม ingress shaping (ไม่ critical)"
+        fi
+    else
+        warn "CAKE ไม่พร้อม — ข้าม ingress shaping (fq_codel ไม่รองรับ IFB)"
+    fi
+fi
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 5 — ETHTOOL: ข้าม (ไม่แตะ coalescing บน VPS)
+# ──────────────────────────────────────────────────────────────────────────────
+# เหตุผล: VPS ส่วนใหญ่ใช้ VirtIO/veth — provider คุม interrupt อยู่แล้ว
+#   บางเจ้า ignore, บางเจ้า CPU spike, บางเจ้า packet pacing เพี้ยน
+#   บน 1 vCPU: latency gain น้อยมาก แต่ jitter risk เพิ่ม
+#   → ไม่แตะดีที่สุดสำหรับ "นิ่ง"
+# ══════════════════════════════════════════════════════════════════════════════
+step "ethtool — skipped (VPS virtual NIC, provider-managed)"
+info "ไม่แตะ interrupt coalescing — VPS 1vCPU jitter stable กว่า"
+ok "ethtool step skipped (intentional)"
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STEP 6 — IRQBALANCE
+# ──────────────────────────────────────────────────────────────────────────────
+# บน VPS ไม่ pin CPU / ไม่แตะ combined queues (ทำ jitter แย่ลงบน KVM)
+# แค่ enable irqbalance ให้ kernel จัดการ interrupt distribution เอง
+# ══════════════════════════════════════════════════════════════════════════════
+step "irqbalance — enable (kernel-managed interrupt distribution)"
+
+if "$DRY_RUN"; then
+    info "[DRY] apt install irqbalance + systemctl enable"
+else
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq irqbalance 2>/dev/null \
+        || warn "ติดตั้ง irqbalance ไม่ได้ — ข้าม"
+    systemctl enable irqbalance 2>/dev/null || true
+    systemctl restart irqbalance 2>/dev/null || true
+    systemctl is-active irqbalance &>/dev/null \
+        && ok "irqbalance active — kernel จัดการ interrupt เอง" \
+        || warn "irqbalance ไม่ active — ไม่ critical"
 fi
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -528,10 +648,12 @@ fi
 step "dnsmasq — local DNS cache"
 
 run bash -c "cat > /etc/dnsmasq.d/ais-vps.conf" << 'DNSEOF'
-# AIS VPS · dnsmasq latency config
-# upstream resolvers — เร็วในไทย
+# AIS VPS · dnsmasq · Thai-optimized resolvers
+# 1.1.1.1 + 1.0.0.1 = Cloudflare (นิ่งกว่า 8.8.8.8 บน AIS route บางช่วง)
+# 9.9.9.9 = Quad9 (fallback ที่ไม่ผ่าน Google)
 server=1.1.1.1
-server=8.8.8.8
+server=1.0.0.1
+server=9.9.9.9
 server=202.44.204.1
 server=202.44.204.2
 
@@ -546,9 +668,13 @@ quiet-dhcp
 DNSEOF
 
 if ! "$DRY_RUN"; then
+    # ไม่ใช้ chattr +i — อันตรายบน Ubuntu 22+
+    # cloud-init / netplan / DHCP renew อาจชนและทำให้ DNS หาย reboot
+    # แทนด้วยการเขียน resolv.conf ตรงๆ แล้วให้ dnsmasq จัดการ
     chattr -i /etc/resolv.conf 2>/dev/null || true
     [[ "$RESOLVER_MODE" == "symlink" ]] && rm -f /etc/resolv.conf
     printf 'nameserver 127.0.0.1\nnameserver 1.1.1.1\n' > /etc/resolv.conf
+    # หมายเหตุ: ไม่ chattr +i อีกต่อไป — dnsmasq เป็น gatekeeper แทน
 
     systemctl enable dnsmasq 2>/dev/null || true
     systemctl restart dnsmasq 2>/dev/null \
@@ -610,6 +736,11 @@ table inet filter {
         type filter hook forward priority 0; policy accept;
         ct state established,related accept
         ct state invalid drop
+
+        # MSS clamp-to-pmtu — ป้องกัน packet fragmentation บน VLESS Reality
+        # ใช้ clamp-to-pmtu แทน hardcode 1280 → adaptive ตาม route จริง
+        # ผล: ลด packet loss, ลด retransmit, ลด jitter บน mobile
+        tcp flags syn / syn,rst tcp option maxseg size set rt mtu
     }
 
     chain output {
@@ -773,37 +904,7 @@ run systemctl daemon-reload
     || warn "x-ui restart ล้มเหลว — ตรวจ: systemctl status x-ui"; }
 ok "x-ui override applied (Nice=-5 · MemoryMax=512M)"
 
-# ══════════════════════════════════════════════════════════════════════════════
-# STEP 11 — ZRAM (RAM headroom สำหรับ 1GB VPS)
-# ══════════════════════════════════════════════════════════════════════════════
-step "ZRAM swap — 256 MB compressed"
-
-if $CAP_ZRAM && ! "$DRY_RUN"; then
-    swapoff -a 2>/dev/null || true
-    modprobe zram 2>/dev/null || true
-    ZRAM_DEV=$(ls /dev/zram* 2>/dev/null | head -1)
-    if [[ -n "${ZRAM_DEV:-}" ]]; then
-        local_name="${ZRAM_DEV##*/}"
-        echo zstd > "/sys/block/${local_name}/comp_algorithm" 2>/dev/null \
-            || echo lz4 > "/sys/block/${local_name}/comp_algorithm" 2>/dev/null || true
-        echo $(( 256 * 1024 * 1024 )) > "/sys/block/${local_name}/disksize"
-        mkswap "$ZRAM_DEV" &>/dev/null
-        swapon -p 10 "$ZRAM_DEV"
-
-        # udev rule เพื่อ persist
-        cat > /etc/udev/rules.d/99-zram.rules << ZRAMEOF
-KERNEL=="zram0", ATTR{comp_algorithm}="zstd", ATTR{disksize}="268435456", \
-    RUN="/sbin/mkswap /dev/zram0", RUN+="/sbin/swapon -p 10 /dev/zram0"
-ZRAMEOF
-        ok "ZRAM: 256MB on $ZRAM_DEV (zstd/lz4)"
-    else
-        warn "ZRAM device ไม่พบ — ข้าม"
-    fi
-elif "$DRY_RUN"; then
-    info "[DRY] ZRAM 256MB swap"
-else
-    warn "ZRAM ไม่รองรับ — ข้าม"
-fi
+# STEP 11 — ZRAM ตัดออก (ไม่ reliable บน VPS ทุกเจ้า)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # STEP 12 — PERSIST QDISC ON BOOT (systemd)
@@ -827,7 +928,16 @@ ExecStart=/bin/sh -c '/sbin/tc qdisc del dev ${IFACE} root 2>/dev/null || true'
 SVCEOF
 
 if [[ "$QDISC_MODE" == "cake" ]]; then
-    echo "ExecStart=/sbin/tc qdisc add dev ${IFACE} root cake rtt ${RTT_MS}ms besteffort nat wash no-ack-filter"
+    echo "ExecStart=/sbin/tc qdisc add dev ${IFACE} root cake bandwidth ${VPS_SHAPE_MBIT}Mbit rtt ${RTT_MS}ms diffserv4 dual-srchost dual-dsthost nat wash no-ack-filter"
+    # ingress via IFB
+    echo "ExecStart=/sbin/modprobe ifb"
+    echo "ExecStart=/bin/sh -c 'ip link show ifb0 &>/dev/null || ip link add ifb0 type ifb'"
+    echo "ExecStart=/bin/sh -c 'ip link set ifb0 up'"
+    echo "ExecStart=/bin/sh -c '/sbin/tc qdisc del dev ${IFACE} handle ffff: ingress 2>/dev/null || true'"
+    echo "ExecStart=/bin/sh -c '/sbin/tc qdisc del dev ifb0 root 2>/dev/null || true'"
+    echo "ExecStart=/bin/sh -c '/sbin/tc qdisc add dev ${IFACE} handle ffff: ingress'"
+    echo "ExecStart=/bin/sh -c '/sbin/tc filter add dev ${IFACE} parent ffff: protocol all u32 match u32 0 0 action mirred egress redirect dev ifb0'"
+    echo "ExecStart=/sbin/tc qdisc add dev ifb0 root cake bandwidth ${CLIENT_UP_KBIT}kbit rtt ${RTT_MS}ms besteffort wash"
 else
     echo "ExecStart=/sbin/tc qdisc add dev ${IFACE} root fq_codel limit 1000 target ${CAKE_TARGET_MS}ms interval ${CAKE_INTERVAL_MS}ms quantum 1514"
 fi
@@ -857,7 +967,6 @@ printf "  ${DIM}%-30s${RST}  ${BWHT}%s ms${RST}\n" "RTT reference"       "$RTT_M
 printf "  ${DIM}%-30s${RST}  ${BWHT}%s${RST}\n" "TCP buffer max"        "4 MB (latency-first)"
 printf "  ${DIM}%-30s${RST}  ${BWHT}%s${RST}\n" "Firewall"             "nftables (443+2053+SSH)"
 printf "  ${DIM}%-30s${RST}  ${BWHT}%s${RST}\n" "DNS cache"            "dnsmasq 127.0.0.1"
-printf "  ${DIM}%-30s${RST}  ${BWHT}%s${RST}\n" "ZRAM swap"            "256 MB (zstd)"
 printf "  ${DIM}%-30s${RST}  ${BWHT}%s${RST}\n" "x-ui panel"           ":${XUI_PORT} · ${XUI_USER}"
 printf "  ${DIM}%-30s${RST}  ${BWHT}%s${RST}\n" "Boot service"         "ais-net.service ✓"
 printf "  ${DIM}%-30s${RST}  ${BWHT}%s${RST}\n" "Log"                  "$LOG_FILE"
