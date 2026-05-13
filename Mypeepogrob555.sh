@@ -27,7 +27,7 @@ err()     { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 step()    { echo -e "\n${BOLD}${CYAN}━━━ $* ${NC}"; }
 pause()   {
   echo -e "\n${YELLOW}▶ กด [Enter] เพื่อดำเนินการต่อ ...${NC}"
-  read -r
+  read -r < /dev/tty
 }
 
 # ─────────────────────────────────────────
@@ -229,7 +229,7 @@ echo -e "${BOLD}ติดตั้ง 3x-ui ไหม?${NC}"
 echo -e "  [Enter]  = ใช่ ติดตั้งเลย"
 echo -e "  [Ctrl+C] = ออกจาก script"
 echo ""
-read -rp "▶ กด Enter เพื่อติดตั้ง 3x-ui: "
+read -rp "▶ กด Enter เพื่อติดตั้ง 3x-ui: " < /dev/tty
 
 info "กำลังดาวน์โหลดและติดตั้ง 3x-ui..."
 bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) || \
