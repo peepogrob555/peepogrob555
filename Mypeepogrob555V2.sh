@@ -27,7 +27,7 @@ err()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
 step()  { echo -e "\n${BOLD}${CYAN}━━━ $* ${NC}"; }
 pause() {
   echo -e "\n${YELLOW}▶ กด [Enter] เพื่อดำเนินการต่อ — [Ctrl+C] เพื่อหยุด${NC}"
-  read -r
+  read -r < /dev/tty
 }
 
 # ─────────────────────────────────────────
