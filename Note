@@ -1,0 +1,385 @@
+<role>
+  You are an expert Linux systems engineer specializing in low-bandwidth
+  network optimization for VPN proxy servers.
+</role>
+
+<environment>
+  OS       : Ubuntu 22.04, Kernel 5.15.x
+  Hardware : 1 vCPU, 1GB RAM
+  Client   : AIS mobile 128kbps, RTT 35-40ms
+  Users    : 2 concurrent (gaming + streaming simultaneously)
+  Stack    : xray-core standalone — NO panel, NO 3x-ui
+  Goal     : minimize jitter and queue delay, NOT maximize throughput
+</environment>
+
+<philosophy>
+  - Bottleneck is AIS 128kbps client-side, NOT the VPS
+  - Strategy: reduce overhead + shorten queue + fast retransmit
+  - Prefer latency stability over raw speed
+  - Anti-bufferbloat is the primary objective
+</philosophy>
+
+<constants>
+  <!-- FIXED VALUES — never prompt user for these, never deviate -->
+  PORT        = 443
+  SNI         = th.speedtest.net
+  FINGERPRINT = firefox
+  FLOW        = xtls-rprx-vision
+  NETWORK     = tcp
+  SECURITY    = reality
+  ENCRYPTION  = none
+  SPX         = /
+</constants>
+
+<user_inputs>
+  <!-- Prompt user for ONLY these, in this order, BEFORE executing anything -->
+  1. SERVER_DOMAIN
+     — server domain or IP (e.g. cdn1-origin.ddns.net)
+     — no default, must not be empty
+
+  2. SSH_PORT
+     — auto-detect from: sshd -T 2>/dev/null | awk '/^port /{print $2}'
+     — show detected value, ask user to confirm or override
+     — if detection fails, prompt user to enter manually
+     — CRITICAL: this port must appear in nftables allow list or step 6 aborts
+
+  3. USER_COUNT
+     — integer ≥ 1, default 2
+     — for each user i (1..USER_COUNT):
+         USER_i_TAG — short label, e.g. "phone", "4m"
+
+  4. Confirmation
+     — print full summary table of all inputs + constants
+     — ask "Proceed? [y/N]" — abort if not y
+</user_inputs>
+
+<auto_generate>
+  <!-- Generated automatically after confirmation. Never prompt user. -->
+
+  Once, shared across ALL users:
+    SERVER_PRIVKEY  ← xray x25519 | grep "Private key" | awk '{print $3}'
+    SERVER_PUBKEY   ← xray x25519 (same run) | grep "Public key" | awk '{print $3}'
+
+  <!-- IMPORTANT: run xray x25519 ONCE, parse both keys from same output -->
+  <!-- Do NOT run it twice — keys would be from different pairs -->
+
+  For each user i:
+    USER_i_UUID  ← xray uuid
+    USER_i_SID   ← openssl rand -hex 8
+</auto_generate>
+
+<script>
+  Filename : ais-vps-setup.sh
+  Shebang  : #!/usr/bin/env bash
+  Header   : set -euo pipefail
+
+  LOG=/var/log/ais-vps-setup.log   # append mode throughout
+  Colors:
+    BGRN='\033[1;32m'  # success
+    BCYN='\033[1;36m'  # info
+    BYLW='\033[1;33m'  # warning
+    BRED='\033[1;31m'  # fatal error
+    RST='\033[0m'
+
+  Structure:
+    [interactive phase]  → collect inputs → confirm → then execute
+    [step 1..8]          → sequential, each logs to $LOG
+    Each step prints:    [STEP N] Starting <name> ...
+                         [STEP N] Done ✓
+    Each step has a verify block printing actual live values after apply.
+    Backup before overwrite: cp file file.bak.$(date +%s)
+</script>
+
+<steps>
+
+<step id="1" name="system_update">
+  apt-get update && apt-get upgrade -y
+  apt-get install -y \
+    nftables dnsmasq iproute2 curl wget \
+    ca-certificates gnupg dnsutils
+
+  Install xray-core via official script:
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+
+  Verify:
+    - which xray → must resolve
+    - xray version → print output
+    - if either fails: BRED fatal error, exit 1
+</step>
+
+<step id="2" name="generate_credentials">
+  Run auto_generate block.
+  Print credential summary to stdout (not saved to file yet):
+
+  ┌────────┬──────────────────────────────────────┬──────────────────┐
+  │ User   │ UUID                                 │ shortId          │
+  ├────────┼──────────────────────────────────────┼──────────────────┤
+  │ {TAG}  │ {UUID}                               │ {SID}            │
+  └────────┴──────────────────────────────────────┴──────────────────┘
+  Public key (shared): {SERVER_PUBKEY}
+</step>
+
+<step id="3" name="xray_config">
+  Path: /usr/local/etc/xray/config.json
+  Idempotent check:
+    if file exists AND systemctl is-active xray → ask "Overwrite existing config? [y/N]"
+    abort step if user says N
+
+  Backup: config.json.bak.$(date +%s)
+
+  Write config with this exact structure:
+  {
+    "log": {
+      "access": "/var/log/xray/access.log",
+      "error":  "/var/log/xray/error.log",
+      "loglevel": "warning"
+    },
+    "inbounds": [{
+      "port": PORT,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          // one object per user:
+          { "id": "USER_i_UUID", "flow": "FLOW" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "NETWORK",
+        "security": "SECURITY",
+        "realitySettings": {
+          "dest": "SNI:443",
+          "serverNames": ["SNI"],
+          "privateKey": "SERVER_PRIVKEY",
+          "shortIds": ["USER_1_SID", "USER_2_SID", ...],
+          "fingerprint": "FINGERPRINT"
+        }
+      }
+    }],
+    "outbounds": [{ "protocol": "freedom" }]
+  }
+
+  mkdir -p /var/log/xray
+  systemctl enable xray
+  systemctl restart xray
+
+  Verify:
+    systemctl is-active xray → must print "active"
+    if not active: journalctl -u xray -n 20 → print, then fatal exit
+</step>
+
+<step id="4" name="sysctl_tuning">
+  Write /etc/sysctl.d/99-ais-128k.conf:
+    net.core.default_qdisc              = fq_codel
+    net.ipv4.tcp_congestion_control     = bbr
+    net.core.rmem_max                   = 4194304
+    net.core.wmem_max                   = 4194304
+    net.ipv4.tcp_rmem                   = 4096 87380 4194304
+    net.ipv4.tcp_wmem                   = 4096 16384 4194304
+    net.ipv4.tcp_notsent_lowat          = 16384
+    net.ipv4.tcp_low_latency            = 1
+    net.ipv4.tcp_slow_start_after_idle  = 0
+    net.ipv4.tcp_thin_linear_timeouts   = 1
+    net.netfilter.nf_conntrack_max      = 32768
+    vm.swappiness                       = 10
+
+  sysctl --system >> $LOG 2>&1
+
+  Verify (print live values):
+    sysctl net.ipv4.tcp_congestion_control
+    sysctl net.core.default_qdisc
+    sysctl net.ipv4.tcp_notsent_lowat
+</step>
+
+<step id="5" name="qdisc">
+  IFACE=$(ip route show default | awk 'NR==1{print $5}')
+  <!-- abort if IFACE is empty -->
+
+  Probe CAKE:
+    if tc qdisc add dev lo root cake 2>/dev/null; then
+      CAKE_OK=1
+      tc qdisc del dev lo root 2>/dev/null
+    else
+      CAKE_OK=0
+    fi
+
+  Apply:
+    CAKE_OK=1 → tc qdisc replace dev $IFACE root cake \
+                  bandwidth 128kbit diffserv4 nat flowblind
+    CAKE_OK=0 → tc qdisc replace dev $IFACE root fq_codel \
+                  limit 512 target 5ms interval 100ms quantum 300
+
+  Create /etc/systemd/system/ais-qdisc.service:
+    [Unit]
+    Description=AIS qdisc latency tuning
+    After=network.target
+
+    [Service]
+    Type=oneshot
+    RemainAfterExit=yes
+    ExecStart=<exact tc command used above, with $IFACE resolved>
+
+    [Install]
+    WantedBy=multi-user.target
+
+  systemctl daemon-reload
+  systemctl enable --now ais-qdisc
+
+  Verify:
+    tc qdisc show dev $IFACE
+</step>
+
+<step id="6" name="nftables">
+  <!-- SAFETY CHECK FIRST — do this before writing any rules -->
+  Confirm SSH_PORT is known and non-empty.
+  If empty or undetected → BRED fatal: "Cannot determine SSH port. Aborting nftables setup."
+
+  Backup: /etc/nftables.conf.bak.$(date +%s)
+
+  Write /etc/nftables.conf:
+
+  #!/usr/sbin/nft -f
+  flush ruleset
+
+  table inet filter {
+    chain input {
+      type filter hook input priority 0; policy drop;
+      iif "lo" accept
+      ct state established,related accept
+      ip  protocol icmp       limit rate 10/second accept
+      ip6 nexthdr  icmpv6     limit rate 10/second accept
+      tcp dport SSH_PORT      limit rate 6/minute burst 10 packets accept
+      tcp dport PORT          accept
+    }
+    chain forward { type filter hook forward priority 0; policy drop; }
+    chain output  { type filter hook output  priority 0; policy accept; }
+  }
+
+  table inet mangle {
+    chain prerouting {
+      type filter hook prerouting priority -150;
+
+      # CS5 — interactive / gaming
+      udp dport 53                                  ip dscp set cs5
+      udp dport { 5000-5100, 7000-8999,
+                  27000-27050, 5672, 17500,
+                  3478-3480, 3074 }                 ip dscp set cs5
+      udp length < 128                              ip dscp set cs5
+
+      # CS4 — TCP ACK only (no payload)
+      tcp flags == ack ip length < 80               ip dscp set cs4
+
+      # CS3 — bulk streaming
+      tcp dport { 80, 443 } ip length > 1000        ip dscp set cs3
+
+      # CS0 — everything else (default, no rule needed)
+    }
+  }
+
+  table inet nat {
+    chain postrouting {
+      type nat hook postrouting priority 100;
+      oif != "lo" masquerade
+    }
+  }
+
+  nft -f /etc/nftables.conf
+  systemctl enable nftables
+
+  Verify:
+    nft list ruleset | head -60
+</step>
+
+<step id="7" name="dnsmasq">
+  Disable systemd-resolved stub:
+    sed -i 's/^#*DNSStubListener=.*/DNSStubListener=no/' \
+      /etc/systemd/resolved.conf
+    <!-- append line if not present -->
+    systemctl restart systemd-resolved
+
+  Backup: /etc/dnsmasq.conf.bak.$(date +%s)
+
+  Write /etc/dnsmasq.conf:
+    listen-address=127.0.0.1
+    bind-interfaces
+    port=53
+    server=94.140.14.140
+    server=94.140.14.141
+    server=1.1.1.1
+    server=1.0.0.1
+    server=8.8.8.8
+    cache-size=2048
+    min-cache-ttl=30
+    neg-ttl=10
+    dns-forward-max=150
+    no-resolv
+
+  chattr -i /etc/resolv.conf 2>/dev/null || true
+  echo "nameserver 127.0.0.1" > /etc/resolv.conf
+  chattr +i /etc/resolv.conf
+
+  systemctl enable --now dnsmasq
+
+  Verify:
+    dig +short google.com @127.0.0.1
+    → must return at least one IP, else BYLW warning (non-fatal)
+</step>
+
+<step id="8" name="output_uris">
+  SERVER_IP=$(curl -s4 https://api.ipify.org || curl -s4 ifconfig.me)
+
+  For each user i, construct URI with this EXACT parameter order
+  (must match this order — some clients parse positionally):
+
+    vless://{USER_i_UUID}@{SERVER_DOMAIN}:{PORT}?security={SECURITY}&encryption={ENCRYPTION}&pbk={SERVER_PUBKEY}&headerType=&fp={FINGERPRINT}&spx={SPX}&type={NETWORK}&flow={FLOW}&sni={SNI}&sid={USER_i_SID}#{USER_i_TAG}
+
+  <!-- SERVER_DOMAIN = what user entered in interactive phase, not SERVER_IP -->
+  <!-- SERVER_IP is shown in summary only -->
+
+  Print each URI to stdout in BGRN color.
+  Do NOT print QR codes.
+
+  Save all URIs to /root/vless-clients.txt
+  chmod 600 /root/vless-clients.txt
+
+  Print:
+    "Client URIs saved to /root/vless-clients.txt"
+</step>
+
+</steps>
+
+<final_summary>
+  Print this table after step 8:
+
+  ┌─────────────────────────┬──────────────────────────────────┐
+  │ Setting                 │ Value                            │
+  ├─────────────────────────┼──────────────────────────────────┤
+  │ Xray version            │ {xray version}                   │
+  │ Server domain           │ {SERVER_DOMAIN}                  │
+  │ Server IP               │ {SERVER_IP}                      │
+  │ VLESS port              │ 443                              │
+  │ SNI                     │ th.speedtest.net                 │
+  │ Fingerprint             │ firefox                          │
+  │ Users configured        │ {USER_COUNT}                     │
+  │ qdisc applied           │ {CAKE | fq_codel}                │
+  │ TCP congestion control  │ {live sysctl value}              │
+  │ nftables                │ {active | inactive}              │
+  │ dnsmasq                 │ {active | inactive}              │
+  │ Client URIs saved to    │ /root/vless-clients.txt          │
+  │ Log file                │ /var/log/ais-vps-setup.log       │
+  └─────────────────────────┴──────────────────────────────────┘
+</final_summary>
+
+<error_policy>
+  On any fatal error:
+    echo -e "${BRED}[FATAL] <step name>: <error message>${RST}"
+    echo "See full log: $LOG"
+    exit 1
+
+  Do NOT attempt auto-rollback — too risky over SSH session.
+
+  SSH lockout prevention:
+    If SSH_PORT cannot be confirmed before step 6 → abort step 6 entirely.
+    Established SSH sessions are protected by ct state established,related rule.
+    Rate-limit applies to NEW connections only.
+</error_policy>
