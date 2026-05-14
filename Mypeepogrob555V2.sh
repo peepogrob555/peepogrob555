@@ -1,553 +1,491 @@
 #!/usr/bin/env bash
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║              VPS TUNE SCRIPT — File 2/2                         ║
-# ║  Ubuntu 22.04 | Xver Cloud TH | VLESS Reality                   ║
-# ║  Profile: AIS 4G/5G 128kbps | 2 Users | Low-Latency First       ║
-# ╚══════════════════════════════════════════════════════════════════╝
-# Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/YOUR/REPO/main/tune.sh)
+# ═══════════════════════════════════════════════════════════════════════════════
+#   AIS Setup — Diagnostic Checker v1.0
+#   By (IG:peepogrob555  FB:Shogun)
 #
-# ⚠️  ต้องรัน setup.sh ก่อน — tune.sh จะไม่ติดตั้ง package ใหม่
+#   เช็คทุกอย่างที่ Mypeepogrob555.sh ทำไว้
+#   ใช้: sudo bash check-ais-setup.sh
+# ═══════════════════════════════════════════════════════════════════════════════
 
-set -euo pipefail
+BGRN='\033[1;32m'
+BCYN='\033[1;36m'
+BYLW='\033[1;33m'
+BRED='\033[1;31m'
+BMAG='\033[1;35m'
+BWHT='\033[1;37m'
+RST='\033[0m'
 
-# ─────────────────────────────────────────
-#  COLORS & HELPERS
-# ─────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+PASS=0
+WARN=0
+FAIL=0
 
-LOG_FILE="/var/log/vps-tune.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+[ "$EUID" -ne 0 ] && echo -e "${BRED}Run as root: sudo bash $0${RST}" && exit 1
 
-info()  { echo -e "${CYAN}[INFO]${NC}  $*"; }
-ok()    { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()  { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()   { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
-step()  { echo -e "\n${BOLD}${CYAN}━━━ $* ${NC}"; }
-pause() {
-  echo -e "\n${YELLOW}▶ กด [Enter] เพื่อดำเนินการต่อ — [Ctrl+C] เพื่อหยุด${NC}"
-  read -r < /dev/tty
-}
+pass() { echo -e "  ${BGRN}[PASS]${RST} $*"; (( PASS++ )); }
+warn() { echo -e "  ${BYLW}[WARN]${RST} $*"; (( WARN++ )); }
+fail() { echo -e "  ${BRED}[FAIL]${RST} $*"; (( FAIL++ )); }
+info() { echo -e "  ${BCYN}[INFO]${RST} $*"; }
+section() { echo -e "\n${BMAG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"; \
+            echo -e "${BMAG}  $*${RST}"; \
+            echo -e "${BMAG}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RST}"; }
 
-# ─────────────────────────────────────────
-#  ROOT CHECK
-# ─────────────────────────────────────────
-[[ "$EUID" -ne 0 ]] && err "ต้องรันด้วย root: sudo bash tune.sh"
+# ─────────────────────────────────────────────────────────────────────────────
+section "1. SYSTEM INFO"
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─────────────────────────────────────────
-#  DETECT INTERFACE
-# ─────────────────────────────────────────
-IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-[ -z "$IFACE" ] && err "ไม่พบ default network interface"
+VIRT=$(systemd-detect-virt 2>/dev/null || echo "unknown")
+RAM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+CPU=$(nproc)
+KERNEL=$(uname -r)
+IFACE=$(ip route show default 2>/dev/null | awk 'NR==1{print $5}')
+SERVER_IP=$(curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null || echo "unknown")
 
-# ─────────────────────────────────────────
-#  BANNER
-# ─────────────────────────────────────────
-clear
-echo -e "${BOLD}${CYAN}"
-cat << 'BANNER'
- ████████╗██╗   ██╗███╗   ██╗███████╗    ███████╗██╗  ██╗
-    ██╔══╝██║   ██║████╗  ██║██╔════╝    ██╔════╝██║  ██║
-    ██║   ██║   ██║██╔██╗ ██║█████╗      ███████╗███████║
-    ██║   ██║   ██║██║╚██╗██║██╔══╝      ╚════██║██╔══██║
-    ██║   ╚██████╔╝██║ ╚████║███████╗    ███████║██║  ██║
-    ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝    ╚══════╝╚═╝  ╚═╝
-BANNER
-echo -e "${NC}"
-echo -e "${CYAN}  Kernel Tune: BBR + CAKE + Sysctl — Low Latency Profile${NC}"
-echo -e "${CYAN}  Interface: ${BOLD}$IFACE${NC}"
-echo -e "  $(date)"
-echo ""
+info "Hostname   : $(hostname)"
+info "OS         : $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY_NAME | cut -d= -f2 | tr -d '"')"
+info "Kernel     : $KERNEL"
+info "Virt       : $VIRT"
+info "RAM        : ${RAM_MB}MB"
+info "CPU        : ${CPU} core(s)"
+info "Interface  : ${IFACE:-not detected}"
+info "Public IP  : $SERVER_IP"
+info "Uptime     : $(uptime -p 2>/dev/null || uptime)"
 
-# ─────────────────────────────────────────
-#  PRE-FLIGHT CHECK
-# ─────────────────────────────────────────
-step "PRE-FLIGHT — ตรวจสอบระบบ"
+# ─────────────────────────────────────────────────────────────────────────────
+section "2. PACKAGES"
+# ─────────────────────────────────────────────────────────────────────────────
 
-KERNEL_VER=$(uname -r)
-info "Kernel: $KERNEL_VER"
-info "Interface: $IFACE"
-info "Virtualization: $(systemd-detect-virt 2>/dev/null || echo 'unknown')"
-
-# ตรวจ CAKE support
-CAKE_OK=false
-if modprobe sch_cake 2>/dev/null; then
-  CAKE_OK=true
-  ok "CAKE module: พร้อมใช้งาน"
-else
-  warn "CAKE module: ไม่พบ — จะใช้ fq_codel แทน"
-fi
-
-# ตรวจ IFB support  
-IFB_OK=false
-if modprobe ifb numifbs=1 2>/dev/null; then
-  IFB_OK=true
-  ok "IFB module: พร้อมใช้งาน (Ingress shaping enabled)"
-else
-  warn "IFB module: ไม่พบ — จะ skip ingress shaping"
-fi
-
-# ตรวจ BBR
-BBR_OK=false
-if modprobe tcp_bbr 2>/dev/null; then
-  BBR_OK=true
-  ok "BBR module: พร้อมใช้งาน"
-else
-  warn "BBR module: ไม่พบ — จะใช้ cubic แทน"
-fi
-
-echo ""
-echo -e "${BOLD}สรุปก่อนเริ่ม:${NC}"
-echo -e "  BBR   : $($BBR_OK  && echo -e "${GREEN}✅ Active${NC}" || echo -e "${YELLOW}⚠️  Fallback cubic${NC}")"
-echo -e "  CAKE  : $($CAKE_OK && echo -e "${GREEN}✅ Active${NC}" || echo -e "${YELLOW}⚠️  Fallback fq_codel${NC}")"
-echo -e "  IFB   : $($IFB_OK  && echo -e "${GREEN}✅ Active${NC}" || echo -e "${YELLOW}⚠️  Skip ingress${NC}")"
-
-echo ""
-echo -e "${YELLOW}Script จะทำการปรับแต่ง Kernel parameter และ QDisc${NC}"
-echo -e "${YELLOW}การตั้งค่าทั้งหมดจะ persist หลัง reboot ผ่าน systemd service${NC}"
-pause
-
-# ─────────────────────────────────────────
-#  PHASE 1 — BBR ACTIVATION
-# ─────────────────────────────────────────
-step "PHASE 1/4 — BBR Congestion Control"
-info "เปิดใช้งาน BBR — ลด buffer bloat, เพิ่มประสิทธิภาพบน 128kbps"
-info "BBR ทำงานโดยประมาณ bandwidth และ RTT แทนการรอ packet loss"
-
-if $BBR_OK; then
-  # Load module
-  modprobe tcp_bbr
-
-  # Persist module
-  if ! grep -q "^tcp_bbr" /etc/modules-load.d/modules.conf 2>/dev/null; then
-    echo "tcp_bbr" >> /etc/modules-load.d/modules.conf
+for pkg in nftables dnsmasq iproute2 curl wget ca-certificates dnsutils certbot; do
+  if dpkg -s "$pkg" &>/dev/null 2>&1; then
+    VER=$(dpkg -s "$pkg" 2>/dev/null | awk '/^Version:/{print $2}')
+    pass "$pkg installed ($VER)"
+  else
+    fail "$pkg NOT installed"
   fi
-  echo "tcp_bbr" > /etc/modules-load.d/99-bbr.conf
-
-  # Activate
-  sysctl -w net.ipv4.tcp_congestion_control=bbr
-  sysctl -w net.core.default_qdisc=cake 2>/dev/null || \
-    sysctl -w net.core.default_qdisc=fq_codel
-
-  CC_NOW=$(sysctl -n net.ipv4.tcp_congestion_control)
-  ok "Congestion Control: $CC_NOW"
-else
-  warn "BBR ไม่พร้อม — ใช้ cubic (ประสิทธิภาพต่ำกว่า แต่ยังทำงานได้)"
-fi
-
-# ─────────────────────────────────────────
-#  PHASE 2 — SYSCTL KERNEL TUNING
-# ─────────────────────────────────────────
-step "PHASE 2/4 — Kernel Sysctl (Low-Latency Profile)"
-info "จูน TCP buffer, ECN, Pacing, Keepalive สำหรับ VLESS 128kbps"
-info ""
-info "📐 BDP Calculation:"
-info "   Bandwidth = 128,000 bps | RTT = 20ms (worst case)"
-info "   BDP = 128000 × 0.020 = 2,560 bytes"
-info "   TCP buffer ตั้งไว้ใหญ่กว่า BDP ~1600x เพื่อรองรับ burst"
-pause
-
-SYSCTL_FILE="/etc/sysctl.d/99-vps-latency.conf"
-
-# Backup ถ้ามีอยู่แล้ว
-[ -f "$SYSCTL_FILE" ] && \
-  cp "$SYSCTL_FILE" "${SYSCTL_FILE}.bak.$(date +%s)" && \
-  info "Backup เดิมไว้แล้ว"
-
-cat > "$SYSCTL_FILE" << 'SYSCTL_EOF'
-# ══════════════════════════════════════════════════════
-#  VPS Latency-First Profile
-#  Xver Cloud TH | Kernel 5.15.x | 2 users | 128kbps
-#  Profile: VLESS Reality :443 | AIS 4G/5G
-# ══════════════════════════════════════════════════════
-
-# ── Congestion Control ──────────────────────────────
-net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = cake
-
-# ── BBR Pacing ──────────────────────────────────────
-# สำหรับ 128kbps: ลด burst ให้น้อยลง
-# pacing_ss_ratio: slow-start pace rate (200 = 2x BW estimate)
-# pacing_ca_ratio: cong-avoid pace rate (120 = 1.2x BW estimate)
-# ⚠️ อย่าเพิ่ม pacing_ca_ratio > 150 — burst จะไปพองที่ AIS buffer
-net.ipv4.tcp_pacing_ss_ratio = 200
-net.ipv4.tcp_pacing_ca_ratio = 120
-
-# ── TCP Buffers ─────────────────────────────────────
-# min(4KB) / default(128KB) / max(4MB)
-# default ตั้ง 128KB ให้พอสำหรับ 2 users concurrent
-# max ตั้ง 4MB ให้ kernel จัดการ burst ได้
-net.ipv4.tcp_rmem = 4096 131072 4194304
-net.ipv4.tcp_wmem = 4096 131072 4194304
-net.core.rmem_default = 262144
-net.core.wmem_default = 262144
-net.core.rmem_max = 4194304
-net.core.wmem_max = 4194304
-net.core.optmem_max = 65536
-
-# ── notsent_lowat ───────────────────────────────────
-# KEY SETTING: จำกัด unsent data ใน send buffer
-# ลด application latency (VLESS payload รอส่งน้อยลง)
-# 16384 = 16KB — เหมาะกับ 128kbps (ส่งได้ ~1วินาที)
-# ⚠️ ค่าต่ำกว่า 8192 อาจทำให้ throughput ลดลง
-net.ipv4.tcp_notsent_lowat = 16384
-
-# ── TCP Features ────────────────────────────────────
-net.ipv4.tcp_fastopen = 3           # TFO client+server (ลด 1 RTT handshake)
-net.ipv4.tcp_window_scaling = 1     # Large window support
-net.ipv4.tcp_timestamps = 1         # PAWS + accurate RTT measurement
-net.ipv4.tcp_sack = 1               # Selective ACK (recovery เร็ว)
-net.ipv4.tcp_dsack = 1              # Duplicate SACK
-net.ipv4.tcp_fack = 0               # ปิด FACK (ไม่เข้ากับ BBR)
-net.ipv4.tcp_low_latency = 1        # Prefer low latency over throughput
-
-# ── ECN (สำคัญมากสำหรับ CAKE) ───────────────────────
-# CAKE ใช้ ECN signal แทน packet drop
-# → queue สั้นลง, latency ต่ำลง โดยไม่ต้อง drop packet
-net.ipv4.tcp_ecn = 1
-net.ipv4.tcp_ecn_fallback = 1       # Fallback ถ้า peer ไม่รองรับ
-
-# ── Connection Handling ─────────────────────────────
-net.core.somaxconn = 4096
-net.core.netdev_max_backlog = 4096
-net.ipv4.tcp_max_syn_backlog = 4096
-net.ipv4.tcp_syn_retries = 3        # ลดจาก 6 default
-net.ipv4.tcp_synack_retries = 3
-net.ipv4.tcp_max_tw_buckets = 32768
-
-# ── Keepalive (VLESS long-lived connections) ────────
-# VLESS Reality connection ค้างได้นาน
-# ตั้ง keepalive สั้น → detect dead connection เร็ว
-net.ipv4.tcp_keepalive_time = 60    # เริ่ม probe หลัง 60s idle
-net.ipv4.tcp_keepalive_intvl = 10   # probe interval
-net.ipv4.tcp_keepalive_probes = 5   # max probe count
-
-# ── Timeout Optimization ────────────────────────────
-net.ipv4.tcp_fin_timeout = 15       # ลด TIME_WAIT จาก 60s default
-net.ipv4.tcp_tw_reuse = 1           # Reuse TIME_WAIT sockets
-
-# ── Memory ──────────────────────────────────────────
-# สำหรับ 1GB RAM (262144 pages × 4096 bytes = 1GB)
-# min/pressure/max
-net.ipv4.tcp_mem = 32768 65536 131072
-
-# ── Network Device ──────────────────────────────────
-net.core.netdev_budget = 600        # packets per NAPI poll
-net.core.netdev_budget_usecs = 8000 # max μs per NAPI poll
-
-# ── IP Forward (routing / tproxy) ───────────────────
-net.ipv4.ip_forward = 1
-net.ipv6.conf.all.forwarding = 1
-
-# ── IPv6 ────────────────────────────────────────────
-net.ipv6.conf.all.disable_ipv6 = 0
-net.ipv6.conf.default.disable_ipv6 = 0
-
-# ── ARP Cache (ลด overhead เล็กน้อย) ────────────────
-net.ipv4.neigh.default.gc_thresh1 = 64
-net.ipv4.neigh.default.gc_thresh2 = 256
-net.ipv4.neigh.default.gc_thresh3 = 512
-
-# ── Swap (ป้องกัน OOM บน 1GB RAM) ──────────────────
-vm.swappiness = 10
-vm.vfs_cache_pressure = 50
-SYSCTL_EOF
-
-# Apply
-sysctl -p "$SYSCTL_FILE" 2>&1 | grep -E "^net|^vm" | while read -r line; do
-  ok "$line"
 done
 
-# Verify key values
-echo ""
-echo -e "${BOLD}KEY VALUES:${NC}"
-printf "  %-35s %s\n" "tcp_congestion_control:" "$(sysctl -n net.ipv4.tcp_congestion_control)"
-printf "  %-35s %s\n" "tcp_ecn:" "$(sysctl -n net.ipv4.tcp_ecn)"
-printf "  %-35s %s\n" "tcp_fastopen:" "$(sysctl -n net.ipv4.tcp_fastopen)"
-printf "  %-35s %s\n" "tcp_notsent_lowat:" "$(sysctl -n net.ipv4.tcp_notsent_lowat) bytes"
-printf "  %-35s %s\n" "tcp_keepalive_time:" "$(sysctl -n net.ipv4.tcp_keepalive_time)s"
-
-# ─────────────────────────────────────────
-#  PHASE 3 — CAKE QDISC
-# ─────────────────────────────────────────
-step "PHASE 3/4 — CAKE QDisc Configuration"
-info "Interface: $IFACE"
-info ""
-info "📦 CAKE Parameters (สำหรับ VPS ไทย, Client 128kbps):"
-info "   bandwidth  90Mbit  → บังคับ queue ที่ CAKE ไม่ใช่ AIS buffer"
-info "   triple-isolate      → Fair share สำหรับ 2 users"
-info "   rtt 20ms            → Target RTT สำหรับ VPS ไทย↔Client AIS"
-info "   overhead 84         → VLESS + TLS 1.3 + TCP + IPv4 header"
-info "   wash                → ลบ DSCP ที่ ISP อาจใช้ detect/throttle"
-info "   ecn                 → ใช้ ECN signal แทน drop"
-info "   nat                 → แก้ IP ก่อน classify (IFB ingress)"
-pause
-
-# ─── Cleanup เดิม ─────────────────────────────────────
-info "กำลัง cleanup qdisc เดิม..."
-tc qdisc del dev "$IFACE" root 2>/dev/null    && info "ลบ egress qdisc เดิม" || true
-tc qdisc del dev "$IFACE" ingress 2>/dev/null && info "ลบ ingress qdisc เดิม" || true
-
-if ip link show ifb0 &>/dev/null 2>&1; then
-  tc qdisc del dev ifb0 root 2>/dev/null || true
-  ip link set ifb0 down 2>/dev/null || true
-fi
-
-# ─── EGRESS CAKE ──────────────────────────────────────
-info "ตั้งค่า EGRESS CAKE (VPS → Client)..."
-
-if $CAKE_OK; then
-  tc qdisc add dev "$IFACE" root cake \
-    bandwidth 90Mbit \
-    triple-isolate \
-    nat \
-    wash \
-    split-gso \
-    overhead 84 \
-    mpu 64 \
-    rtt 20ms \
-    ecn \
-    memlimit 32m \
-    && ok "CAKE egress: ✅ ตั้งค่าสำเร็จ" \
-    || { warn "CAKE egress ล้มเหลว — fallback fq_codel"
-         tc qdisc add dev "$IFACE" root fq_codel \
-           limit 1024 flows 1024 target 5ms interval 100ms ecn \
-           && ok "fq_codel egress: ✅ fallback สำเร็จ"; }
+MODULES_PKG="linux-modules-extra-${KERNEL}"
+if dpkg -s "$MODULES_PKG" &>/dev/null 2>&1; then
+  pass "$MODULES_PKG installed"
 else
-  info "ใช้ fq_codel แทน CAKE..."
-  tc qdisc add dev "$IFACE" root fq_codel \
-    limit 1024 flows 1024 target 5ms interval 100ms ecn
-  ok "fq_codel egress: ✅ ตั้งค่าสำเร็จ"
+  warn "$MODULES_PKG not installed — CAKE may rely on built-in module"
 fi
 
-# ─── INGRESS CAKE via IFB ─────────────────────────────
-if $IFB_OK && $CAKE_OK; then
-  info "ตั้งค่า INGRESS CAKE via IFB (Client → VPS)..."
+# ─────────────────────────────────────────────────────────────────────────────
+section "3. 3x-ui / XRAY"
+# ─────────────────────────────────────────────────────────────────────────────
 
-  ip link add ifb0 type ifb 2>/dev/null || true
-  ip link set ifb0 up
-
-  tc qdisc add dev "$IFACE" handle ffff: ingress
-
-  tc filter add dev "$IFACE" parent ffff: \
-    protocol all \
-    u32 match u32 0 0 \
-    action mirred egress redirect dev ifb0 \
-    && info "Traffic redirect: eth0 → ifb0" || warn "redirect filter ล้มเหลว"
-
-  tc qdisc add dev ifb0 root cake \
-    bandwidth 90Mbit \
-    triple-isolate \
-    nat \
-    wash \
-    ingress \
-    split-gso \
-    overhead 84 \
-    mpu 64 \
-    rtt 20ms \
-    ecn \
-    memlimit 32m \
-    && ok "CAKE ingress (ifb0): ✅ ตั้งค่าสำเร็จ" \
-    || warn "CAKE ingress ล้มเหลว — ใช้ egress-only mode"
-
-  # Persist IFB
-  grep -q "^ifb" /etc/modules-load.d/99-bbr.conf 2>/dev/null || \
-    echo "ifb" >> /etc/modules-load.d/99-bbr.conf
+if command -v x-ui &>/dev/null; then
+  pass "x-ui binary found: $(which x-ui)"
+  XUI_VER=$(x-ui version 2>/dev/null || echo "unknown")
+  info "x-ui version: $XUI_VER"
 else
-  info "ข้าม ingress shaping (IFB หรือ CAKE ไม่พร้อม)"
+  fail "x-ui binary not found"
 fi
 
-# ─── Verify QDisc ─────────────────────────────────────
-echo ""
-echo -e "${BOLD}QDisc Status:${NC}"
-tc qdisc show dev "$IFACE"
-ip link show ifb0 &>/dev/null && tc qdisc show dev ifb0 || true
+XUI_STATUS=$(systemctl is-active x-ui 2>/dev/null || echo "inactive")
+XUI_ENABLED=$(systemctl is-enabled x-ui 2>/dev/null || echo "disabled")
+if [ "$XUI_STATUS" = "active" ]; then
+  pass "x-ui service: $XUI_STATUS (enabled: $XUI_ENABLED)"
+else
+  fail "x-ui service: $XUI_STATUS (enabled: $XUI_ENABLED)"
+fi
 
-# ─────────────────────────────────────────
-#  PHASE 4 — SYSTEMD PERSISTENCE
-# ─────────────────────────────────────────
-step "PHASE 4/4 — Systemd Auto-Restore Service"
-info "สร้าง service ให้ CAKE กลับมาหลัง reboot อัตโนมัติ"
-pause
+XRAY_BIN=$(command -v xray 2>/dev/null \
+  || find /usr/local/x-ui /usr/local/bin /root/.config/3x-ui -name "xray" 2>/dev/null | head -1 \
+  || echo "")
+if [ -n "$XRAY_BIN" ]; then
+  pass "xray binary: $XRAY_BIN"
+  XRAY_VER=$("$XRAY_BIN" version 2>/dev/null | head -1 || echo "unknown")
+  info "xray version: $XRAY_VER"
+else
+  warn "xray binary not found standalone (may be embedded in x-ui)"
+fi
 
-# ─── Restore Script ───────────────────────────────────
-cat > /usr/local/bin/vps-tune-restore.sh << RESTORE_SCRIPT
-#!/usr/bin/env bash
-# Auto-restore CAKE/BBR on boot
-# Generated by tune.sh
+# x-ui panel listening on 2053?
+if ss -tlnp 2>/dev/null | grep -q ':2053'; then
+  pass "Panel port 2053 is LISTENING"
+  ss -tlnp | grep ':2053' | while read -r line; do info "  $line"; done
+else
+  fail "Panel port 2053 not listening"
+fi
 
-IFACE="$IFACE"
-LOG="/var/log/vps-tune.log"
-CAKE_OK="$CAKE_OK"
-IFB_OK="$IFB_OK"
+# VLESS port 443?
+if ss -tlnp 2>/dev/null | grep -q ':443'; then
+  pass "Port 443 is LISTENING"
+else
+  warn "Port 443 not listening — inbound may not be configured yet"
+fi
 
-exec >> "\$LOG" 2>&1
-echo "[\\$(date)] === Auto-restore CAKE ==="
+# ─────────────────────────────────────────────────────────────────────────────
+section "4. TLS CERTIFICATE"
+# ─────────────────────────────────────────────────────────────────────────────
 
-# Load modules
-modprobe tcp_bbr 2>/dev/null   && echo "[OK] tcp_bbr"
-modprobe sch_cake 2>/dev/null  && echo "[OK] sch_cake"
-modprobe ifb numifbs=1 2>/dev/null && echo "[OK] ifb"
+CERT_DIR="/etc/ssl/xray"
 
-# Apply sysctl
-sysctl -p /etc/sysctl.d/99-vps-latency.conf >> "\$LOG" 2>&1
+for f in fullchain.pem key.pem cert.pem; do
+  FPATH="$CERT_DIR/$f"
+  if [ -L "$FPATH" ] && [ -f "$FPATH" ]; then
+    TARGET=$(readlink -f "$FPATH")
+    pass "Symlink OK: $FPATH → $TARGET"
+  elif [ -f "$FPATH" ]; then
+    pass "File exists: $FPATH"
+  else
+    fail "Missing: $FPATH"
+  fi
+done
 
-# Cleanup old
-tc qdisc del dev "\$IFACE" root 2>/dev/null || true
-tc qdisc del dev "\$IFACE" ingress 2>/dev/null || true
-ip link show ifb0 &>/dev/null && {
-  tc qdisc del dev ifb0 root 2>/dev/null || true
-  ip link set ifb0 down 2>/dev/null || true
+CERT_FILE="$CERT_DIR/fullchain.pem"
+if [ -f "$CERT_FILE" ]; then
+  EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null | cut -d= -f2)
+  EXPIRY_EPOCH=$(openssl x509 -enddate -noout -in "$CERT_FILE" 2>/dev/null \
+    | cut -d= -f2 | xargs -I{} date -d "{}" +%s 2>/dev/null || echo "0")
+  NOW_EPOCH=$(date +%s)
+  DAYS_LEFT=$(( (EXPIRY_EPOCH - NOW_EPOCH) / 86400 ))
+
+  if [ "$DAYS_LEFT" -gt 30 ]; then
+    pass "Certificate expires: $EXPIRY (${DAYS_LEFT} days left)"
+  elif [ "$DAYS_LEFT" -gt 0 ]; then
+    warn "Certificate expires SOON: $EXPIRY (${DAYS_LEFT} days left — renew soon)"
+  else
+    fail "Certificate EXPIRED: $EXPIRY"
+  fi
+
+  DOMAIN_IN_CERT=$(openssl x509 -noout -subject -in "$CERT_FILE" 2>/dev/null \
+    | sed 's/.*CN = //' | sed 's/,.*//')
+  info "Domain in cert: $DOMAIN_IN_CERT"
+
+  # Check SANs
+  SANS=$(openssl x509 -noout -ext subjectAltName -in "$CERT_FILE" 2>/dev/null | grep DNS || echo "none")
+  info "SANs: $SANS"
+else
+  fail "Certificate file not found at $CERT_FILE"
+fi
+
+# Certbot auto-renew hook
+HOOK="/etc/letsencrypt/renewal-hooks/deploy/restart-xui.sh"
+if [ -f "$HOOK" ] && [ -x "$HOOK" ]; then
+  pass "Certbot renew hook: $HOOK (executable)"
+else
+  warn "Certbot renew hook missing or not executable: $HOOK"
+fi
+
+# Test certbot timer/cron
+if systemctl list-timers 2>/dev/null | grep -q certbot; then
+  pass "certbot systemd timer active"
+elif crontab -l 2>/dev/null | grep -qi certbot || ls /etc/cron* 2>/dev/null | grep -qi certbot; then
+  pass "certbot cron job found"
+else
+  warn "certbot timer/cron not detected — renewal may not be automatic"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+section "5. DNS (dnsmasq)"
+# ─────────────────────────────────────────────────────────────────────────────
+
+DNS_STATUS=$(systemctl is-active dnsmasq 2>/dev/null || echo "inactive")
+DNS_ENABLED=$(systemctl is-enabled dnsmasq 2>/dev/null || echo "disabled")
+if [ "$DNS_STATUS" = "active" ]; then
+  pass "dnsmasq: $DNS_STATUS (enabled: $DNS_ENABLED)"
+else
+  fail "dnsmasq: $DNS_STATUS (enabled: $DNS_ENABLED)"
+fi
+
+# resolv.conf locked?
+RESOLV_NS=$(grep "^nameserver" /etc/resolv.conf 2>/dev/null | head -1)
+if echo "$RESOLV_NS" | grep -q "127.0.0.1"; then
+  pass "resolv.conf → nameserver 127.0.0.1"
+else
+  warn "resolv.conf not pointing to 127.0.0.1 (got: $RESOLV_NS)"
+fi
+
+RESOLV_IMMUTABLE=$(lsattr /etc/resolv.conf 2>/dev/null | awk '{print $1}')
+if echo "$RESOLV_IMMUTABLE" | grep -q "i"; then
+  pass "resolv.conf is immutable (chattr +i)"
+else
+  warn "resolv.conf is NOT immutable — may get overwritten"
+fi
+
+# DNS query tests
+for domain in google.com th.speedtest.net; do
+  RESULT=$(dig +short +time=3 "$domain" @127.0.0.1 2>/dev/null | head -1)
+  if [ -n "$RESULT" ]; then
+    pass "DNS resolve $domain → $RESULT"
+  else
+    fail "DNS resolve $domain FAILED via 127.0.0.1"
+  fi
+done
+
+# dnsmasq config
+if grep -q "listen-address=127.0.0.1" /etc/dnsmasq.conf 2>/dev/null; then
+  pass "dnsmasq listen-address=127.0.0.1 configured"
+  SERVERS=$(grep "^server=" /etc/dnsmasq.conf 2>/dev/null | head -5)
+  info "Upstream servers:"
+  echo "$SERVERS" | while read -r s; do info "    $s"; done
+else
+  warn "dnsmasq.conf may not be configured by setup script"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+section "6. TCP / BBR / SYSCTL"
+# ─────────────────────────────────────────────────────────────────────────────
+
+check_sysctl() {
+  local key="$1" expected="$2" label="$3"
+  local val
+  val=$(sysctl -n "$key" 2>/dev/null || echo "N/A")
+  if [ "$val" = "$expected" ]; then
+    pass "$label: $val"
+  else
+    warn "$label: got '$val' (expected '$expected')"
+  fi
 }
 
-# Egress
-if modprobe sch_cake 2>/dev/null; then
-  tc qdisc add dev "\$IFACE" root cake \\
-    bandwidth 90Mbit triple-isolate nat wash \\
-    split-gso overhead 84 mpu 64 rtt 20ms ecn memlimit 32m
-  echo "[OK] CAKE egress restored"
+check_sysctl "net.ipv4.tcp_congestion_control"    "bbr"     "TCP CC (BBR)"
+check_sysctl "net.core.default_qdisc"             "fq_codel" "Default qdisc"
+check_sysctl "net.ipv4.tcp_notsent_lowat"         "16384"   "tcp_notsent_lowat"
+check_sysctl "net.ipv4.tcp_slow_start_after_idle" "0"       "tcp_slow_start_after_idle"
+check_sysctl "net.ipv4.tcp_ecn"                   "1"       "TCP ECN"
+check_sysctl "net.ipv4.tcp_fastopen"              "3"       "TCP Fast Open"
+check_sysctl "net.ipv4.tcp_mtu_probing"           "1"       "MTU probing"
+check_sysctl "net.ipv4.ip_forward"                "1"       "IP forwarding"
+check_sysctl "net.ipv6.conf.all.forwarding"       "1"       "IPv6 forwarding"
+check_sysctl "net.ipv4.tcp_limit_output_bytes"    "131072"  "tcp_limit_output_bytes"
+check_sysctl "vm.swappiness"                      "10"      "vm.swappiness"
+
+BBR_LOADED=$(lsmod | grep -c tcp_bbr || echo "0")
+if [ "$BBR_LOADED" -gt 0 ]; then
+  pass "BBR kernel module loaded"
 else
-  tc qdisc add dev "\$IFACE" root fq_codel \\
-    limit 1024 flows 1024 target 5ms interval 100ms ecn
-  echo "[OK] fq_codel egress restored (CAKE fallback)"
+  warn "BBR module not in lsmod (may be built-in)"
 fi
 
-# Ingress via IFB
-if modprobe ifb numifbs=1 2>/dev/null && modprobe sch_cake 2>/dev/null; then
-  ip link add ifb0 type ifb 2>/dev/null || true
-  ip link set ifb0 up
-  tc qdisc add dev "\$IFACE" handle ffff: ingress
-  tc filter add dev "\$IFACE" parent ffff: protocol all \\
-    u32 match u32 0 0 \\
-    action mirred egress redirect dev ifb0
-  tc qdisc add dev ifb0 root cake \\
-    bandwidth 90Mbit triple-isolate nat wash ingress \\
-    split-gso overhead 84 mpu 64 rtt 20ms ecn memlimit 32m
-  echo "[OK] CAKE ingress restored"
-fi
-
-echo "[\\$(date)] Restore complete"
-RESTORE_SCRIPT
-
-chmod +x /usr/local/bin/vps-tune-restore.sh
-ok "Restore script: /usr/local/bin/vps-tune-restore.sh"
-
-# ─── Systemd Service ──────────────────────────────────
-cat > /etc/systemd/system/vps-tune.service << 'SERVICE_EOF'
-[Unit]
-Description=VPS Tune — CAKE QDisc + BBR Restore
-Documentation=https://github.com/YOUR/REPO
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/vps-tune-restore.sh
-RemainAfterExit=yes
-StandardOutput=journal
-StandardError=journal
-TimeoutSec=30
-
-[Install]
-WantedBy=multi-user.target
-SERVICE_EOF
-
-systemctl daemon-reload
-systemctl enable vps-tune.service --quiet
-systemctl start vps-tune.service
-
-if systemctl is-active --quiet vps-tune.service; then
-  ok "vps-tune.service: ✅ Active"
+SYSCTL_FILE="/etc/sysctl.d/99-ais-128k.conf"
+if [ -f "$SYSCTL_FILE" ]; then
+  pass "sysctl config file exists: $SYSCTL_FILE"
 else
-  warn "vps-tune.service ไม่ active — ตรวจ: journalctl -u vps-tune.service"
+  warn "sysctl config file not found: $SYSCTL_FILE"
 fi
 
-# ─────────────────────────────────────────
-#  FINAL STATUS REPORT
-# ─────────────────────────────────────────
-step "FINAL STATUS REPORT"
-echo ""
+# conntrack
+CT_VAL=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null || echo "N/A")
+info "nf_conntrack_max: $CT_VAL"
 
-# BBR
-CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-printf "  %-30s" "Congestion Control:"
-[ "$CC" = "bbr" ] && echo -e "${GREEN}BBR ✅${NC}" || echo -e "${YELLOW}$CC ⚠️${NC}"
+# keepalive
+info "tcp_keepalive_time : $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)"
+info "tcp_keepalive_intvl: $(sysctl -n net.ipv4.tcp_keepalive_intvl 2>/dev/null)"
 
-# CAKE
-QDISC=$(tc qdisc show dev "$IFACE" 2>/dev/null)
-printf "  %-30s" "QDisc Egress:"
-echo "$QDISC" | grep -q cake  && echo -e "${GREEN}CAKE ✅${NC}" || \
-echo "$QDISC" | grep -q codel && echo -e "${YELLOW}fq_codel ⚠️${NC}" || \
-echo -e "${RED}ไม่พบ ❌${NC}"
+# ─────────────────────────────────────────────────────────────────────────────
+section "7. QDISC (CAKE / fq_codel)"
+# ─────────────────────────────────────────────────────────────────────────────
 
-# IFB ingress
-printf "  %-30s" "QDisc Ingress (IFB):"
-if ip link show ifb0 &>/dev/null 2>&1; then
-  tc qdisc show dev ifb0 2>/dev/null | grep -q cake && \
-    echo -e "${GREEN}CAKE ✅${NC}" || echo -e "${YELLOW}ไม่มี qdisc ⚠️${NC}"
+if [ -z "$IFACE" ]; then
+  fail "Cannot detect default interface — skipping qdisc check"
 else
-  echo -e "${YELLOW}ไม่มี IFB (egress-only mode)${NC}"
+  QDISC_OUT=$(tc qdisc show dev "$IFACE" 2>/dev/null)
+  info "qdisc on $IFACE:"
+  echo "$QDISC_OUT" | while read -r line; do info "    $line"; done
+
+  if echo "$QDISC_OUT" | grep -q "cake"; then
+    pass "CAKE qdisc active on $IFACE"
+    BW_IN_USE=$(echo "$QDISC_OUT" | grep -oP 'bandwidth \K[0-9]+[KMGkbitKbit]+' | head -1)
+    info "CAKE bandwidth: ${BW_IN_USE:-not shown}"
+  elif echo "$QDISC_OUT" | grep -q "fq_codel"; then
+    warn "fq_codel active on $IFACE (CAKE fallback — still good)"
+  else
+    fail "No CAKE or fq_codel found on $IFACE"
+  fi
+
+  # IFB ingress
+  IFB_DEV="ifb0"
+  if ip link show "$IFB_DEV" &>/dev/null 2>&1; then
+    IFB_QDISC=$(tc qdisc show dev "$IFB_DEV" 2>/dev/null)
+    info "qdisc on $IFB_DEV (ingress IFB):"
+    echo "$IFB_QDISC" | while read -r line; do info "    $line"; done
+    if echo "$IFB_QDISC" | grep -q "cake"; then
+      pass "CAKE ingress shaping active on $IFB_DEV"
+    else
+      warn "IFB device exists but no CAKE ingress qdisc"
+    fi
+  else
+    warn "IFB device ($IFB_DEV) not present — ingress shaping not active"
+  fi
+
+  # ais-qdisc service
+  AIS_STATUS=$(systemctl is-active ais-qdisc 2>/dev/null || echo "inactive")
+  AIS_ENABLED=$(systemctl is-enabled ais-qdisc 2>/dev/null || echo "disabled")
+  if [ "$AIS_STATUS" = "active" ]; then
+    pass "ais-qdisc service: $AIS_STATUS (enabled: $AIS_ENABLED)"
+  else
+    warn "ais-qdisc service: $AIS_STATUS (enabled: $AIS_ENABLED) — qdisc may not persist after reboot"
+  fi
 fi
 
-# ECN
-printf "  %-30s" "ECN:"
-[ "$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)" = "1" ] && \
-  echo -e "${GREEN}Enabled ✅${NC}" || echo -e "${YELLOW}Disabled ⚠️${NC}"
+# ─────────────────────────────────────────────────────────────────────────────
+section "8. NFTABLES FIREWALL"
+# ─────────────────────────────────────────────────────────────────────────────
 
-# TFO
-printf "  %-30s" "TCP Fast Open:"
-TFO=$(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)
-[ "$TFO" = "3" ] && echo -e "${GREEN}Client+Server ✅${NC}" || echo -e "${YELLOW}$TFO${NC}"
+NFT_STATUS=$(systemctl is-active nftables 2>/dev/null || echo "inactive")
+NFT_ENABLED=$(systemctl is-enabled nftables 2>/dev/null || echo "disabled")
+if [ "$NFT_STATUS" = "active" ]; then
+  pass "nftables: $NFT_STATUS (enabled: $NFT_ENABLED)"
+else
+  fail "nftables: $NFT_STATUS (enabled: $NFT_ENABLED)"
+fi
 
-# notsent_lowat
-printf "  %-30s" "notsent_lowat:"
-echo -e "${GREEN}$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null) bytes ✅${NC}"
+# Check key rules exist
+NFT_RULES=$(nft list ruleset 2>/dev/null || echo "")
 
-# Service
-printf "  %-30s" "vps-tune.service:"
-systemctl is-active --quiet vps-tune.service && \
-  echo -e "${GREEN}Active (auto-restore) ✅${NC}" || echo -e "${YELLOW}ไม่ active ⚠️${NC}"
+if echo "$NFT_RULES" | grep -q "dport 443"; then
+  pass "nftables: port 443 rule present"
+else
+  fail "nftables: port 443 rule NOT found"
+fi
 
-# Memory
+if echo "$NFT_RULES" | grep -q "dport 2053"; then
+  pass "nftables: port 2053 rule present"
+else
+  fail "nftables: port 2053 rule NOT found"
+fi
+
+if echo "$NFT_RULES" | grep -q "ssh_blocklist"; then
+  pass "nftables: SSH brute-force blocklist present"
+else
+  warn "nftables: SSH blocklist not found"
+fi
+
+if echo "$NFT_RULES" | grep -q "masquerade"; then
+  pass "nftables: NAT masquerade rule present"
+else
+  warn "nftables: NAT masquerade rule not found"
+fi
+
+if echo "$NFT_RULES" | grep -q "dscp"; then
+  pass "nftables: DSCP QoS marking rules present"
+else
+  warn "nftables: DSCP marking rules not found"
+fi
+
+# Show SSH port in use
+SSH_PORT_IN_NFT=$(echo "$NFT_RULES" | grep -oP 'dport \K[0-9]+' | grep -v "^443$" | grep -v "^2053$" | grep -v "^53$" | head -1)
+[ -n "$SSH_PORT_IN_NFT" ] && info "SSH port in nftables: $SSH_PORT_IN_NFT"
+
+# ─────────────────────────────────────────────────────────────────────────────
+section "9. FILE DESCRIPTORS / LIMITS"
+# ─────────────────────────────────────────────────────────────────────────────
+
+LIMITS_CONF="/etc/security/limits.conf"
+if grep -q "xray-limits" "$LIMITS_CONF" 2>/dev/null; then
+  pass "limits.conf: xray fd limits configured"
+  grep -A4 "xray-limits" "$LIMITS_CONF" | while read -r l; do info "    $l"; done
+else
+  warn "limits.conf: xray fd limits not found"
+fi
+
+OVERRIDE_FILE="/etc/systemd/system/x-ui.service.d/override.conf"
+if [ -f "$OVERRIDE_FILE" ]; then
+  pass "systemd override: $OVERRIDE_FILE exists"
+  cat "$OVERRIDE_FILE" | while read -r l; do info "    $l"; done
+else
+  warn "systemd override not found: $OVERRIDE_FILE"
+fi
+
+# Check actual fd limit of x-ui process
+XUI_PID=$(pgrep -f "x-ui" | head -1 || echo "")
+if [ -n "$XUI_PID" ]; then
+  FD_SOFT=$(cat /proc/"$XUI_PID"/limits 2>/dev/null | awk '/open files/{print $4}')
+  FD_HARD=$(cat /proc/"$XUI_PID"/limits 2>/dev/null | awk '/open files/{print $5}')
+  if [ "${FD_SOFT:-0}" -ge 65535 ] 2>/dev/null; then
+    pass "x-ui process fd limit: soft=$FD_SOFT hard=$FD_HARD"
+  else
+    warn "x-ui process fd limit may be low: soft=${FD_SOFT:-?} hard=${FD_HARD:-?}"
+  fi
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+section "10. CONNECTIVITY TEST"
+# ─────────────────────────────────────────────────────────────────────────────
+
+# HTTPS to panel
+DOMAIN_IN_CERT_CHECK=$(openssl x509 -noout -subject -in "$CERT_DIR/fullchain.pem" 2>/dev/null \
+  | sed 's/.*CN = //' | sed 's/,.*//' || echo "")
+
+if [ -n "$DOMAIN_IN_CERT_CHECK" ]; then
+  HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" \
+    "https://$DOMAIN_IN_CERT_CHECK:2053/" --connect-timeout 5 2>/dev/null || echo "000")
+  if [[ "$HTTP_CODE" =~ ^(200|301|302|400|401|403|404)$ ]]; then
+    pass "Panel HTTPS reachable: https://$DOMAIN_IN_CERT_CHECK:2053/ (HTTP $HTTP_CODE)"
+  else
+    warn "Panel HTTPS: https://$DOMAIN_IN_CERT_CHECK:2053/ → HTTP $HTTP_CODE (may need cert config in panel UI)"
+  fi
+fi
+
+# Outbound internet
+OUTBOUND=$(curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null || echo "")
+if [ -n "$OUTBOUND" ]; then
+  pass "Outbound internet: OK (public IP = $OUTBOUND)"
+else
+  fail "Outbound internet: FAILED"
+fi
+
+# th.speedtest.net reachable (Reality SNI target)
+SNI_IP=$(dig +short th.speedtest.net @127.0.0.1 2>/dev/null | tail -1)
+if [ -n "$SNI_IP" ]; then
+  SNI_REACH=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
+    "https://th.speedtest.net" 2>/dev/null || echo "000")
+  if [[ "$SNI_REACH" =~ ^(200|301|302|400)$ ]]; then
+    pass "th.speedtest.net reachable ($SNI_IP, HTTP $SNI_REACH) — Reality SNI OK"
+  else
+    warn "th.speedtest.net → $SNI_IP but HTTP $SNI_REACH — Reality may still work"
+  fi
+else
+  fail "th.speedtest.net DNS failed — Reality handshake will fail"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+section "11. LOG FILE"
+# ─────────────────────────────────────────────────────────────────────────────
+
+LOG_FILE="/var/log/3x-ui-ais-setup.log"
+if [ -f "$LOG_FILE" ]; then
+  LOG_SIZE=$(du -sh "$LOG_FILE" | cut -f1)
+  LOG_LINES=$(wc -l < "$LOG_FILE")
+  pass "Setup log exists: $LOG_FILE ($LOG_SIZE, $LOG_LINES lines)"
+  info "Last 5 lines:"
+  tail -5 "$LOG_FILE" | while read -r l; do info "    $l"; done
+else
+  warn "Setup log not found: $LOG_FILE (setup may not have been run yet)"
+fi
+
+HINT_FILE="/root/xray-inbound-settings.txt"
+if [ -f "$HINT_FILE" ]; then
+  pass "Xray hints file: $HINT_FILE"
+else
+  warn "Xray hints file not found: $HINT_FILE"
+fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+section "SUMMARY"
+# ─────────────────────────────────────────────────────────────────────────────
+
+TOTAL=$(( PASS + WARN + FAIL ))
+
 echo ""
-echo -e "${BOLD}Memory:${NC}"
-free -h | grep -E "Mem|Swap" | while read -r line; do echo "  $line"; done
-
-# ─────────────────────────────────────────
-#  3x-ui XRAY SOCKOPT REMINDER
-# ─────────────────────────────────────────
+echo -e "${BCYN}╔═════════════════════════════════════════╗${RST}"
+echo -e "${BCYN}║           DIAGNOSTIC RESULTS            ║${RST}"
+echo -e "${BCYN}╠═════════════════════════════════════════╣${RST}"
+printf "${BCYN}║${RST}  ${BGRN}%-6s PASS${RST}  %-26s ${BCYN}║${RST}\n" "$PASS" ""
+printf "${BCYN}║${RST}  ${BYLW}%-6s WARN${RST}  %-26s ${BCYN}║${RST}\n" "$WARN" "(non-critical)"
+printf "${BCYN}║${RST}  ${BRED}%-6s FAIL${RST}  %-26s ${BCYN}║${RST}\n" "$FAIL" "(needs attention)"
+printf "${BCYN}║${RST}  %-6s TOTAL %-26s ${BCYN}║${RST}\n" "$TOTAL" ""
+echo -e "${BCYN}╚═════════════════════════════════════════╝${RST}"
 echo ""
-echo -e "${BOLD}${YELLOW}📋 3x-ui Config Recommendation:${NC}"
-cat << 'XRAY_TIP'
-  ใน Panel → Inbound → VLESS Reality → เพิ่ม sockopt:
-  ┌─────────────────────────────────────────────────────┐
-  │  "sockopt": {                                        │
-  │    "tcpFastOpen": true,       ← ตรงกับ sysctl       │
-  │    "tcpKeepAliveIdle": 60,    ← ตรงกับ keepalive    │
-  │    "tcpKeepAliveInterval": 10,                       │
-  │    "tcpKeepAliveRetry": 5,                           │
-  │    "domainStrategy": "IPIfNonMatch"                  │
-  │  }                                                   │
-  └─────────────────────────────────────────────────────┘
-XRAY_TIP
 
-# ─────────────────────────────────────────
-#  COMPLETE
-# ─────────────────────────────────────────
+if [ "$FAIL" -eq 0 ] && [ "$WARN" -eq 0 ]; then
+  echo -e "${BGRN}  ✓ Everything looks perfect!${RST}"
+elif [ "$FAIL" -eq 0 ]; then
+  echo -e "${BYLW}  ⚠ Setup OK but $WARN warning(s) — review above${RST}"
+else
+  echo -e "${BRED}  ✗ $FAIL failure(s) found — check [FAIL] items above${RST}"
+fi
+
 echo ""
-echo -e "${GREEN}${BOLD}"
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║           ✅  TUNE COMPLETE — File 2/2                  ║"
-echo "╠══════════════════════════════════════════════════════════╣"
-echo "║  Reboot แนะนำ เพื่อให้ทุกค่ามีผลเต็มรูปแบบ             ║"
-echo "║  หลัง reboot: vps-tune.service จะ restore CAKE อัตโนมัติ ║"
-echo "╠══════════════════════════════════════════════════════════╣"
-echo "║  ตรวจสอบหลัง reboot:                                    ║"
-echo "║    tc qdisc show dev eth0                                ║"
-echo "║    sysctl net.ipv4.tcp_congestion_control                ║"
-echo "║    systemctl status vps-tune.service                     ║"
-echo "╚══════════════════════════════════════════════════════════╝"
-echo -e "${NC}"
-
-echo "[$(date)] tune.sh complete" >> "$LOG_FILE"
