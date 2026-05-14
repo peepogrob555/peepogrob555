@@ -5,7 +5,7 @@
 
 **By (IG:peepogrob555 FB:Shogun)**
 
-สคริปต์ตั้งค่า VPS แบบ production-grade สำหรับ 3x-ui + VLESS+Reality
+สคริปต์ตั้งค่า VPS สำหรับ 3x-ui + VLESS+Reality
 บน AIS มือถือ 128kbps
 
 **เป้าหมายหลัก: ลด jitter และ queue delay — ไม่ใช่เพิ่ม throughput**
