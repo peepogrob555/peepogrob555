@@ -1,308 +1,367 @@
 #!/usr/bin/env bash
-# ╔══════════════════════════════════════════════════════════════════╗
-# ║              VPS SETUP SCRIPT — File 1/2                        ║
-# ║  Ubuntu 22.04 | Xver Cloud TH | VLESS Reality | 3x-ui           ║
-# ║  Author: AI-Generated for AIS 128kbps Low-Latency Profile       ║
-# ╚══════════════════════════════════════════════════════════════════╝
-# Usage:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/YOUR/REPO/main/setup.sh)
-#
-# หลังรันไฟล์นี้เสร็จ → รัน tune.sh เพื่อ optimize kernel/CAKE/BBR
-
 set -euo pipefail
 
-# ─────────────────────────────────────────
-#  COLORS & HELPERS
-# ─────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+BRED='\033[1;31m'
+BGRN='\033[1;32m'
+BYLW='\033[1;33m'
+BCYN='\033[1;36m'
+RST='\033[0m'
 
-LOG_FILE="/var/log/vps-setup.log"
-exec > >(tee -a "$LOG_FILE") 2>&1
+LOG="/var/log/ais-vps-setup.log"
 
-info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
-ok()      { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-err()     { echo -e "${RED}[ERROR]${NC} $*"; exit 1; }
-step()    { echo -e "\n${BOLD}${CYAN}━━━ $* ${NC}"; }
-pause()   {
-  echo -e "\n${YELLOW}▶ กด [Enter] เพื่อดำเนินการต่อ ...${NC}"
-  read -r < /dev/tty
-}
+PORT=443
+SNI="th.speedtest.net"
+FINGERPRINT="firefox"
+FLOW="xtls-rprx-vision"
+NETWORK="tcp"
+SECURITY="reality"
+ENCRYPTION="none"
+SPX="/"
 
-# ─────────────────────────────────────────
-#  ROOT CHECK
-# ─────────────────────────────────────────
-[[ "$EUID" -ne 0 ]] && err "ต้องรันด้วย root: sudo bash setup.sh"
+if [[ $EUID -ne 0 ]]; then
+  echo -e "${BRED}[FATAL] Must run as root${RST}"
+  exit 1
+fi
 
-# ─────────────────────────────────────────
-#  BANNER
-# ─────────────────────────────────────────
+exec > >(tee -a "$LOG") 2>&1
+
 clear
-echo -e "${BOLD}${GREEN}"
-cat << 'BANNER'
- ██╗   ██╗██████╗ ███████╗    ███████╗███████╗████████╗██╗   ██╗██████╗ 
- ██║   ██║██╔══██╗██╔════╝    ██╔════╝██╔════╝╚══██╔══╝██║   ██║██╔══██╗
- ██║   ██║██████╔╝███████╗    ███████╗█████╗     ██║   ██║   ██║██████╔╝
- ╚██╗ ██╔╝██╔═══╝ ╚════██║    ╚════██║██╔══╝     ██║   ██║   ██║██╔═══╝ 
-  ╚████╔╝ ██║     ███████║    ███████║███████╗   ██║   ╚██████╔╝██║     
-   ╚═══╝  ╚═╝     ╚══════╝    ╚══════╝╚══════╝   ╚═╝    ╚═════╝ ╚═╝     
-BANNER
-echo -e "${NC}"
-echo -e "${CYAN}  VPS Setup Script — Xver Cloud TH | VLESS Reality | Ubuntu 22.04${NC}"
-echo -e "${CYAN}  Log: $LOG_FILE${NC}"
-echo -e "  $(date)"
-echo ""
+echo "================================================="
+echo " AIS 128kbps Xray Reality Optimizer"
+echo "================================================="
+echo
 
-# ─────────────────────────────────────────
-#  STEP 0 — SYSTEM INFO SNAPSHOT
-# ─────────────────────────────────────────
-step "STEP 0 — System Snapshot"
-info "OS      : $(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep PRETTY | cut -d= -f2)"
-info "Kernel  : $(uname -r)"
-info "CPU     : $(nproc) core(s)"
-info "RAM     : $(free -h | awk '/^Mem:/{print $2}')"
-info "Disk    : $(df -h / | awk 'NR==2{print $4}') free"
-info "IP      : $(curl -s --max-time 5 ifconfig.me || hostname -I | awk '{print $1}')"
-info "Interface: $(ip route | grep default | awk '{print $5}' | head -1)"
-IFACE=$(ip route | grep default | awk '{print $5}' | head -1)
-[ -z "$IFACE" ] && err "ไม่พบ default interface — ตรวจสอบ network"
-ok "Interface: $IFACE"
+read -rp "SERVER_DOMAIN (domain or IP): " SERVER_DOMAIN
+[[ -z "$SERVER_DOMAIN" ]] && { echo -e "${BRED}[FATAL] SERVER_DOMAIN cannot be empty${RST}"; exit 1; }
 
-# ─────────────────────────────────────────
-#  STEP 1 — APT UPDATE & UPGRADE
-# ─────────────────────────────────────────
-step "STEP 1 — APT Update & Upgrade"
-info "กำลัง update apt package list..."
-pause
-
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq && ok "apt update สำเร็จ"
-
-info "กำลัง upgrade packages (อาจใช้เวลา 1-3 นาที)..."
-apt-get upgrade -y -qq \
-  -o Dpkg::Options::="--force-confdef" \
-  -o Dpkg::Options::="--force-confold" \
-  && ok "apt upgrade สำเร็จ"
-
-apt-get autoremove -y -qq && apt-get autoclean -qq
-ok "Cleanup เสร็จ"
-
-# ─────────────────────────────────────────
-#  STEP 2 — INSTALL REQUIRED PACKAGES
-# ─────────────────────────────────────────
-step "STEP 2 — Install Required Packages"
-info "ติดตั้ง packages ที่จำเป็น..."
-pause
-
-PKGS=(
-  curl wget git unzip tar
-  ca-certificates gnupg lsb-release
-  ufw fail2ban
-  iproute2 iputils-ping
-  net-tools tcpdump
-  htop iotop iftop
-  cron logrotate
-  # CAKE/Traffic shaping
-  iproute2            # tc command
-  linux-modules-extra-$(uname -r) # CAKE, ifb modules
-  # Utilities
-  jq bc
-)
-
-for pkg in "${PKGS[@]}"; do
-  if ! dpkg -l "$pkg" &>/dev/null 2>&1; then
-    apt-get install -y -qq "$pkg" && ok "ติดตั้ง $pkg" || warn "ไม่สามารถติดตั้ง $pkg (ข้ามไป)"
+DETECTED_SSH=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -n1 || true)
+if [[ -n "$DETECTED_SSH" ]]; then
+  echo "Detected SSH port: $DETECTED_SSH"
+  read -rp "Use detected SSH port $DETECTED_SSH? [Y/n]: " SSH_CONFIRM
+  if [[ "$SSH_CONFIRM" =~ ^[Nn]$ ]]; then
+    read -rp "Enter SSH port manually: " SSH_PORT
   else
-    info "$pkg — มีอยู่แล้ว"
+    SSH_PORT="$DETECTED_SSH"
   fi
+else
+  read -rp "SSH port detection failed. Enter SSH port manually: " SSH_PORT
+fi
+[[ -z "$SSH_PORT" ]] && { echo -e "${BRED}[FATAL] Cannot determine SSH port${RST}"; exit 1; }
+
+read -rp "Concurrent users [default=2]: " USER_COUNT
+USER_COUNT=${USER_COUNT:-2}
+if ! [[ "$USER_COUNT" =~ ^[0-9]+$ ]] || [[ "$USER_COUNT" -lt 1 ]]; then
+  echo -e "${BRED}[FATAL] USER_COUNT must be integer >= 1${RST}"
+  exit 1
+fi
+
+declare -a USER_TAGS
+for ((i=1; i<=USER_COUNT; i++)); do
+  read -rp "Tag for user $i (e.g. phone): " TAG
+  USER_TAGS[$i]="$TAG"
 done
 
-# ตรวจ CAKE module
-info "ตรวจสอบ CAKE module..."
-if modprobe sch_cake 2>/dev/null; then
-  ok "CAKE module พร้อมใช้งาน"
-else
-  warn "CAKE module ไม่พบ — จะลองติดตั้ง kernel extras..."
-  apt-get install -y -qq "linux-modules-extra-$(uname -r)" 2>/dev/null || \
-    warn "ติดตั้ง kernel extras ไม่ได้ — CAKE อาจต้องการ kernel upgrade"
-fi
+clear
+echo "================ SUMMARY ================"
+printf "%-20s %s\n" "Server domain"  "$SERVER_DOMAIN"
+printf "%-20s %s\n" "SSH port"       "$SSH_PORT"
+printf "%-20s %s\n" "Users"          "$USER_COUNT"
+printf "%-20s %s\n" "VLESS port"     "$PORT"
+printf "%-20s %s\n" "SNI"            "$SNI"
+printf "%-20s %s\n" "Fingerprint"    "$FINGERPRINT"
+printf "%-20s %s\n" "Flow"           "$FLOW"
+printf "%-20s %s\n" "Security"       "$SECURITY"
+echo "========================================="
+read -rp "Proceed? [y/N]: " CONFIRM
+[[ "$CONFIRM" =~ ^[Yy]$ ]] || { echo "Aborted."; exit 0; }
 
-# ตรวจ ifb module
-if modprobe ifb numifbs=1 2>/dev/null; then
-  ok "IFB module พร้อมใช้งาน"
-  ip link add ifb0 type ifb 2>/dev/null || true
-  ip link set ifb0 up 2>/dev/null || true
-else
-  warn "IFB module ไม่พบ — Ingress CAKE จะถูกข้ามใน tune.sh"
-fi
+echo -e "\n${BCYN}[STEP 1] Starting system_update ...${RST}"
+apt-get update && apt-get upgrade -y
+apt-get install -y nftables dnsmasq iproute2 curl wget ca-certificates gnupg dnsutils openssl
+bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
+which xray >/dev/null 2>&1 || { echo -e "${BRED}[FATAL] xray binary not found${RST}"; exit 1; }
+XRAY_VERSION=$(xray version | head -n1)
+echo "$XRAY_VERSION"
+echo -e "${BGRN}[STEP 1] Done ✓${RST}"
 
-# ─────────────────────────────────────────
-#  STEP 3 — SWAP (ถ้า RAM ≤ 1GB)
-# ─────────────────────────────────────────
-step "STEP 3 — Swap Setup"
-TOTAL_RAM_MB=$(free -m | awk '/^Mem:/{print $2}')
-SWAP_CURRENT=$(swapon --show | wc -l)
+echo -e "\n${BCYN}[STEP 2] Generating credentials ...${RST}"
+KEYPAIR=$(xray x25519)
+SERVER_PRIVKEY=$(echo "$KEYPAIR" | awk '/Private key/{print $3}')
+SERVER_PUBKEY=$(echo "$KEYPAIR"  | awk '/Public key/{print $3}')
 
-if [ "$SWAP_CURRENT" -le 1 ] && [ "$TOTAL_RAM_MB" -le 1024 ]; then
-  info "RAM ${TOTAL_RAM_MB}MB และไม่มี Swap — กำลังสร้าง 512MB Swap..."
-  pause
-  fallocate -l 512M /swapfile
-  chmod 600 /swapfile
-  mkswap /swapfile -q
-  swapon /swapfile
-  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  sysctl -w vm.swappiness=10
-  echo "vm.swappiness=10" >> /etc/sysctl.d/99-swap.conf
-  ok "Swap 512MB สร้างเสร็จ (swappiness=10)"
-else
-  info "Swap มีอยู่แล้ว หรือ RAM เพียงพอ — ข้ามขั้นตอนนี้"
-fi
+declare -a USER_UUIDS
+declare -a USER_SIDS
+for ((i=1; i<=USER_COUNT; i++)); do
+  USER_UUIDS[$i]=$(xray uuid)
+  USER_SIDS[$i]=$(openssl rand -hex 8)
+done
 
-# ─────────────────────────────────────────
-#  STEP 4 — UFW FIREWALL
-# ─────────────────────────────────────────
-step "STEP 4 — UFW Firewall"
-info "จะตั้งค่า UFW เปิด port: 22 (SSH), 80 (HTTP/ACME), 443 (VLESS), 2053 (3x-ui)"
-info "⚠️  UFW จะ enable หลังจากตั้งค่า — SSH port 22 จะเปิดไว้เสมอ"
-pause
+printf "┌────────┬──────────────────────────────────────┬──────────────────┐\n"
+printf "│ User   │ UUID                                 │ shortId          │\n"
+printf "├────────┼──────────────────────────────────────┼──────────────────┤\n"
+for ((i=1; i<=USER_COUNT; i++)); do
+  printf "│ %-6s │ %-36s │ %-16s │\n" "${USER_TAGS[$i]}" "${USER_UUIDS[$i]}" "${USER_SIDS[$i]}"
+done
+printf "└────────┴──────────────────────────────────────┴──────────────────┘\n"
+printf "Public key (shared): %s\n" "$SERVER_PUBKEY"
+echo -e "${BGRN}[STEP 2] Done ✓${RST}"
 
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-
-# SSH — สำคัญมาก อย่าลืม
-ufw allow 22/tcp comment "SSH"
-
-# HTTP (ACME cert / Xray fallback)
-ufw allow 80/tcp comment "HTTP-ACME"
-
-# VLESS Reality
-ufw allow 443/tcp comment "VLESS-Reality"
-ufw allow 443/udp comment "VLESS-Reality-UDP"
-
-# 3x-ui Panel
-ufw allow 2053/tcp comment "3x-ui-Panel"
-
-# Enable
-ufw --force enable
-ok "UFW เปิดใช้งาน"
-ufw status numbered
-
-# ─────────────────────────────────────────
-#  STEP 5 — FAIL2BAN (SSH protection)
-# ─────────────────────────────────────────
-step "STEP 5 — Fail2Ban"
-info "ตั้งค่า fail2ban ป้องกัน SSH brute force..."
-
-cat > /etc/fail2ban/jail.local << 'F2B'
-[DEFAULT]
-bantime  = 3600
-findtime = 600
-maxretry = 5
-ignoreip = 127.0.0.1/8
-
-[sshd]
-enabled  = true
-port     = ssh
-logpath  = %(sshd_log)s
-backend  = %(syslog_backend)s
-F2B
-
-systemctl enable fail2ban --quiet
-systemctl restart fail2ban
-ok "Fail2Ban เปิดใช้งาน"
-
-# ─────────────────────────────────────────
-#  STEP 6 — 3x-ui INSTALL
-# ─────────────────────────────────────────
-step "STEP 6 — 3x-ui Installation"
-echo ""
-echo -e "${YELLOW}┌──────────────────────────────────────────────────────┐${NC}"
-echo -e "${YELLOW}│  จะติดตั้ง 3x-ui (MHSanaei) — Official Latest        │${NC}"
-echo -e "${YELLOW}│  Source: github.com/MHSanaei/3x-ui                   │${NC}"
-echo -e "${YELLOW}│  Panel จะอยู่ที่: http://YOUR-IP:2053                 │${NC}"
-echo -e "${YELLOW}│  ระบบจะถามตั้ง username/password ระหว่างติดตั้ง       │${NC}"
-echo -e "${YELLOW}└──────────────────────────────────────────────────────┘${NC}"
-echo ""
-echo -e "${BOLD}ติดตั้ง 3x-ui ไหม?${NC}"
-echo -e "  [Enter]  = ใช่ ติดตั้งเลย"
-echo -e "  [Ctrl+C] = ออกจาก script"
-echo ""
-read -rp "▶ กด Enter เพื่อติดตั้ง 3x-ui: " < /dev/tty
-
-info "กำลังดาวน์โหลดและติดตั้ง 3x-ui..."
-bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) || \
-  err "ติดตั้ง 3x-ui ไม่สำเร็จ — ตรวจสอบ internet connection"
-
-ok "3x-ui ติดตั้งสำเร็จ"
-
-# รอให้ service start
-sleep 3
-if systemctl is-active --quiet x-ui; then
-  ok "x-ui service กำลังทำงาน"
-else
-  warn "x-ui service ยังไม่ start — ลอง: systemctl start x-ui"
-fi
-
-# ─────────────────────────────────────────
-#  STEP 7 — LOGROTATE
-# ─────────────────────────────────────────
-step "STEP 7 — Log Rotation"
-cat > /etc/logrotate.d/vps-setup << 'LR'
-/var/log/vps-setup.log
-/var/log/vps-tune.log {
-    weekly
-    rotate 4
-    compress
-    missingok
-    notifempty
-}
-LR
-ok "Logrotate ตั้งค่าเสร็จ"
-
-# ─────────────────────────────────────────
-#  STEP 8 — PRE-CHECK สำหรับ tune.sh
-# ─────────────────────────────────────────
-step "STEP 8 — Pre-check ก่อนรัน tune.sh"
-
-echo ""
-echo -e "${BOLD}ตรวจสอบ modules ที่ tune.sh ต้องการ:${NC}"
-
-check_module() {
-  local mod="$1"
-  if modprobe "$mod" 2>/dev/null; then
-    echo -e "  ${GREEN}✅ $mod${NC}"
+echo -e "\n${BCYN}[STEP 3] Configuring Xray ...${RST}"
+CONFIG_PATH="/usr/local/etc/xray/config.json"
+if [[ -f "$CONFIG_PATH" ]] && systemctl is-active --quiet xray; then
+  read -rp "Overwrite existing xray config? [y/N]: " OVERWRITE
+  if [[ ! "$OVERWRITE" =~ ^[Yy]$ ]]; then
+    echo -e "${BYLW}[STEP 3] Skipped (existing config kept)${RST}"
   else
-    echo -e "  ${RED}❌ $mod — ไม่พบ (tune.sh จะ handle เอง)${NC}"
+    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak.$(date +%s)"
+    WRITE_CONFIG=1
   fi
+else
+  WRITE_CONFIG=1
+fi
+
+if [[ "${WRITE_CONFIG:-0}" -eq 1 ]]; then
+  mkdir -p /usr/local/etc/xray /var/log/xray
+
+  CLIENTS_JSON=""
+  SHORTIDS_JSON=""
+  for ((i=1; i<=USER_COUNT; i++)); do
+    CLIENTS_JSON+="{\"id\":\"${USER_UUIDS[$i]}\",\"flow\":\"${FLOW}\"}"
+    SHORTIDS_JSON+="\"${USER_SIDS[$i]}\""
+    if [[ $i -lt $USER_COUNT ]]; then
+      CLIENTS_JSON+=","
+      SHORTIDS_JSON+=","
+    fi
+  done
+
+  cat > "$CONFIG_PATH" <<EOF
+{
+  "log": {
+    "access": "/var/log/xray/access.log",
+    "error": "/var/log/xray/error.log",
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [ ${CLIENTS_JSON} ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "${NETWORK}",
+        "security": "${SECURITY}",
+        "realitySettings": {
+          "dest": "${SNI}:443",
+          "serverNames": ["${SNI}"],
+          "privateKey": "${SERVER_PRIVKEY}",
+          "shortIds": [ ${SHORTIDS_JSON} ],
+          "fingerprint": "${FINGERPRINT}"
+        }
+      }
+    }
+  ],
+  "outbounds": [{ "protocol": "freedom" }]
+}
+EOF
+
+  systemctl enable xray
+  systemctl restart xray
+  if ! systemctl is-active --quiet xray; then
+    journalctl -u xray -n 20
+    echo -e "${BRED}[FATAL] xray failed to start${RST}"
+    exit 1
+  fi
+fi
+echo -e "${BGRN}[STEP 3] Done ✓${RST}"
+
+echo -e "\n${BCYN}[STEP 4] Applying sysctl tuning ...${RST}"
+cat > /etc/sysctl.d/99-ais-128k.conf <<EOF
+net.core.default_qdisc = fq_codel
+net.ipv4.tcp_congestion_control = bbr
+net.core.rmem_max = 4194304
+net.core.wmem_max = 4194304
+net.ipv4.tcp_rmem = 4096 87380 4194304
+net.ipv4.tcp_wmem = 4096 16384 4194304
+net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_low_latency = 1
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_thin_linear_timeouts = 1
+net.netfilter.nf_conntrack_max = 32768
+vm.swappiness = 10
+EOF
+sysctl --system
+sysctl net.ipv4.tcp_congestion_control
+sysctl net.core.default_qdisc
+sysctl net.ipv4.tcp_notsent_lowat
+echo -e "${BGRN}[STEP 4] Done ✓${RST}"
+
+echo -e "\n${BCYN}[STEP 5] Setting up qdisc ...${RST}"
+IFACE=$(ip route show default | awk 'NR==1{print $5}')
+[[ -z "$IFACE" ]] && { echo -e "${BRED}[FATAL] Cannot detect network interface${RST}"; exit 1; }
+
+CAKE_OK=0
+if tc qdisc add dev lo root cake 2>/dev/null; then
+  CAKE_OK=1
+  tc qdisc del dev lo root 2>/dev/null
+fi
+
+if [[ "$CAKE_OK" -eq 1 ]]; then
+  Q_CMD="tc qdisc replace dev ${IFACE} root cake bandwidth 128kbit diffserv4 nat flowblind"
+  QDISC_NAME="CAKE"
+else
+  Q_CMD="tc qdisc replace dev ${IFACE} root fq_codel limit 512 target 5ms interval 100ms quantum 300"
+  QDISC_NAME="fq_codel"
+fi
+$Q_CMD
+
+cat > /etc/systemd/system/ais-qdisc.service <<EOF
+[Unit]
+Description=AIS qdisc latency tuning
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=${Q_CMD}
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now ais-qdisc
+tc qdisc show dev "$IFACE"
+echo -e "${BGRN}[STEP 5] Done ✓${RST}"
+
+echo -e "\n${BCYN}[STEP 6] Setting up nftables ...${RST}"
+[[ -z "$SSH_PORT" ]] && { echo -e "${BRED}[FATAL] Cannot determine SSH port. Aborting nftables.${RST}"; exit 1; }
+
+cp /etc/nftables.conf "/etc/nftables.conf.bak.$(date +%s)" 2>/dev/null || true
+
+cat > /etc/nftables.conf <<EOF
+#!/usr/sbin/nft -f
+
+flush ruleset
+
+table inet filter {
+  chain input {
+    type filter hook input priority 0;
+    policy drop;
+    iif "lo" accept
+    ct state established,related accept
+    ip  protocol icmp  limit rate 10/second accept
+    ip6 nexthdr icmpv6 limit rate 10/second accept
+    tcp dport ${SSH_PORT} limit rate 6/minute burst 10 packets accept
+    tcp dport ${PORT} accept
+  }
+  chain forward {
+    type filter hook forward priority 0;
+    policy drop;
+  }
+  chain output {
+    type filter hook output priority 0;
+    policy accept;
+  }
 }
 
-check_module tcp_bbr
-check_module sch_cake
-check_module ifb
+table inet mangle {
+  chain prerouting {
+    type filter hook prerouting priority -150;
+    udp dport 53 ip dscp set cs5
+    udp dport { 5000-5100, 7000-8999, 27000-27050, 5672, 17500, 3478-3480, 3074 } ip dscp set cs5
+    udp length < 128 ip dscp set cs5
+    tcp flags == ack ip length < 80 ip dscp set cs4
+    tcp dport { 80, 443 } ip length > 1000 ip dscp set cs3
+  }
+}
 
-echo ""
-CC_AVAIL=$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo "unknown")
-echo -e "  CC Available: ${CYAN}$CC_AVAIL${NC}"
+table inet nat {
+  chain postrouting {
+    type nat hook postrouting priority 100;
+    oif != "lo" masquerade
+  }
+}
+EOF
 
-# ─────────────────────────────────────────
-#  COMPLETE SUMMARY
-# ─────────────────────────────────────────
-VPS_IP=$(curl -s --max-time 5 ifconfig.me || hostname -I | awk '{print $1}')
+nft -f /etc/nftables.conf
+systemctl enable nftables
+nft list ruleset | head -60
+echo -e "${BGRN}[STEP 6] Done ✓${RST}"
 
-echo ""
-echo -e "${GREEN}${BOLD}"
-echo "╔══════════════════════════════════════════════════════════╗"
-echo "║            ✅  SETUP COMPLETE — File 1/2                ║"
-echo "╠══════════════════════════════════════════════════════════╣"
-printf "║  3x-ui Panel  : http://%-33s║\n" "${VPS_IP}:2053"
-echo "║  Log file     : /var/log/vps-setup.log                  ║"
-echo "╠══════════════════════════════════════════════════════════╣"
-echo "║  ขั้นตอนถัดไป:                                            ║"
-echo "║  รัน tune.sh เพื่อ Optimize BBR + CAKE + Kernel          ║"
-echo "║                                                          ║"
-echo "║  bash <(curl -fsSL https://YOUR_REPO/tune.sh)           ║"
-echo "╚══════════════════════════════════════════════════════════╝"
-echo -e "${NC}"
-echo "[$(date)] Setup complete" >> "$LOG_FILE"
+echo -e "\n${BCYN}[STEP 7] Configuring dnsmasq ...${RST}"
+if grep -q "DNSStubListener" /etc/systemd/resolved.conf; then
+  sed -i 's/^#*DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf
+else
+  echo "DNSStubListener=no" >> /etc/systemd/resolved.conf
+fi
+systemctl restart systemd-resolved
+
+cp /etc/dnsmasq.conf "/etc/dnsmasq.conf.bak.$(date +%s)" 2>/dev/null || true
+
+cat > /etc/dnsmasq.conf <<EOF
+listen-address=127.0.0.1
+bind-interfaces
+port=53
+server=94.140.14.140
+server=94.140.14.141
+server=1.1.1.1
+server=1.0.0.1
+server=8.8.8.8
+cache-size=2048
+min-cache-ttl=30
+neg-ttl=10
+dns-forward-max=150
+no-resolv
+EOF
+
+chattr -i /etc/resolv.conf 2>/dev/null || true
+echo "nameserver 127.0.0.1" > /etc/resolv.conf
+chattr +i /etc/resolv.conf
+
+systemctl enable --now dnsmasq
+
+if dig +short google.com @127.0.0.1 | grep -q .; then
+  echo "DNS verify: OK"
+else
+  echo -e "${BYLW}[WARNING] dnsmasq verify failed — check manually${RST}"
+fi
+echo -e "${BGRN}[STEP 7] Done ✓${RST}"
+
+echo -e "\n${BCYN}[STEP 8] Generating client URIs ...${RST}"
+SERVER_IP=$(curl -s4 --max-time 5 https://api.ipify.org || curl -s4 --max-time 5 ifconfig.me || echo "unknown")
+
+URI_FILE="/root/vless-clients.txt"
+> "$URI_FILE"
+
+for ((i=1; i<=USER_COUNT; i++)); do
+  URI="vless://${USER_UUIDS[$i]}@${SERVER_DOMAIN}:${PORT}?security=${SECURITY}&encryption=${ENCRYPTION}&pbk=${SERVER_PUBKEY}&headerType=&fp=${FINGERPRINT}&spx=${SPX}&type=${NETWORK}&flow=${FLOW}&sni=${SNI}&sid=${USER_SIDS[$i]}#${USER_TAGS[$i]}"
+  echo -e "${BGRN}${URI}${RST}"
+  echo "$URI" >> "$URI_FILE"
+done
+
+chmod 600 "$URI_FILE"
+echo "Client URIs saved to $URI_FILE"
+echo -e "${BGRN}[STEP 8] Done ✓${RST}"
+
+echo
+printf "┌─────────────────────────┬──────────────────────────────────┐\n"
+printf "│ %-23s │ %-32s │\n" "Setting" "Value"
+printf "├─────────────────────────┼──────────────────────────────────┤\n"
+printf "│ %-23s │ %-32s │\n" "Xray version"    "$(xray version | head -n1 | awk '{print $2}')"
+printf "│ %-23s │ %-32s │\n" "Server domain"   "$SERVER_DOMAIN"
+printf "│ %-23s │ %-32s │\n" "Server IP"       "$SERVER_IP"
+printf "│ %-23s │ %-32s │\n" "VLESS port"      "$PORT"
+printf "│ %-23s │ %-32s │\n" "SNI"             "$SNI"
+printf "│ %-23s │ %-32s │\n" "Fingerprint"     "$FINGERPRINT"
+printf "│ %-23s │ %-32s │\n" "Users configured" "$USER_COUNT"
+printf "│ %-23s │ %-32s │\n" "qdisc applied"   "$QDISC_NAME"
+printf "│ %-23s │ %-32s │\n" "TCP congestion"  "$(sysctl -n net.ipv4.tcp_congestion_control)"
+printf "│ %-23s │ %-32s │\n" "nftables"        "$(systemctl is-active nftables)"
+printf "│ %-23s │ %-32s │\n" "dnsmasq"         "$(systemctl is-active dnsmasq)"
+printf "│ %-23s │ %-32s │\n" "Client URI file" "$URI_FILE"
+printf "│ %-23s │ %-32s │\n" "Log file"        "$LOG"
+printf "└─────────────────────────┴──────────────────────────────────┘\n"
+echo
+echo -e "${BGRN}Setup completed successfully.${RST}"
