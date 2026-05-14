@@ -13,15 +13,17 @@ set -euo pipefail
 #   AIS 128Kbps — Anti-Bufferbloat VPS Setup for 3x-ui + VLESS+Reality
 #   By (IG:peepogrob555  FB:Shogun)
 #
-#   v2.0 — Full Production Grade
+#   v2.1 — Full Production Grade
 #   Features: Dual CAKE (ingress+egress), adaptive bandwidth probe, DNS
 #             benchmarking, TCP pacing, Xray sockopt tuning, virt detection,
 #             dynamic conntrack, IFB ingress shaping
+#   Changes v2.1: removed email prompt (--register-unsafely-without-email),
+#                 full verbose output on all steps (tee to log)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 LOG=/var/log/3x-ui-ais-setup.log
 CERT_DIR=/etc/ssl/xray
-SCRIPT_VER="2.0"
+SCRIPT_VER="2.1"
 
 BGRN='\033[1;32m'
 BCYN='\033[1;36m'
@@ -44,6 +46,9 @@ ok()   { echo -e "${BGRN}✓ $*${RST}"; log "OK:   $*"; }
 warn() { echo -e "${BYLW}⚠ WARNING: $*${RST}"; log "WARN: $*"; }
 die()  { echo -e "${BRED}[FATAL] $*${RST}"; log "FATAL: $*"; echo "See full log: $LOG"; exit 1; }
 step() { echo -e "\n${BMAG}━━━ $* ━━━${RST}"; log "STEP: $*"; }
+
+# tee_run: run a command and show output on screen AND save to log
+tee_run() { "$@" 2>&1 | tee -a "$LOG"; return "${PIPESTATUS[0]}"; }
 
 [ "$EUID" -ne 0 ] && die "Run as root: sudo bash $0"
 touch "$LOG"
@@ -125,13 +130,6 @@ fi
 [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "SSH_PORT must be numeric: $SSH_PORT"
 [ -z "$SSH_PORT" ] && die "SSH_PORT empty — aborting to prevent lockout"
 
-while true; do
-  echo -e "${BCYN}[INPUT] Admin email for Let's Encrypt:${RST} "
-  read -r ADMIN_EMAIL
-  [[ "$ADMIN_EMAIL" =~ @ ]] && [[ "$ADMIN_EMAIL" =~ \..* ]] && break
-  echo -e "${BRED}Invalid email — must contain @ and a dot after @${RST}"
-done
-
 echo -e "${BCYN}[INPUT] AIS target bandwidth kbps (default 128, range 64-512):${RST} "
 read -r BW_INPUT
 if [[ "$BW_INPUT" =~ ^[0-9]+$ ]] && [ "$BW_INPUT" -ge 64 ] && [ "$BW_INPUT" -le 512 ]; then
@@ -147,7 +145,7 @@ echo -e "${BCYN}║              CONFIGURATION SUMMARY v${SCRIPT_VER}           
 echo -e "${BCYN}╠══════════════════════════════════════════════════════════════╣${RST}"
 printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "SERVER_DOMAIN"   "$SERVER_DOMAIN"
 printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "SSH_PORT"        "$SSH_PORT"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "ADMIN_EMAIL"     "$ADMIN_EMAIL"
+printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "ADMIN_EMAIL"     "(none — unsafely-without-email)"
 printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "TARGET_BW"       "${BW_KBIT}kbps"
 printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "PANEL_PORT"      "2053"
 printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "VLESS_PORT"      "443"
@@ -168,13 +166,18 @@ read -r CONFIRM
 
 step "[STEP 1] System update + 3x-ui install"
 
-apt-get update >> "$LOG" 2>&1
-apt-get upgrade -y >> "$LOG" 2>&1
-apt-get install -y \
+info "Running apt-get update ..."
+tee_run apt-get update
+
+info "Running apt-get upgrade ..."
+tee_run apt-get upgrade -y
+
+info "Installing required packages ..."
+tee_run apt-get install -y \
   nftables dnsmasq iproute2 curl wget \
   ca-certificates gnupg dnsutils \
   certbot python3-certbot \
-  linux-modules-extra-$(uname -r) >> "$LOG" 2>&1 \
+  "linux-modules-extra-$(uname -r)" \
   || warn "linux-modules-extra failed — CAKE may be unavailable (fq_codel fallback used)"
 
 if command -v x-ui &>/dev/null && systemctl is-active --quiet x-ui; then
@@ -196,7 +199,7 @@ else
   [ $INSTALL_EXIT -ne 0 ] && warn "3x-ui installer exited $INSTALL_EXIT — verifying binary"
 fi
 
-which x-ui >> "$LOG" 2>&1 || die "step1: x-ui binary not found"
+which x-ui | tee -a "$LOG" || die "step1: x-ui binary not found"
 x-ui status 2>/dev/null || true
 systemctl is-active x-ui | grep -q "^active$" || die "step1: x-ui not active"
 
@@ -238,10 +241,11 @@ else
   nft add rule inet filter input tcp dport 80 accept comment \"certbot-temp\" 2>/dev/null || true
 
   mkdir -p "$CERT_DIR"
-  certbot certonly \
+  info "Running certbot (--register-unsafely-without-email) ..."
+  tee_run certbot certonly \
     --standalone --non-interactive --agree-tos \
-    --email "$ADMIN_EMAIL" -d "$SERVER_DOMAIN" \
-    >> "$LOG" 2>&1 \
+    --register-unsafely-without-email \
+    -d "$SERVER_DOMAIN" \
     || die "step2: certbot failed — check DNS + port 80. See $LOG"
 
   _remove_port80
@@ -271,7 +275,8 @@ systemctl restart x-ui
 EOF
 chmod +x "$HOOK_FILE"
 
-certbot renew --dry-run >> "$LOG" 2>&1 && ok "certbot dry-run passed" || warn "certbot dry-run failed — check $LOG"
+info "Running certbot dry-run ..."
+tee_run certbot renew --dry-run && ok "certbot dry-run passed" || warn "certbot dry-run failed — check $LOG"
 
 for f in fullchain.pem key.pem cert.pem; do
   [ -L "$CERT_DIR/$f" ] && [ -f "$CERT_DIR/$f" ] \
@@ -343,7 +348,8 @@ if grep -q "^DNSStubListener" "$RESOLVED_CONF" 2>/dev/null; then
 else
   echo "DNSStubListener=no" >> "$RESOLVED_CONF"
 fi
-systemctl restart systemd-resolved
+info "Restarting systemd-resolved ..."
+tee_run systemctl restart systemd-resolved
 
 cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak.$(date +%s) 2>/dev/null || true
 
@@ -368,7 +374,8 @@ echo "nameserver 127.0.0.1" > /etc/resolv.conf
 chattr +i /etc/resolv.conf
 ok "resolv.conf locked to 127.0.0.1"
 
-systemctl enable --now dnsmasq >> "$LOG" 2>&1 \
+info "Enabling dnsmasq ..."
+tee_run systemctl enable --now dnsmasq \
   || die "step3: dnsmasq failed — check: journalctl -u dnsmasq"
 
 DIG_RESULT=$(dig +short google.com @127.0.0.1 2>/dev/null | head -1)
@@ -397,19 +404,22 @@ probe_bandwidth() {
   local start_ms end_ms
   start_ms=$(date +%s%3N)
 
+  info "  Downloading from $url ..."
   bytes=$(curl -s -m 8 --max-filesize 524288 -w "%{size_download}" \
     -o /dev/null "$url" 2>/dev/null || echo "0")
 
   end_ms=$(date +%s%3N)
   ms_elapsed=$(( end_ms - start_ms ))
+  info "  → ${bytes} bytes in ${ms_elapsed}ms"
 
   if [ "$bytes" -lt 10240 ] || [ "$ms_elapsed" -lt 100 ]; then
-    info "Primary probe insufficient, trying fallback ..."
+    info "Primary probe insufficient, trying fallback ($alt_url) ..."
     start_ms=$(date +%s%3N)
     bytes=$(curl -s -m 8 --max-filesize 524288 -w "%{size_download}" \
       -o /dev/null "$alt_url" 2>/dev/null || echo "0")
     end_ms=$(date +%s%3N)
     ms_elapsed=$(( end_ms - start_ms ))
+    info "  → ${bytes} bytes in ${ms_elapsed}ms"
   fi
 
   if [ "$bytes" -gt 10240 ] && [ "$ms_elapsed" -gt 100 ]; then
@@ -484,7 +494,8 @@ EOF
   fi
 fi
 
-sysctl --system >> "$LOG" 2>&1
+info "Applying sysctl settings ..."
+tee_run sysctl --system
 
 info "Live sysctl values:"
 sysctl net.ipv4.tcp_congestion_control
@@ -526,12 +537,14 @@ else
   fi
 
   if [ "$CAKE_OK" = "1" ]; then
-    tc qdisc replace dev "$IFACE" root cake \
+    info "Applying CAKE egress on $IFACE at ${BW_KBIT}kbit ..."
+    tee_run tc qdisc replace dev "$IFACE" root cake \
       bandwidth "${BW_KBIT}kbit" diffserv4 nat flowblind
     QDISC_APPLIED="CAKE egress (${BW_KBIT}kbit diffserv4 nat flowblind)"
     ok "CAKE egress applied on $IFACE at ${BW_KBIT}kbit"
   else
-    tc qdisc replace dev "$IFACE" root fq_codel \
+    info "Applying fq_codel egress on $IFACE ..."
+    tee_run tc qdisc replace dev "$IFACE" root fq_codel \
       limit 512 target 5ms interval 100ms quantum 300
     QDISC_APPLIED="fq_codel (limit 512 target 5ms quantum 300)"
     warn "fq_codel egress applied (CAKE unavailable)"
@@ -556,7 +569,8 @@ if [ "$CAKE_OK" = "1" ] && [ "${VIRT_RESTRICTED:-0}" != "1" ]; then
       u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV"
 
     INGRESS_BW=$(( BW_KBIT * 4 ))
-    tc qdisc replace dev "$IFB_DEV" root cake \
+    info "Applying CAKE ingress on $IFB_DEV at ${INGRESS_BW}kbit ..."
+    tee_run tc qdisc replace dev "$IFB_DEV" root cake \
       bandwidth "${INGRESS_BW}kbit" diffserv4 nat ingress
 
     INGRESS_APPLIED="CAKE ingress on $IFB_DEV (${INGRESS_BW}kbit diffserv4)"
@@ -602,9 +616,10 @@ WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
 fi
-systemctl enable --now ais-qdisc >> "$LOG" 2>&1
+info "Enabling ais-qdisc service ..."
+tee_run systemctl enable --now ais-qdisc
 
-info "qdisc status:"
+info "qdisc status on $IFACE:"
 tc qdisc show dev "$IFACE"
 [ "$INGRESS_APPLIED" != "none" ] && tc qdisc show dev "$IFB_DEV" 2>/dev/null || true
 
@@ -685,8 +700,9 @@ sed -i \
   -e "s/IFACE_PLACEHOLDER/${IFACE}/g" \
   /etc/nftables.conf
 
-nft -f /etc/nftables.conf || die "step6: nft failed — check /etc/nftables.conf"
-systemctl enable nftables >> "$LOG" 2>&1
+info "Loading nftables ruleset ..."
+tee_run nft -f /etc/nftables.conf || die "step6: nft failed — check /etc/nftables.conf"
+tee_run systemctl enable nftables
 
 nft list ruleset | grep -E "dport.*${SSH_PORT}" \
   && ok "SSH port ${SSH_PORT} in ruleset" || warn "SSH port rule not visible"
@@ -747,19 +763,21 @@ fi
 SYSCTL_XRAY="/etc/sysctl.d/99-xray-sockopt.conf"
 if [ ! -f "$SYSCTL_XRAY" ]; then
   cat > "$SYSCTL_XRAY" << EOF
-net.core.optmem_max        = 131072
+net.core.optmem_max             = 131072
 net.ipv4.tcp_keepalive_time     = 600
 net.ipv4.tcp_keepalive_intvl    = 60
 net.ipv4.tcp_keepalive_probes   = 5
 EOF
-  sysctl --system >> "$LOG" 2>&1
+  info "Applying xray sockopt sysctl ..."
+  tee_run sysctl --system
   ok "Xray sockopt sysctl applied"
 else
   ok "Xray sockopt sysctl already present"
 fi
 
 systemctl daemon-reload
-systemctl restart x-ui
+info "Restarting x-ui ..."
+tee_run systemctl restart x-ui
 ok "x-ui restarted with new limits"
 
 XRAY_HINT_FILE="/root/xray-inbound-settings.txt"
