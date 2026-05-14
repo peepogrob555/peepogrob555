@@ -74,8 +74,8 @@ ok "xray $(xray version 2>/dev/null | awk 'NR==1{print $2}')"
 
 info "step 2 · credentials"
 _kp=$(xray x25519 2>/dev/null)
-PRIV=$(awk '/Private/{print $3}' <<<"$_kp")
-PUB=$(awk '/Public/{print $3}'   <<<"$_kp")
+PRIV=$(awk '/PrivateKey:/{print $2}' <<<"$_kp")
+PUB=$(awk '/Password .PublicKey.:/{print $3}'   <<<"$_kp")
 [[ -z ${PRIV:-} || -z ${PUB:-} ]] && die "x25519 keygen failed"
 
 declare -a UUIDS=() SIDS=()
