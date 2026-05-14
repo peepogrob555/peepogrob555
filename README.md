@@ -11,116 +11,169 @@
 
 **By (IG:peepogrob555 FB:Shogun)**
 
-Production-grade VPS setup script for 3x-ui + VLESS+Reality on AIS 128kbps mobile connections.
-Focus: minimize jitter and queue delay — NOT maximize throughput.
+สคริปต์ตั้งค่า VPS แบบ production-grade สำหรับ 3x-ui + VLESS+Reality
+บน AIS มือถือ 128kbps
+
+**เป้าหมายหลัก: ลด jitter และ queue delay — ไม่ใช่เพิ่ม throughput**
 
 ---
 
-## What this script does
-
-| Component | Action |
-|---|---|
-| **3x-ui** | Install latest stable via official script |
-| **TLS Cert** | certbot standalone + auto-renew hook |
-| **DNS** | Benchmark resolvers, pick fastest, deploy dnsmasq cache |
-| **sysctl** | BBR + anti-bufferbloat tuning calibrated to RAM/virt type |
-| **CAKE egress** | Adaptive bandwidth probe → shape at real measured speed |
-| **CAKE ingress** | IFB dual-shaping — eliminates download bufferbloat |
-| **nftables** | policy drop + dynamic SSH blocklist + DSCP marking |
-| **Xray tuning** | File descriptor limits + sockopt hints + keepalive |
-
----
-
-## Requirements
-
-- Ubuntu 22.04 LTS (kernel 5.15+)
-- 1 vCPU / 1 GB RAM minimum
-- Domain (FQDN) pointing to VPS IP
-- KVM or bare-metal (LXC/OpenVZ: partial — script auto-detects and adjusts)
-
----
-
-## Quick start
+## รันสคริปต์
 
 ```bash
-wget https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/3x-ui-ais-setup.sh
-chmod +x 3x-ui-ais-setup.sh
-sudo bash 3x-ui-ais-setup.sh
+bash <(curl -Ls https://raw.githubusercontent.com/peepogrob555/peepogrob555/main/Mypeepogrob555.sh)
 ```
 
-Script will prompt for:
-1. **Server domain** — FQDN pointing to this VPS
-2. **SSH port** — auto-detected, confirm or override
-3. **Admin email** — for Let's Encrypt
-4. **Target bandwidth** — default 128 (kbps), script will probe actual speed
+หรือ download มาก่อน:
+
+```bash
+wget https://raw.githubusercontent.com/peepogrob555/peepogrob555/main/Mypeepogrob555.sh
+chmod +x Mypeepogrob555.sh
+sudo bash Mypeepogrob555.sh
+```
 
 ---
 
-## Key design decisions
+## ความต้องการของระบบ
 
-### Why CAKE not just fq_codel?
-CAKE with `bandwidth` set to the actual link speed shapes traffic *before* it hits the ISP queue. This is where bufferbloat is actually eliminated. Without a bandwidth limit, CAKE runs in unlimited mode and provides no shaping.
-
-### Why dual CAKE (egress + IFB ingress)?
-AIS 128kbps download bufferbloat is worse than upload. Without ingress shaping, large downloads fill the ISP's queue and destroy interactive traffic latency. IFB redirects incoming traffic through a CAKE instance so both directions are shaped.
-
-### Why adaptive bandwidth probe?
-AIS mobile speed varies (90–140kbps at nominal 128). Hard-coding 128kbit misses this. Script measures actual throughput and sets CAKE to 90% of measured speed, leaving headroom for the ISP's own queue.
-
-### Why DNS benchmarking?
-Reality handshakes require a DNS lookup of the SNI target (th.speedtest.net) per new connection. dnsmasq caches this, but the first hit still goes upstream. Picking the lowest-latency resolver from: AdGuard, Cloudflare, Google, Quad9, TWNIC reduces this from ~40ms to ~5ms for Thai routing.
-
-### Why `tcp_notsent_lowat = 16384`?
-At 128kbps, 16384 bytes = ~1 second of data. Without this, the kernel buffers multiple seconds of data in the send buffer before xray picks it up. The result is visible multi-second latency spikes on the client. This is one of the most impactful single settings for XTLS-Vision on low-bandwidth links.
-
-### Why `tcp_limit_output_bytes = 131072`?
-Limits per-flow bytes in the kernel's output queue before the pacing layer sees them. Reduces burstiness at the socket level, complementing CAKE's flow shaping.
-
-### Why dynamic SSH blocklist in nftables?
-IPs that exceed 10 new SSH connections/minute are automatically added to a blocklist (1 hour timeout). No fail2ban needed. nftables handles it natively with dynamic sets.
+| รายการ | รายละเอียด |
+|---|---|
+| OS | Ubuntu 22.04 LTS |
+| Kernel | 5.15+ |
+| RAM | 1 GB ขึ้นไป |
+| CPU | 1 vCPU ขึ้นไป |
+| Domain | FQDN ที่ชี้มาที่ IP ของ VPS แล้ว |
+| Virtualization | KVM หรือ bare-metal (LXC/OpenVZ ได้บางส่วน — script ตรวจอัตโนมัติ) |
 
 ---
 
-## After running
+## สคริปต์ทำอะไรบ้าง
 
-1. Open panel: `https://YOUR_DOMAIN:2053/YOUR_PATH/`
-2. Panel Settings → Panel Certificate → paste paths from summary
-3. Add Inbound:
-   - Protocol: VLESS | Port: 443 | Security: Reality
-   - Destination: `th.speedtest.net:443` | uTLS: firefox
-   - Flow: `xtls-rprx-vision`
-   - Enable `tcpNoDelay: true` in stream settings
-4. Generate UUID + keypair + shortId via panel
-5. Add users → panel generates client URIs + QR codes
-
-Full xray tuning hints are saved to `/root/xray-inbound-settings.txt`.
-
----
-
-## What this script does NOT do
-
-- Install or configure xray standalone (3x-ui manages xray internally)
-- Create VLESS inbounds or users
-- Generate UUIDs, keys, or client URIs
-- Configure IPv6 routing (ICMP6 rules included, full v6 strategy is manual)
-- Auto-rollback on failure (backups in `.bak.TIMESTAMP` before every overwrite)
+| ขั้นตอน | สิ่งที่ทำ |
+|---|---|
+| Pre-flight | ตรวจ virt type, RAM, kernel — ปรับค่าให้อัตโนมัติ |
+| Step 1 | ติดตั้ง 3x-ui (latest stable) ผ่าน official installer |
+| Step 2 | ขอ TLS cert ด้วย certbot standalone + ตั้ง auto-renew hook |
+| Step 3 | benchmark DNS resolver 8 ตัว เลือก 3 ที่เร็วที่สุด deploy dnsmasq cache |
+| Step 4 | probe bandwidth จริง + sysctl BBR + anti-bufferbloat ตาม RAM/virt |
+| Step 5 | ติดตั้ง CAKE egress + IFB ingress shaping (dual-direction) |
+| Step 6 | nftables: policy drop + dynamic SSH blocklist + DSCP marking |
+| Step 7 | tuning Xray: fd limits, systemd override, keepalive, hint file |
 
 ---
 
-## Idempotency
+## สิ่งที่สคริปต์ถามก่อนรัน
 
-Safe to re-run. Each step checks if already applied and skips. Backups are created before every file overwrite (`.bak.TIMESTAMP`). On error: restore from `.bak` files and check `/var/log/3x-ui-ais-setup.log`.
+1. **Server domain** — FQDN ที่ชี้มา VPS นี้
+2. **SSH port** — detect อัตโนมัติ กด Enter ยืนยัน หรือพิมพ์ใหม่
+3. **Admin email** — สำหรับ Let's Encrypt
+4. **Target bandwidth** — default 128kbps สคริปต์จะ probe ความเร็วจริงด้วย
 
 ---
 
-## Tested on
+## จุดเด่นที่ต่างจากสคริปต์ทั่วไป
+
+### Dual CAKE (Egress + IFB Ingress)
+สคริปต์ส่วนใหญ่ shape แค่ฝั่ง upload AIS 128kbps bufferbloat ฝั่ง download หนักกว่า upload อีก
+IFB redirect traffic ขาเข้าผ่าน CAKE อีกตัว — ทั้งสองทิศทางถูก shape พร้อมกัน
+
+### Adaptive Bandwidth Probe
+ไม่ใช้ค่าตายตัว 128kbit สคริปต์วัด throughput จริงในขณะรัน
+CAKE ถูกตั้งที่ 90% ของที่วัดได้ เผื่อ headroom ให้ ISP queue
+
+### DNS Benchmark
+วัด latency DNS resolver 8 ตัวจริง ๆ แล้วเลือก 3 อันดับแรกใส่ dnsmasq
+Reality handshake ต้องการ DNS lookup ทุก connection ใหม่ — ลด latency ได้ ~35ms ต่อครั้ง
+
+### `tcp_notsent_lowat = 16384`
+ที่ 128kbps ถ้า kernel buffer ข้อมูลเกิน 1 วินาทีก่อนที่ xray จะเข้ารหัส
+client จะเห็น latency spike หลายวินาที ค่านี้ล็อก buffer ให้แน่น
+เป็นหนึ่งในค่าที่ส่งผลมากที่สุดสำหรับ XTLS-Vision บน low-bandwidth link
+
+### `tcp_limit_output_bytes = 131072`
+จำกัด bytes ใน kernel output queue ก่อนที่ pacing layer จะเห็น
+ลด burstiness ระดับ socket ช่วยเสริม CAKE flow shaping
+
+### Dynamic SSH Blocklist (nftables)
+IP ที่ brute force SSH เกิน 10 ครั้ง/นาที ถูก ban อัตโนมัติ 1 ชั่วโมง
+ไม่ต้องติดตั้ง fail2ban — nftables จัดการด้วย dynamic sets โดยตรง
+
+### Auto-detect Virtualization
+ตรวจ KVM / LXC / OpenVZ / bare-metal
+LXC/OpenVZ: ข้าม feature ที่ไม่รองรับ (IFB, conntrack) แล้ว warn แทน crash
+
+### Conntrack ตาม RAM จริง
+คำนวณ `RAM_MB × 8` ไม่ใช้ค่า default 131072 ที่เปลือง RAM ฟรี
+VPS 1GB → conntrack_max = 8192 พอสำหรับ 2 user
+
+---
+
+## หลังรันสคริปต์ — ขั้นตอนใน 3x-ui Panel
+
+**1. เปิด panel:**
+```
+https://YOUR_DOMAIN:2053/YOUR_PATH/
+```
+fallback (ถ้า HTTPS ยังไม่ work):
+```
+http://YOUR_IP:2053/YOUR_PATH/
+```
+
+**2. ตั้งใบ cert:**
+
+Panel Settings → Panel Certificate
+```
+Certificate File : /etc/ssl/xray/fullchain.pem
+Private Key File : /etc/ssl/xray/key.pem
+```
+Save → restart panel → ใช้ HTTPS URL
+
+**3. เพิ่ม Inbound:**
+
+| ค่า | รายละเอียด |
+|---|---|
+| Protocol | VLESS |
+| Port | 443 |
+| Security | Reality |
+| Destination | th.speedtest.net:443 |
+| uTLS | firefox |
+| Flow | xtls-rprx-vision |
+| tcpNoDelay | true (ใน Advanced / Stream Settings) |
+| Generate | UUID + keypair + shortId ผ่าน panel |
+
+**4. เพิ่ม users** → panel สร้าง client URI + QR code ให้อัตโนมัติ
+
+**5. ดู Xray tuning hints:**
+```bash
+cat /root/xray-inbound-settings.txt
+```
+
+---
+
+## สิ่งที่สคริปต์ไม่ทำ (by design)
+
+- ไม่ติดตั้ง xray standalone (3x-ui จัดการ xray ภายในอยู่แล้ว)
+- ไม่สร้าง VLESS inbound หรือ user
+- ไม่สร้าง UUID, key หรือ client URI
+- ไม่ตั้งค่า IPv6 routing (มี ICMPv6 rule แต่ full v6 strategy ต้องทำเอง)
+- ไม่ rollback อัตโนมัติถ้า error (มี `.bak.TIMESTAMP` ก่อนทับไฟล์ทุกครั้ง)
+
+---
+
+## Idempotency — รันซ้ำได้ปลอดภัย
+
+แต่ละ step มี guard check — ถ้าทำไปแล้วจะข้ามโดยไม่ error
+ไฟล์ที่จะถูกทับมี backup `.bak.TIMESTAMP` ก่อนทุกครั้ง
+ถ้า error: restore จาก `.bak` แล้วดู log ที่ `/var/log/3x-ui-ais-setup.log`
+
+---
+
+## ทดสอบบน
 
 - Ubuntu 22.04 LTS / kernel 5.15 / KVM VPS
-- AIS 4G mobile client, 128kbps plan
-- 2 concurrent users: gaming (UDP) + streaming (TCP)
+- AIS 4G มือถือ แผน 128kbps
+- 2 user พร้อมกัน: เล่นเกม (UDP) + ดูวิดีโอ (TCP)
 
 ---
 
-## License
-
-MIT — use freely, attribution appreciated.
+*MIT License — ใช้ได้เลย ขอบคุณถ้า credit ด้วย*
