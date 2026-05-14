@@ -13,17 +13,19 @@ set -euo pipefail
 #   AIS 128Kbps — Anti-Bufferbloat VPS Setup for 3x-ui + VLESS+Reality
 #   By (IG:peepogrob555  FB:Shogun)
 #
-#   v2.1 — Full Production Grade
+#   v2.2 — Full Production Grade
 #   Features: Dual CAKE (ingress+egress), adaptive bandwidth probe, DNS
 #             benchmarking, TCP pacing, Xray sockopt tuning, virt detection,
 #             dynamic conntrack, IFB ingress shaping
 #   Changes v2.1: removed email prompt (--register-unsafely-without-email),
 #                 full verbose output on all steps (tee to log)
+#   Changes v2.2: fix chattr crash on KVM providers that don't support it,
+#                 fallback to systemd-resolved + NetworkManager dns=none
 # ═══════════════════════════════════════════════════════════════════════════════
 
 LOG=/var/log/3x-ui-ais-setup.log
 CERT_DIR=/etc/ssl/xray
-SCRIPT_VER="2.1"
+SCRIPT_VER="2.2"
 
 BGRN='\033[1;32m'
 BCYN='\033[1;36m'
@@ -371,8 +373,32 @@ DNSEOF
 
 chattr -i /etc/resolv.conf 2>/dev/null || true
 echo "nameserver 127.0.0.1" > /etc/resolv.conf
-chattr +i /etc/resolv.conf
-ok "resolv.conf locked to 127.0.0.1"
+
+# Try chattr lock — gracefully skip if filesystem doesn't support it (some KVM providers)
+if chattr +i /etc/resolv.conf 2>/dev/null; then
+  ok "resolv.conf locked to 127.0.0.1 (chattr +i)"
+else
+  warn "chattr not supported on this filesystem — using systemd-resolved static config instead"
+  # Lock via systemd-resolved: set DNS to 127.0.0.1 and disable dynamic updates
+  mkdir -p /etc/systemd/resolved.conf.d
+  cat > /etc/systemd/resolved.conf.d/99-dnsmasq.conf << 'RESEOF'
+[Resolve]
+DNS=127.0.0.1
+DNSStubListener=no
+ReadEtcHosts=yes
+RESEOF
+  # Also drop a NetworkManager override to prevent it from rewriting resolv.conf
+  if [ -d /etc/NetworkManager/conf.d ]; then
+    cat > /etc/NetworkManager/conf.d/99-dns-none.conf << 'NMEOF'
+[main]
+dns=none
+NMEOF
+    systemctl reload NetworkManager 2>/dev/null || true
+  fi
+  # Re-write resolv.conf since chattr failed
+  echo "nameserver 127.0.0.1" > /etc/resolv.conf
+  ok "resolv.conf set to 127.0.0.1 (systemd-resolved + NM override)"
+fi
 
 info "Enabling dnsmasq ..."
 tee_run systemctl enable --now dnsmasq \
