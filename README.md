@@ -1,6 +1,9 @@
-# AIS 128Kbps — Anti-Bufferbloat VPS Setup(ทำใช้เองเอาไปใช้ได้ฟรี)
+# AIS 64kbps-512Kbps — Anti-Bufferbloat VPS Setup(ทำใช้เองเอาไปใช้ได้ฟรี)
+# หลักๆทำมาเพื่อเน็ต 128kbps
 
+# อันนี้ไว้เช็คหลังจากทำเสร็จ
 ```
+bash <(curl -Ls https://raw.githubusercontent.com/peepogrob555/peepogrob555/main/Mypeepogrob555V2.sh)
 ```
 
 **By (IG:peepogrob555 FB:Shogun)**
