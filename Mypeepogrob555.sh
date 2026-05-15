@@ -13,7 +13,7 @@ set -euo pipefail
 #   AIS 128Kbps — Anti-Bufferbloat VPS Setup for 3x-ui + VLESS+Reality
 #   By (IG:peepogrob555  FB:Shogun)
 #
-#   v2.2 — Full Production Grade
+#   v2.3 — Full Production Grade
 #   Features: Dual CAKE (ingress+egress), adaptive bandwidth probe, DNS
 #             benchmarking, TCP pacing, Xray sockopt tuning, virt detection,
 #             dynamic conntrack, IFB ingress shaping
@@ -21,11 +21,14 @@ set -euo pipefail
 #                 full verbose output on all steps (tee to log)
 #   Changes v2.2: fix chattr crash on KVM providers that don't support it,
 #                 fallback to systemd-resolved + NetworkManager dns=none
+#   Changes v2.3: add port 80 in nftables for certbot renewal,
+#                 pre-open port 80 before dry-run test,
+#                 fix x-ui version detection (no longer prints menu)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 LOG=/var/log/3x-ui-ais-setup.log
 CERT_DIR=/etc/ssl/xray
-SCRIPT_VER="2.2"
+SCRIPT_VER="2.3"
 
 BGRN='\033[1;32m'
 BCYN='\033[1;36m'
@@ -278,6 +281,8 @@ EOF
 chmod +x "$HOOK_FILE"
 
 info "Running certbot dry-run ..."
+# Temporarily allow port 80 in case nftables is active (certbot standalone needs it)
+nft add rule inet filter input tcp dport 80 accept 2>/dev/null || true
 tee_run certbot renew --dry-run && ok "certbot dry-run passed" || warn "certbot dry-run failed — check $LOG"
 
 for f in fullchain.pem key.pem cert.pem; do
@@ -688,6 +693,7 @@ table inet filter {
       limit rate over 10/minute burst 5 packets \
       add @ssh_blocklist { ip saddr timeout 1h }
     tcp dport SSH_PORT_PLACEHOLDER ct state new limit rate 6/minute burst 10 packets accept
+    tcp dport 80 accept comment "certbot-renew"
     tcp dport 443 accept
     tcp dport 2053 limit rate 30/minute burst 20 packets accept
   }
@@ -841,7 +847,10 @@ ok "[STEP 7] Done"
 
 step "[STEP 8] Final summary"
 
-XUI_VER=$(x-ui version 2>/dev/null || echo "unknown")
+XUI_VER=$(systemctl show x-ui --property=ExecStart 2>/dev/null | grep -oP 'x-ui \K[0-9]+\.[0-9]+\.[0-9]+' | head -1 \
+  || grep -oP 'Starting x-ui \K[0-9]+\.[0-9]+\.[0-9]+' /var/log/3x-ui-ais-setup.log 2>/dev/null | tail -1 \
+  || journalctl -u x-ui -n 50 2>/dev/null | grep -oP 'Starting x-ui \K[0-9]+\.[0-9]+\.[0-9]+' | tail -1 \
+  || echo "3.x (embedded)")
 XUI_STATUS=$(systemctl is-active x-ui 2>/dev/null || echo "inactive")
 SERVER_IP=$(curl -s4 https://api.ipify.org 2>/dev/null || curl -s4 ifconfig.me 2>/dev/null || echo "unknown")
 CERT_EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_DIR/fullchain.pem" 2>/dev/null \
