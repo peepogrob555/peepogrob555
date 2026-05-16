@@ -3,7 +3,7 @@ set -euo pipefail
 
 LOG=/var/log/3x-ui-ais128k.log
 CERT_DIR=/etc/ssl/xray
-SCRIPT_VER="3.2"
+SCRIPT_VER="3.3"
 BW_KBIT=116
 
 BGRN='\033[1;32m'; BCYN='\033[1;36m'; BYLW='\033[1;33m'
@@ -15,8 +15,23 @@ ok()   { echo -e "${BGRN}  ✓ $*${RST}";       log "OK: $*"; }
 warn() { echo -e "${BYLW}  ⚠ $*${RST}";       log "WARN: $*"; }
 die()  { echo -e "${BRED}[FATAL] $*${RST}";   log "FATAL: $*"; exit 1; }
 step() { echo -e "\n${BMAG}━━━ $* ━━━${RST}"; log "STEP: $*"; }
+
 run()  { "$@" >> "$LOG" 2>&1 || true; }
 must() { "$@" >> "$LOG" 2>&1 || die "Failed: $*"; }
+
+# show output on screen AND log — for slow steps so user sees progress
+loud() {
+  local label="$1"; shift
+  info "$label"
+  "$@" 2>&1 | tee -a "$LOG"
+  return "${PIPESTATUS[0]}"
+}
+loud_must() {
+  local label="$1"; shift
+  info "$label"
+  "$@" 2>&1 | tee -a "$LOG"
+  [ "${PIPESTATUS[0]}" -eq 0 ] || die "Failed: $*"
+}
 
 [ "$EUID" -ne 0 ] && die "Run as root"
 touch "$LOG"
@@ -79,13 +94,18 @@ printf "${BYLW}  Proceed? [y/N]: ${RST}"; read -r CONFIRM
 
 step "[1] System update + packages"
 
-must apt-get update
-must apt-get upgrade -y
-must apt-get install -y \
-  nftables dnsmasq iproute2 curl wget \
-  ca-certificates gnupg dnsutils \
-  certbot python3-certbot \
-  "linux-modules-extra-$(uname -r)" \
+loud_must "apt-get update..." \
+  apt-get update
+
+loud_must "apt-get upgrade (this may take a few minutes)..." \
+  apt-get upgrade -y
+
+loud_must "Installing required packages..." \
+  apt-get install -y \
+    nftables dnsmasq iproute2 curl wget \
+    ca-certificates gnupg dnsutils \
+    certbot python3-certbot \
+    "linux-modules-extra-$(uname -r)" \
   || warn "linux-modules-extra unavailable"
 
 ok "Packages ready"
@@ -103,10 +123,11 @@ echo "  └───────────────────────
 echo -e "${RST}"
 
 set +e
-bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
-XI=$?
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) 2>&1 \
+  | tee -a "$LOG"
+XI="${PIPESTATUS[0]}"
 set -e
-[ $XI -ne 0 ] && warn "Installer exit $XI — verifying binary"
+[ "$XI" -ne 0 ] && warn "Installer exit $XI — verifying binary"
 
 which x-ui >> "$LOG"       || die "x-ui binary not found"
 systemctl is-active x-ui | grep -q "^active$" || die "x-ui not active"
@@ -137,10 +158,11 @@ run systemctl start nftables
 nft add rule inet filter input tcp dport 80 accept comment '"certbot-temp"' 2>/dev/null || true
 
 mkdir -p "$CERT_DIR"
+info "Requesting TLS certificate from Let's Encrypt..."
 certbot certonly \
   --standalone --non-interactive --agree-tos \
   --register-unsafely-without-email \
-  -d "$SERVER_DOMAIN" >> "$LOG" 2>&1 \
+  -d "$SERVER_DOMAIN" 2>&1 | tee -a "$LOG" \
   || die "certbot failed — check DNS + port 80. Log: $LOG"
 
 HANDLE=$(nft -a list chain inet filter input 2>/dev/null \
@@ -175,7 +197,7 @@ bench_dns() {
     | awk '/Query time:/{print $4}' | head -1 || echo "9999"
 }
 
-info "Benchmarking resolvers..."
+info "Benchmarking resolvers (takes ~15s)..."
 RESOLVERS=(
   "94.140.14.140" "94.140.14.141"
   "1.1.1.1"       "1.0.0.1"
@@ -299,7 +321,8 @@ net.netfilter.nf_conntrack_udp_timeout             = 30
 EOF
 fi
 
-must sysctl --system
+info "Applying sysctl..."
+sysctl --system 2>&1 | grep -E "^(net\.|vm\.)" | tee -a "$LOG"
 ok "sysctl applied"
 
 step "[6] qdisc — fq egress"
@@ -321,6 +344,9 @@ else
     limit 512 target 5ms interval 100ms quantum 300 >> "$LOG" 2>&1
   QDISC_APPLIED="fq_codel fallback"
 fi
+
+info "qdisc status:"
+"$TC_BIN" qdisc show dev "$IFACE" | tee -a "$LOG"
 
 systemctl stop ais-qdisc 2>/dev/null || true
 rm -f /etc/systemd/system/ais-qdisc.service
@@ -395,6 +421,10 @@ NFTEOF
 
 must nft -f /etc/nftables.conf
 must systemctl enable nftables
+
+info "nftables ruleset:"
+nft list ruleset | tee -a "$LOG"
+
 ok "nftables loaded — SSH:${SSH_PORT} VLESS:443 Panel:2053 MSS-clamp:on"
 
 step "[8] x-ui limits + Xray hints"
