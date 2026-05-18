@@ -1,175 +1,219 @@
-# AIS 64kbps-512Kbps — Anti-Bufferbloat VPS Setup ทำไว้ใช้เองเอาไปใช้ได้เลยฟรีเหมาะสำหรับคนเปิดVPSเองแล้วใช้งานเองล้วนๆไม่เหมาะกับการทำขาย
-# หลักๆทำมาเพื่อเน็ต 128kbps
-# อันนี้ไว้เช็คหลังจากทำเสร็จ
-```
-bash <(curl -Ls https://raw.githubusercontent.com/peepogrob555/peepogrob555/main/Mypeepogrob555V2.sh)
-```
+AIS Narrowband VPS Stack
 
-**By (IG:peepogrob555 FB:Shogun)**
+ทำไว้ใช้เอง เอาไปใช้ได้ฟรี
+เหมาะสำหรับคนเปิด VPS ใช้เอง ไม่เหมาะกับทำขายหรือหลาย user
 
-สคริปต์ตั้งค่า VPS สำหรับ 3x-ui + VLESS+Reality
-บน AIS มือถือ 128kbps
+เน้นลด:
 
-**เป้าหมายหลัก: ลด jitter และ queue delay — ไม่ใช่เพิ่ม throughput**
+- bufferbloat
+- jitter
+- queue delay
+
+ไม่ได้ทำมาเพื่อเร่งสปีด
 
 ---
 
-## รันสคริปต์
+เหมาะกับ
 
-```bash
+- AIS FUP 64kbps-512kbps
+- เน็ต 128kbps
+- เล่นเกม
+- Discord
+- YouTube 144p
+- ใช้งานทั่วไป
+- VPS 1-2GB RAM
+- ใช้ 1-2 คน
+
+---
+
+ระบบที่รองรับ
+
+รายการ| รายละเอียด
+OS| Ubuntu 22.04 LTS
+RAM| 1GB+
+CPU| 1 vCPU+
+VPS| KVM แนะนำ
+Domain| ต้องชี้เข้า VPS แล้ว
+
+---
+
+สิ่งที่สคริปต์ทำ
+
+- ติดตั้ง 3x-ui
+- ตั้งค่า BBR
+- ตั้งค่า CAKE + IFB
+- optimize sysctl
+- ตั้ง nftables
+- ขอ TLS cert อัตโนมัติ
+- benchmark DNS
+- optimize สำหรับเน็ตมือถือ bandwidth ต่ำ
+
+---
+
+Architecture
+
+AIS 128kbps
+     ↓
+VLESS+Reality
+     ↓
+Xray
+     ↓
+CAKE + IFB shaping
+     ↓
+BBR pacing
+     ↓
+Low latency / low jitter
+
+---
+
+ติดตั้ง
+
+เข้า VPS
+
+sudo -i
+
+รันสคริปต์
+
 bash <(curl -Ls https://raw.githubusercontent.com/peepogrob555/peepogrob555/main/Mypeepogrob555.sh)
-```
 
-หรือ download มาก่อน:
+หรือโหลดมาก่อน
 
-```bash
 wget https://raw.githubusercontent.com/peepogrob555/peepogrob555/main/Mypeepogrob555.sh
+
 chmod +x Mypeepogrob555.sh
+
 sudo bash Mypeepogrob555.sh
-```
 
 ---
 
-## ความต้องการของระบบ
+หลังติดตั้ง
 
-| รายการ | รายละเอียด |
-|---|---|
-| OS | Ubuntu 22.04 LTS |
-| Kernel | 5.15+ |
-| RAM | 1 GB ขึ้นไป |
-| CPU | 1 vCPU ขึ้นไป |
-| Domain | FQDN ที่ชี้มาที่ IP ของ VPS แล้ว |
-| Virtualization | KVM หรือ bare-metal (LXC/OpenVZ ได้บางส่วน — script ตรวจอัตโนมัติ) |
+เปิด panel
+
+https://YOUR_DOMAIN:2053
 
 ---
 
-## สคริปต์ทำอะไรบ้าง
+ตั้งค่าใน 3x-ui
 
-| ขั้นตอน | สิ่งที่ทำ |
-|---|---|
-| Pre-flight | ตรวจ virt type, RAM, kernel — ปรับค่าให้อัตโนมัติ |
-| Step 1 | ติดตั้ง 3x-ui (latest stable) ผ่าน official installer |
-| Step 2 | ขอ TLS cert ด้วย certbot standalone + ตั้ง auto-renew hook |
-| Step 3 | benchmark DNS resolver 8 ตัว เลือก 3 ที่เร็วที่สุด deploy dnsmasq cache |
-| Step 4 | probe bandwidth จริง + sysctl BBR + anti-bufferbloat ตาม RAM/virt |
-| Step 5 | ติดตั้ง CAKE egress + IFB ingress shaping (dual-direction) |
-| Step 6 | nftables: policy drop + dynamic SSH blocklist + DSCP marking |
-| Step 7 | tuning Xray: fd limits, systemd override, keepalive, hint file |
+เพิ่ม Inbound
 
----
-
-## สิ่งที่สคริปต์ถามก่อนรัน
-
-1. **Server domain** — FQDN ที่ชี้มา VPS นี้
-2. **SSH port** — detect อัตโนมัติ กด Enter ยืนยัน หรือพิมพ์ใหม่
-3. **Admin email** — สำหรับ Let's Encrypt
-4. **Target bandwidth** — default 128kbps สคริปต์จะ probe ความเร็วจริงด้วย
+ค่า| ตั้งเป็น
+Protocol| VLESS
+Port| 443
+Security| Reality
+Flow| xtls-rprx-vision
+uTLS| firefox
+Dest| th.speedtest.net:443
 
 ---
 
-## จุดเด่นที่ต่างจากสคริปต์ทั่วไป
+แนะนำ
 
-### Dual CAKE (Egress + IFB Ingress)
-สคริปต์ส่วนใหญ่ shape แค่ฝั่ง upload AIS 128kbps bufferbloat ฝั่ง download หนักกว่า upload อีก
-IFB redirect traffic ขาเข้าผ่าน CAKE อีกตัว — ทั้งสองทิศทางถูก shape พร้อมกัน
+เปิด
 
-### Adaptive Bandwidth Probe
-ไม่ใช้ค่าตายตัว 128kbit สคริปต์วัด throughput จริงในขณะรัน
-CAKE ถูกตั้งที่ 90% ของที่วัดได้ เผื่อ headroom ให้ ISP queue
+- tcpNoDelay
+- Reality
+- Vision
 
-### DNS Benchmark
-วัด latency DNS resolver 8 ตัวจริง ๆ แล้วเลือก 3 อันดับแรกใส่ dnsmasq
-Reality handshake ต้องการ DNS lookup ทุก connection ใหม่ — ลด latency ได้ ~35ms ต่อครั้ง
+ปิด
 
-### `tcp_notsent_lowat = 16384`
-ที่ 128kbps ถ้า kernel buffer ข้อมูลเกิน 1 วินาทีก่อนที่ xray จะเข้ารหัส
-client จะเห็น latency spike หลายวินาที ค่านี้ล็อก buffer ให้แน่น
-เป็นหนึ่งในค่าที่ส่งผลมากที่สุดสำหรับ XTLS-Vision บน low-bandwidth link
-
-### `tcp_limit_output_bytes = 131072`
-จำกัด bytes ใน kernel output queue ก่อนที่ pacing layer จะเห็น
-ลด burstiness ระดับ socket ช่วยเสริม CAKE flow shaping
-
-### Dynamic SSH Blocklist (nftables)
-IP ที่ brute force SSH เกิน 10 ครั้ง/นาที ถูก ban อัตโนมัติ 1 ชั่วโมง
-ไม่ต้องติดตั้ง fail2ban — nftables จัดการด้วย dynamic sets โดยตรง
-
-### Auto-detect Virtualization
-ตรวจ KVM / LXC / OpenVZ / bare-metal
-LXC/OpenVZ: ข้าม feature ที่ไม่รองรับ (IFB, conntrack) แล้ว warn แทน crash
-
-### Conntrack ตาม RAM จริง
-คำนวณ `RAM_MB × 8` ไม่ใช้ค่า default 131072 ที่เปลือง RAM ฟรี
-VPS 1GB → conntrack_max = 8192 พอสำหรับ 2 user
+- mux
+- sniffing
 
 ---
 
-## หลังรันสคริปต์ — ขั้นตอนใน 3x-ui Panel
+เช็คสถานะหลังติดตั้ง
 
-**1. เปิด panel:**
-```
-https://YOUR_DOMAIN:2053/YOUR_PATH/
-```
-fallback (ถ้า HTTPS ยังไม่ work):
-```
-http://YOUR_IP:2053/YOUR_PATH/
-```
-
-**2. ตั้งใบ cert:**
-
-Panel Settings → Panel Certificate
-```
-Certificate File : /etc/ssl/xray/fullchain.pem
-Private Key File : /etc/ssl/xray/key.pem
-```
-Save → restart panel → ใช้ HTTPS URL
-
-**3. เพิ่ม Inbound:**
-
-| ค่า | รายละเอียด |
-|---|---|
-| Protocol | VLESS |
-| Port | 443 |
-| Security | Reality |
-| Destination | th.speedtest.net:443 |
-| uTLS | firefox |
-| Flow | xtls-rprx-vision |
-| tcpNoDelay | true (ใน Advanced / Stream Settings) |
-| Generate | UUID + keypair + shortId ผ่าน panel |
-
-**4. เพิ่ม users** → panel สร้าง client URI + QR code ให้อัตโนมัติ
-
-**5. ดู Xray tuning hints:**
-```bash
-cat /root/xray-inbound-settings.txt
-```
+bash <(curl -Ls https://raw.githubusercontent.com/peepogrob555/peepogrob555/main/Mypeepogrob555V2.sh)
 
 ---
 
-## สิ่งที่สคริปต์ไม่ทำ (by design)
+จุดเด่น
 
-- ไม่ติดตั้ง xray standalone (3x-ui จัดการ xray ภายในอยู่แล้ว)
-- ไม่สร้าง VLESS inbound หรือ user
-- ไม่สร้าง UUID, key หรือ client URI
-- ไม่ตั้งค่า IPv6 routing (มี ICMPv6 rule แต่ full v6 strategy ต้องทำเอง)
-- ไม่ rollback อัตโนมัติถ้า error (มี `.bak.TIMESTAMP` ก่อนทับไฟล์ทุกครั้ง)
+CAKE + IFB
+
+จัดการ queue ทั้ง upload และ download
+ลด bufferbloat บนเน็ต AIS FUP
+
+BBR
+
+ช่วย pacing traffic ให้ latency นิ่งขึ้น
+
+DNS Benchmark
+
+เลือก DNS ที่ latency ต่ำที่สุดอัตโนมัติ
+
+nftables
+
+- policy drop
+- SSH anti brute-force
+- DSCP marking
+
+Adaptive tuning
+
+ปรับตาม:
+
+- RAM
+- virtualization
+- kernel capability
 
 ---
 
-## Idempotency — รันซ้ำได้ปลอดภัย
+ไม่เหมาะกับ
 
-แต่ละ step มี guard check — ถ้าทำไปแล้วจะข้ามโดยไม่ error
-ไฟล์ที่จะถูกทับมี backup `.bak.TIMESTAMP` ก่อนทุกครั้ง
-ถ้า error: restore จาก `.bak` แล้วดู log ที่ `/var/log/3x-ui-ais-setup.log`
-
----
-
-## ทดสอบบน
-
-- Ubuntu 22.04 LTS / kernel 5.15 / KVM VPS
-- AIS 4G มือถือ แผน 128kbps
-- 2 user พร้อมกัน: เล่นเกม (UDP) + ดูวิดีโอ (TCP)
+- แชร์หลาย user
+- VPS ขายลูกค้า
+- ดู 720p/1080p
+- throughput สูง
+- OpenVZ เก่า ๆ
 
 ---
 
-*MIT License — ใช้ได้เลย ขอบคุณถ้า credit ด้วย*
+Log
+
+/var/log/3x-ui-gaming.log
+
+---
+
+Reset qdisc
+
+tc qdisc del dev eth0 root
+tc qdisc del dev eth0 ingress
+
+---
+
+Disable nftables
+
+systemctl stop nftables
+
+nft flush ruleset
+
+---
+
+ทดสอบบน
+
+- Ubuntu 22.04
+- Kernel 5.15+
+- KVM VPS
+- AIS 4G FUP 128kbps
+
+---
+
+Warning
+
+สคริปต์แก้:
+
+- sysctl
+- nftables
+- qdisc
+- network stack
+
+ควรใช้บน VPS ใหม่หรือ clean install
+
+---
+
+By:
+
+- IG: peepogrob555
+- FB: Shogun
