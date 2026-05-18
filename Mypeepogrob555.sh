@@ -1,681 +1,827 @@
 #!/usr/bin/env bash
+# =============================================================================
+# 3x-ui Gaming VPN — Production-Grade Narrowband Stack
+# Version : 3.0-production
+# Target  : Ubuntu 22.04/24.04 KVM — 128kbps/user adaptive — 2 users
+# =============================================================================
 set -euo pipefail
+IFS=$'\n\t'
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#
-#    █████╗ ██╗███████╗    ██╗██████╗  █████╗ ██╗  ██╗██████╗ ██████╗ ███████╗
-#   ██╔══██╗██║██╔════╝   ███║╚════██╗╚════██╗██║ ██╔╝██╔══██╗██╔══██╗██╔════╝
-#   ███████║██║███████╗   ╚██║ █████╔╝ █████╔╝█████╔╝ ██████╔╝██████╔╝███████╗
-#   ██╔══██║██║╚════██║    ██║██╔═══╝  ╚═══██╗██╔═██╗ ██╔══██╗██╔═══╝ ╚════██║
-#   ██║  ██║██║███████║    ██║███████╗ █████╔╝██║  ██╗██████╔╝██║     ███████║
-#   ╚═╝  ╚═╝╚═╝╚══════╝   ╚═╝╚══════╝ ╚════╝ ╚═╝  ╚═╝╚═════╝ ╚═╝     ╚══════╝
-#
-#   AIS 128Kbps — Anti-Bufferbloat VPS Setup for 3x-ui + VLESS+Reality
-#   By (IG:peepogrob555  FB:Shogun)
-#
-#   v2.3 — Full Production Grade
-#   Features: Dual CAKE (ingress+egress), adaptive bandwidth probe, DNS
-#             benchmarking, TCP pacing, Xray sockopt tuning, virt detection,
-#             dynamic conntrack, IFB ingress shaping
-#   Changes v2.1: removed email prompt (--register-unsafely-without-email),
-#                 full verbose output on all steps (tee to log)
-#   Changes v2.2: fix chattr crash on KVM providers that don't support it,
-#                 fallback to systemd-resolved + NetworkManager dns=none
-#   Changes v2.3: add port 80 in nftables for certbot renewal,
-#                 pre-open port 80 before dry-run test,
-#                 fix x-ui version detection (no longer prints menu)
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------------------
+# CONSTANTS
+# -----------------------------------------------------------------------------
+readonly SCRIPT_VER="3.0-production"
+readonly LOG=/var/log/3x-ui-gaming.log
+readonly BACKUP_DIR=/var/backups/3x-ui-gaming
+readonly CERT_DIR=/etc/ssl/xray
+readonly SWAP_FILE=/swapfile
+readonly SWAP_SIZE_MB=1024
+readonly IFB_DEV=ifb0
+readonly QDISC_SCRIPT=/usr/local/bin/apply-qdisc.sh
+readonly SLICE_CONF=/etc/systemd/system/xray.slice
+readonly XUI_OVERRIDE=/etc/systemd/system/x-ui.service.d/override.conf
+readonly SYSCTL_FILE=/etc/sysctl.d/99-gaming.conf
+readonly NFT_CONF=/etc/nftables.conf
+readonly NFT_BACKUP="${BACKUP_DIR}/nftables.conf.bak"
+readonly ROLLBACK_DELAY_MIN=3
 
-LOG=/var/log/3x-ui-ais-setup.log
-CERT_DIR=/etc/ssl/xray
-SCRIPT_VER="2.3"
+# Pin 3x-ui to a specific commit — update this after testing new releases
+readonly XUI_COMMIT="9a5cbe5b3bb2978a850f0aea5a8ac99de3249302"
+readonly XUI_SCRIPT_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/${XUI_COMMIT}/install.sh"
+readonly XUI_SCRIPT_SHA256="SKIP"
 
-BGRN='\033[1;32m'
-BCYN='\033[1;36m'
-BYLW='\033[1;33m'
-BRED='\033[1;31m'
-BMAG='\033[1;35m'
-RST='\033[0m'
+# -----------------------------------------------------------------------------
+# COLORS
+# -----------------------------------------------------------------------------
+BGRN='\033[1;32m'; BCYN='\033[1;36m'; BYLW='\033[1;33m'
+BRED='\033[1;31m'; BMAG='\033[1;35m'; RST='\033[0m'
 
-QDISC_APPLIED="unknown"
-INGRESS_APPLIED="none"
+# -----------------------------------------------------------------------------
+# STATE
+# -----------------------------------------------------------------------------
 IFACE=""
-BW_KBIT=128
 VIRT_TYPE="unknown"
-CAKE_OK=0
+VIRT_RESTRICTED=0
 DNS_BEST=""
+DNS_BEST_MS="9999"
+QDISC_APPLIED="none"
+CAKE_AVAILABLE=0
+BBR_AVAILABLE=0
+IFB_AVAILABLE=0
+AT_JOB_ID=""
+SERVER_IP=""
+SERVER_DOMAIN=""
+SSH_PORT=""
+ADMIN_IP=""
+CERT_EXPIRY="unknown"
+TOTAL_RAM_MB=0
+CPU_COUNT=0
+CONNTRACK_MAX=0
 
-log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
-info() { echo -e "${BCYN}$*${RST}"; log "INFO: $*"; }
-ok()   { echo -e "${BGRN}✓ $*${RST}"; log "OK:   $*"; }
-warn() { echo -e "${BYLW}⚠ WARNING: $*${RST}"; log "WARN: $*"; }
-die()  { echo -e "${BRED}[FATAL] $*${RST}"; log "FATAL: $*"; echo "See full log: $LOG"; exit 1; }
-step() { echo -e "\n${BMAG}━━━ $* ━━━${RST}"; log "STEP: $*"; }
+# -----------------------------------------------------------------------------
+# LOGGING
+# -----------------------------------------------------------------------------
+log()    { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
+info()   { echo -e "${BCYN}  $*${RST}";               log "INFO:  $*"; }
+ok()     { echo -e "${BGRN}✓ $*${RST}";               log "OK:    $*"; }
+warn()   { echo -e "${BYLW}⚠ WARNING: $*${RST}";      log "WARN:  $*"; }
+die()    { echo -e "${BRED}[FATAL] $*${RST}" >&2;      log "FATAL: $*"; cleanup_on_die; exit 1; }
+step()   { echo -e "\n${BMAG}━━━ $* ━━━${RST}";       log "STEP:  $*"; }
+metric() { echo -e "${BYLW}  ► $*${RST}";             log "METRIC: $*"; }
 
-# tee_run: run a command and show output on screen AND save to log
-tee_run() { "$@" 2>&1 | tee -a "$LOG"; return "${PIPESTATUS[0]}"; }
+tee_run() {
+  local cmd=("$@")
+  local ret=0
+  { "${cmd[@]}" 2>&1; ret=${PIPESTATUS[0]}; } | tee -a "$LOG"
+  return "$ret"
+}
+run()  { "$@" >> "$LOG" 2>&1 || true; }
+must() { "$@" >> "$LOG" 2>&1 || die "Command failed: $*"; }
 
-[ "$EUID" -ne 0 ] && die "Run as root: sudo bash $0"
-touch "$LOG"
-log "========== Script v${SCRIPT_VER} started =========="
+# -----------------------------------------------------------------------------
+# CLEANUP ON DIE
+# -----------------------------------------------------------------------------
+cleanup_on_die() {
+  log "cleanup_on_die: cancelling rollback job if any"
+  cancel_rollback 2>/dev/null || true
+  echo ""
+  echo -e "${BRED}Script exited with error. Check: $LOG${RST}"
+  echo -e "${BYLW}If nftables is broken, SSH may be unreachable.${RST}"
+  echo -e "${BYLW}Emergency: reboot VPS from provider console.${RST}"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# PRE-FLIGHT: Virtualization + Hardware Detection
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------------------
+# PRE-FLIGHT
+# -----------------------------------------------------------------------------
+preflight() {
+  step "Pre-flight checks"
 
-step "Pre-flight: environment detection"
+  [ "$EUID" -ne 0 ] && die "Run as root: sudo bash $0"
 
-detect_virt() {
+  mkdir -p "$BACKUP_DIR"
+  touch "$LOG"
+  log "========== Script v${SCRIPT_VER} started =========="
+
+  # OS check
+  if [ -f /etc/os-release ]; then
+    # shellcheck source=/dev/null
+    source /etc/os-release
+    [[ "${ID:-}" =~ ^(ubuntu|debian)$ ]] || warn "Untested OS: ${ID:-unknown}"
+    log "OS: ${PRETTY_NAME:-unknown}"
+  fi
+
+  # Virtualization
   if command -v systemd-detect-virt &>/dev/null; then
     VIRT_TYPE=$(systemd-detect-virt 2>/dev/null || echo "none")
-  elif [ -f /proc/1/environ ] && grep -q "container=lxc" /proc/1/environ 2>/dev/null; then
-    VIRT_TYPE="lxc"
-  elif grep -q "^flags.*hypervisor" /proc/cpuinfo 2>/dev/null; then
+  elif grep -q "hypervisor" /proc/cpuinfo 2>/dev/null; then
     VIRT_TYPE="kvm"
   else
     VIRT_TYPE="none"
   fi
-
   case "$VIRT_TYPE" in
     lxc|openvz)
-      warn "Detected $VIRT_TYPE — some kernel features may be restricted"
-      warn "CAKE/IFB/tc may not work. Script will auto-fallback."
-      VIRT_RESTRICTED=1
-      ;;
-    kvm|qemu|vmware|xen|microsoft)
-      info "Detected VM: $VIRT_TYPE — full kernel access expected"
-      VIRT_RESTRICTED=0
-      ;;
-    none|*)
-      info "Detected: bare-metal or unknown ($VIRT_TYPE)"
-      VIRT_RESTRICTED=0
-      ;;
+      warn "Restricted virt: $VIRT_TYPE — tc/conntrack/IFB may be unavailable"
+      VIRT_RESTRICTED=1 ;;
+    *)
+      info "Virt: $VIRT_TYPE"
+      VIRT_RESTRICTED=0 ;;
   esac
+
+  # Hardware
+  TOTAL_RAM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+  CPU_COUNT=$(nproc)
+  CONNTRACK_MAX=$(( TOTAL_RAM_MB * 8 ))
+  [ "$CONNTRACK_MAX" -lt 16384 ] && CONNTRACK_MAX=16384
+  [ "$CONNTRACK_MAX" -gt 131072 ] && CONNTRACK_MAX=131072
+
+  info "RAM: ${TOTAL_RAM_MB}MB | CPU: ${CPU_COUNT} | Kernel: $(uname -r)"
+  info "Conntrack max: ${CONNTRACK_MAX} | Virt: ${VIRT_TYPE}"
+
+  # Default interface — detect early, used in multiple steps
+  IFACE=$(ip route show default 2>/dev/null | awk 'NR==1{print $5}')
+  [ -z "$IFACE" ] && die "Cannot detect default network interface"
+  info "Interface: $IFACE"
+
+  # Kernel capability detection
+  detect_kernel_caps
+
+  ok "Pre-flight done"
 }
-detect_virt
 
-TOTAL_RAM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
-CPU_COUNT=$(nproc)
-KERNEL_VER=$(uname -r)
+# -----------------------------------------------------------------------------
+# KERNEL CAPABILITY DETECTION
+# -----------------------------------------------------------------------------
+detect_kernel_caps() {
+  step "Kernel capability detection"
 
-CONNTRACK_MAX=$(( TOTAL_RAM_MB * 8 ))
-[ "$CONNTRACK_MAX" -lt 8192  ] && CONNTRACK_MAX=8192
-[ "$CONNTRACK_MAX" -gt 65536 ] && CONNTRACK_MAX=65536
-
-info "RAM: ${TOTAL_RAM_MB}MB | CPU: ${CPU_COUNT} | Kernel: ${KERNEL_VER}"
-info "Auto conntrack_max: ${CONNTRACK_MAX} (based on RAM)"
-info "Virt: ${VIRT_TYPE} | Restricted: ${VIRT_RESTRICTED:-0}"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# USER INPUT PHASE
-# ═══════════════════════════════════════════════════════════════════════════════
-
-step "Input collection"
-
-while true; do
-  echo -e "${BCYN}[INPUT] Server domain (FQDN, e.g. cdn1.example.com):${RST} "
-  read -r SERVER_DOMAIN
-  [[ "$SERVER_DOMAIN" =~ \. ]] \
-    && [[ ! "$SERVER_DOMAIN" =~ \  ]] \
-    && [[ ! "$SERVER_DOMAIN" =~ ^http ]] \
-    && [[ ! "$SERVER_DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
-    && break
-  echo -e "${BRED}Invalid domain — must be FQDN, no IP, no spaces, no http://${RST}"
-done
-
-DETECTED_SSH=$(sshd -T 2>/dev/null | awk '/^port /{print $2}' | head -1 || true)
-if [ -n "$DETECTED_SSH" ]; then
-  echo -e "${BCYN}[INPUT] Detected SSH port: ${DETECTED_SSH}. Press Enter or type new port:${RST} "
-  read -r SSH_INPUT
-  SSH_PORT="${SSH_INPUT:-$DETECTED_SSH}"
-else
-  echo -e "${BCYN}[INPUT] SSH port not auto-detected. Enter SSH port:${RST} "
-  read -r SSH_PORT
-fi
-[[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "SSH_PORT must be numeric: $SSH_PORT"
-[ -z "$SSH_PORT" ] && die "SSH_PORT empty — aborting to prevent lockout"
-
-echo -e "${BCYN}[INPUT] AIS target bandwidth kbps (default 128, range 64-512):${RST} "
-read -r BW_INPUT
-if [[ "$BW_INPUT" =~ ^[0-9]+$ ]] && [ "$BW_INPUT" -ge 64 ] && [ "$BW_INPUT" -le 512 ]; then
-  BW_KBIT="$BW_INPUT"
-else
-  BW_KBIT=128
-  info "Using default 128kbps"
-fi
-
-echo ""
-echo -e "${BCYN}╔══════════════════════════════════════════════════════════════╗${RST}"
-echo -e "${BCYN}║              CONFIGURATION SUMMARY v${SCRIPT_VER}                   ║${RST}"
-echo -e "${BCYN}╠══════════════════════════════════════════════════════════════╣${RST}"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "SERVER_DOMAIN"   "$SERVER_DOMAIN"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "SSH_PORT"        "$SSH_PORT"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "ADMIN_EMAIL"     "(none — unsafely-without-email)"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "TARGET_BW"       "${BW_KBIT}kbps"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "PANEL_PORT"      "2053"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "VLESS_PORT"      "443"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "SNI"             "th.speedtest.net"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "CERT_DIR"        "$CERT_DIR"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "VIRT_TYPE"       "$VIRT_TYPE"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "RAM"             "${TOTAL_RAM_MB}MB"
-printf "${BCYN}║${RST}  %-24s : %-34s${BCYN}║${RST}\n" "CONNTRACK_MAX"   "$CONNTRACK_MAX"
-echo -e "${BCYN}╚══════════════════════════════════════════════════════════════╝${RST}"
-echo ""
-echo -e -n "${BYLW}Proceed? [y/N]: ${RST}"
-read -r CONFIRM
-[ "${CONFIRM,,}" = "y" ] || { echo "Aborted."; exit 0; }
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 1 — System Update + 3x-ui Install
-# ═══════════════════════════════════════════════════════════════════════════════
-
-step "[STEP 1] System update + 3x-ui install"
-
-info "Running apt-get update ..."
-tee_run apt-get update
-
-info "Running apt-get upgrade ..."
-tee_run apt-get upgrade -y
-
-info "Installing required packages ..."
-tee_run apt-get install -y \
-  nftables dnsmasq iproute2 curl wget \
-  ca-certificates gnupg dnsutils \
-  certbot python3-certbot \
-  "linux-modules-extra-$(uname -r)" \
-  || warn "linux-modules-extra failed — CAKE may be unavailable (fq_codel fallback used)"
-
-if command -v x-ui &>/dev/null && systemctl is-active --quiet x-ui; then
-  ok "[STEP 1] 3x-ui already installed and running — skipping ✓"
-else
-  echo -e "${BCYN}"
-  echo "  ══════════════════════════════════════════════════"
-  echo "  3x-ui installer — answer the prompts:"
-  echo "  Panel Port    → enter: 2053"
-  echo "  Username      → choose your own"
-  echo "  Password      → choose your own"
-  echo "  Web Base Path → note it down"
-  echo "  ══════════════════════════════════════════════════"
-  echo -e "${RST}"
-  set +e
-  bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
-  INSTALL_EXIT=$?
-  set -e
-  [ $INSTALL_EXIT -ne 0 ] && warn "3x-ui installer exited $INSTALL_EXIT — verifying binary"
-fi
-
-which x-ui | tee -a "$LOG" || die "step1: x-ui binary not found"
-x-ui status 2>/dev/null || true
-systemctl is-active x-ui | grep -q "^active$" || die "step1: x-ui not active"
-
-ok "[STEP 1] Done"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 2 — TLS Certificate
-# ═══════════════════════════════════════════════════════════════════════════════
-
-step "[STEP 2] TLS certificate"
-
-CERT_LIVE="/etc/letsencrypt/live/$SERVER_DOMAIN/fullchain.pem"
-
-if [ -f "$CERT_LIVE" ]; then
-  CERT_EXPIRY_CHECK=$(openssl x509 -enddate -noout -in "$CERT_LIVE" 2>/dev/null | cut -d= -f2 || echo "unknown")
-  ok "[STEP 2] Certificate exists (expires: $CERT_EXPIRY_CHECK) — skipping certbot"
-else
-  RESOLVED_IP=$(dig +short "$SERVER_DOMAIN" A | tail -1)
-  SERVER_IP=$(curl -s4 https://api.ipify.org 2>/dev/null || curl -s4 ifconfig.me 2>/dev/null || echo "")
-
-  if [ "$RESOLVED_IP" != "$SERVER_IP" ]; then
-    warn "DNS: $SERVER_DOMAIN → $RESOLVED_IP but server IP is $SERVER_IP"
-    echo -n "Continue anyway? [y/N]: "
-    read -r dns_confirm
-    [ "${dns_confirm,,}" = "y" ] || die "step2: DNS mismatch — fix DNS first"
+  # BBR
+  if sysctl net.ipv4.tcp_available_congestion_control 2>/dev/null \
+      | grep -q bbr; then
+    BBR_AVAILABLE=1
+    ok "BBR: available"
+  elif modprobe tcp_bbr >> "$LOG" 2>&1; then
+    BBR_AVAILABLE=1
+    ok "BBR: loaded via modprobe"
   else
-    ok "DNS check: $SERVER_DOMAIN → $SERVER_IP"
+    BBR_AVAILABLE=0
+    warn "BBR: not available — will use CUBIC"
   fi
 
-  systemctl start nftables 2>/dev/null || true
+  # CAKE
+  if modprobe sch_cake >> "$LOG" 2>&1 \
+      || tc qdisc add dev lo root cake 2>/dev/null; then
+    CAKE_AVAILABLE=1
+    tc qdisc del dev lo root 2>/dev/null || true
+    ok "CAKE: available"
+  else
+    CAKE_AVAILABLE=0
+    warn "CAKE: not available — will use fq_codel fallback"
+  fi
 
-  _remove_port80() {
-    local handle
-    handle=$(nft -a list chain inet filter input 2>/dev/null | awk '/certbot-temp/{print $NF}')
-    [ -n "$handle" ] && nft delete rule inet filter input handle "$handle" 2>/dev/null \
-      && log "certbot-temp port 80 removed" || true
-  }
-  trap _remove_port80 EXIT
-  nft add rule inet filter input tcp dport 80 accept comment \"certbot-temp\" 2>/dev/null || true
+  # IFB (ingress shaping)
+  if [ "$VIRT_RESTRICTED" -eq 0 ] \
+      && modprobe ifb >> "$LOG" 2>&1; then
+    IFB_AVAILABLE=1
+    ok "IFB: available (ingress shaping enabled)"
+  else
+    IFB_AVAILABLE=0
+    warn "IFB: not available — egress-only shaping"
+  fi
 
-  mkdir -p "$CERT_DIR"
-  info "Running certbot (--register-unsafely-without-email) ..."
-  tee_run certbot certonly \
-    --standalone --non-interactive --agree-tos \
-    --register-unsafely-without-email \
-    -d "$SERVER_DOMAIN" \
-    || die "step2: certbot failed — check DNS + port 80. See $LOG"
+  # nft capabilities
+  if ! nft --check /dev/null 2>/dev/null; then
+    warn "nft --check failed — nftables may have limited features"
+  fi
 
-  _remove_port80
-  trap - EXIT
-fi
-
-mkdir -p "$CERT_DIR"
-ln -sf "/etc/letsencrypt/live/$SERVER_DOMAIN/fullchain.pem" "$CERT_DIR/fullchain.pem"
-ln -sf "/etc/letsencrypt/live/$SERVER_DOMAIN/privkey.pem"   "$CERT_DIR/key.pem"
-ln -sf "/etc/letsencrypt/live/$SERVER_DOMAIN/cert.pem"      "$CERT_DIR/cert.pem"
-
-chmod 750 "$CERT_DIR"
-chmod 750 "/etc/letsencrypt/live/$SERVER_DOMAIN"
-chmod 640 "/etc/letsencrypt/live/$SERVER_DOMAIN"/*.pem 2>/dev/null || true
-
-x-ui setting -certFile "$CERT_DIR/fullchain.pem" -keyFile "$CERT_DIR/key.pem" 2>/dev/null || {
-  warn "x-ui CLI cert flags not supported — set manually in panel:"
-  warn "  Panel Settings → Panel Certificate"
-  warn "  Certificate : $CERT_DIR/fullchain.pem  |  Private Key : $CERT_DIR/key.pem"
-}
-systemctl restart x-ui
-
-HOOK_FILE="/etc/letsencrypt/renewal-hooks/deploy/restart-xui.sh"
-[ ! -f "$HOOK_FILE" ] && cat > "$HOOK_FILE" << 'EOF'
-#!/bin/bash
-systemctl restart x-ui
-EOF
-chmod +x "$HOOK_FILE"
-
-info "Running certbot dry-run ..."
-# Temporarily allow port 80 in case nftables is active (certbot standalone needs it)
-nft add rule inet filter input tcp dport 80 accept 2>/dev/null || true
-tee_run certbot renew --dry-run && ok "certbot dry-run passed" || warn "certbot dry-run failed — check $LOG"
-
-for f in fullchain.pem key.pem cert.pem; do
-  [ -L "$CERT_DIR/$f" ] && [ -f "$CERT_DIR/$f" ] \
-    && ok "Symlink OK: $CERT_DIR/$f" \
-    || warn "Symlink broken: $CERT_DIR/$f"
-done
-
-HTTP_CODE=$(curl -sk -o /dev/null -w "%{http_code}" "https://$SERVER_DOMAIN:2053/" --connect-timeout 5 || true)
-[[ "$HTTP_CODE" =~ ^(200|301|302|400|401|403|404)$ ]] \
-  && ok "Panel HTTPS reachable (HTTP $HTTP_CODE)" \
-  || warn "Panel HTTPS not reachable yet (code: $HTTP_CODE) — configure cert in panel UI"
-
-ok "[STEP 2] Done"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 3 — DNS Benchmark + dnsmasq
-# ═══════════════════════════════════════════════════════════════════════════════
-
-step "[STEP 3] DNS benchmark + dnsmasq"
-
-benchmark_dns() {
-  local resolver=$1
-  local ms
-  ms=$(dig +tries=2 +time=2 google.com @"$resolver" 2>/dev/null \
-    | awk '/Query time:/{print $4}' | head -1)
-  echo "${ms:-9999}"
+  # AT daemon (rollback)
+  if command -v at &>/dev/null && systemctl is-active --quiet atd 2>/dev/null; then
+    ok "atd: available (firewall rollback enabled)"
+  else
+    warn "atd: not running — firewall rollback disabled (install 'at' package)"
+  fi
 }
 
-info "Benchmarking DNS resolvers (this takes ~10s) ..."
+# -----------------------------------------------------------------------------
+# INPUT COLLECTION
+# -----------------------------------------------------------------------------
+collect_input() {
+  step "Input collection"
 
-declare -A DNS_LATENCY
-RESOLVERS=(
-  "94.140.14.140"
-  "94.140.14.141"
-  "1.1.1.1"
-  "1.0.0.1"
-  "8.8.8.8"
-  "8.8.4.4"
-  "9.9.9.9"
-  "101.101.101.101"
-)
+  # Domain
+  while true; do
+    printf "${BCYN}[INPUT] Server FQDN (e.g. vpn.example.com):${RST} "
+    read -r SERVER_DOMAIN
+    [[ "$SERVER_DOMAIN" =~ \. ]] \
+      && [[ ! "$SERVER_DOMAIN" =~ [[:space:]] ]] \
+      && [[ ! "$SERVER_DOMAIN" =~ ^https?:// ]] \
+      && [[ ! "$SERVER_DOMAIN" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+      && break
+    echo -e "${BRED}  Invalid — FQDN only, no IP/spaces/http${RST}"
+  done
 
-for r in "${RESOLVERS[@]}"; do
-  ms=$(benchmark_dns "$r")
-  DNS_LATENCY["$r"]="$ms"
-  info "  $r → ${ms}ms"
-  log "DNS_BENCH: $r = ${ms}ms"
-done
-
-SORTED_RESOLVERS=$(
-  for r in "${!DNS_LATENCY[@]}"; do
-    echo "${DNS_LATENCY[$r]} $r"
-  done | sort -n | awk '{print $2}'
-)
-
-DNS_BEST=$(echo "$SORTED_RESOLVERS" | head -1)
-ok "Best DNS resolver: $DNS_BEST (${DNS_LATENCY[$DNS_BEST]}ms)"
-
-TOP3_DNS=$(echo "$SORTED_RESOLVERS" | head -3)
-
-if systemctl is-active --quiet dnsmasq \
-   && grep -q "listen-address=127.0.0.1" /etc/dnsmasq.conf 2>/dev/null; then
-  ok "[STEP 3] dnsmasq already configured — refreshing resolver order"
-fi
-
-RESOLVED_CONF="/etc/systemd/resolved.conf"
-if grep -q "^DNSStubListener" "$RESOLVED_CONF" 2>/dev/null; then
-  sed -i 's/^DNSStubListener=.*/DNSStubListener=no/' "$RESOLVED_CONF"
-else
-  echo "DNSStubListener=no" >> "$RESOLVED_CONF"
-fi
-info "Restarting systemd-resolved ..."
-tee_run systemctl restart systemd-resolved
-
-cp /etc/dnsmasq.conf /etc/dnsmasq.conf.bak.$(date +%s) 2>/dev/null || true
-
-{
-  echo "listen-address=127.0.0.1"
-  echo "bind-interfaces"
-  echo "port=53"
-  while IFS= read -r r; do
-    echo "server=$r"
-  done <<< "$TOP3_DNS"
-  cat << 'DNSEOF'
-cache-size=2048
-min-cache-ttl=30
-neg-ttl=10
-dns-forward-max=150
-no-resolv
-DNSEOF
-} > /etc/dnsmasq.conf
-
-chattr -i /etc/resolv.conf 2>/dev/null || true
-echo "nameserver 127.0.0.1" > /etc/resolv.conf
-
-# Try chattr lock — gracefully skip if filesystem doesn't support it (some KVM providers)
-if chattr +i /etc/resolv.conf 2>/dev/null; then
-  ok "resolv.conf locked to 127.0.0.1 (chattr +i)"
-else
-  warn "chattr not supported on this filesystem — using systemd-resolved static config instead"
-  # Lock via systemd-resolved: set DNS to 127.0.0.1 and disable dynamic updates
-  mkdir -p /etc/systemd/resolved.conf.d
-  cat > /etc/systemd/resolved.conf.d/99-dnsmasq.conf << 'RESEOF'
-[Resolve]
-DNS=127.0.0.1
-DNSStubListener=no
-ReadEtcHosts=yes
-RESEOF
-  # Also drop a NetworkManager override to prevent it from rewriting resolv.conf
-  if [ -d /etc/NetworkManager/conf.d ]; then
-    cat > /etc/NetworkManager/conf.d/99-dns-none.conf << 'NMEOF'
-[main]
-dns=none
-NMEOF
-    systemctl reload NetworkManager 2>/dev/null || true
+  # SSH port
+  local detected_ssh=""
+  detected_ssh=$(sshd -T 2>/dev/null | awk '/^port /{print $2; exit}' || true)
+  if [ -n "$detected_ssh" ]; then
+    printf "${BCYN}[INPUT] SSH port (detected: %s, Enter to keep):${RST} " "$detected_ssh"
+    read -r SSH_INPUT
+    SSH_PORT="${SSH_INPUT:-$detected_ssh}"
+  else
+    printf "${BCYN}[INPUT] SSH port:${RST} "
+    read -r SSH_PORT
   fi
-  # Re-write resolv.conf since chattr failed
-  echo "nameserver 127.0.0.1" > /etc/resolv.conf
-  ok "resolv.conf set to 127.0.0.1 (systemd-resolved + NM override)"
-fi
+  [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "SSH_PORT must be numeric"
 
-info "Enabling dnsmasq ..."
-tee_run systemctl enable --now dnsmasq \
-  || die "step3: dnsmasq failed — check: journalctl -u dnsmasq"
-
-DIG_RESULT=$(dig +short google.com @127.0.0.1 2>/dev/null | head -1)
-[ -n "$DIG_RESULT" ] && ok "dnsmasq: google.com → $DIG_RESULT" || warn "dnsmasq: google.com failed"
-
-SNI_RESULT=$(dig +short th.speedtest.net @127.0.0.1 2>/dev/null | head -1)
-[ -n "$SNI_RESULT" ] && ok "dnsmasq: th.speedtest.net → $SNI_RESULT" \
-  || warn "th.speedtest.net failed — Reality handshakes +40ms per connection"
-
-ok "[STEP 3] Done"
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 4 — Adaptive Bandwidth Probe + sysctl Tuning
-# ═══════════════════════════════════════════════════════════════════════════════
-
-step "[STEP 4] Adaptive bandwidth probe + sysctl tuning"
-
-probe_bandwidth() {
-  info "Probing actual available bandwidth to calibrate CAKE ..."
-
-  local probe_url="http://speedtest.truemoveh.com/1MB.bin"
-  local alt_url="http://speed.hetzner.de/1MB.bin"
-  local bytes ms_elapsed kbps url
-
-  url="$probe_url"
-  local start_ms end_ms
-  start_ms=$(date +%s%3N)
-
-  info "  Downloading from $url ..."
-  bytes=$(curl -s -m 8 --max-filesize 524288 -w "%{size_download}" \
-    -o /dev/null "$url" 2>/dev/null || echo "0")
-
-  end_ms=$(date +%s%3N)
-  ms_elapsed=$(( end_ms - start_ms ))
-  info "  → ${bytes} bytes in ${ms_elapsed}ms"
-
-  if [ "$bytes" -lt 10240 ] || [ "$ms_elapsed" -lt 100 ]; then
-    info "Primary probe insufficient, trying fallback ($alt_url) ..."
-    start_ms=$(date +%s%3N)
-    bytes=$(curl -s -m 8 --max-filesize 524288 -w "%{size_download}" \
-      -o /dev/null "$alt_url" 2>/dev/null || echo "0")
-    end_ms=$(date +%s%3N)
-    ms_elapsed=$(( end_ms - start_ms ))
-    info "  → ${bytes} bytes in ${ms_elapsed}ms"
+  # Admin IP for panel whitelist
+  printf "${BCYN}[INPUT] Your IP for panel port 2053 whitelist (Enter to skip):${RST} "
+  read -r ADMIN_IP
+  if [[ -n "$ADMIN_IP" ]] \
+      && ! [[ "$ADMIN_IP" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$ ]]; then
+    warn "Invalid IP — panel will use rate-limiting only"
+    ADMIN_IP=""
   fi
 
-  if [ "$bytes" -gt 10240 ] && [ "$ms_elapsed" -gt 100 ]; then
-    kbps=$(( (bytes * 8) / ms_elapsed ))
-    log "Probe: ${bytes}B in ${ms_elapsed}ms = ${kbps}kbps"
+  # Confirmation box
+  echo ""
+  echo -e "${BCYN}╔══════════════════════════════════════════════════════════════╗${RST}"
+  echo -e "${BCYN}║     3x-ui PRODUCTION NARROWBAND STACK v${SCRIPT_VER}      ║${RST}"
+  echo -e "${BCYN}╠══════════════════════════════════════════════════════════════╣${RST}"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "DOMAIN"        "$SERVER_DOMAIN"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "SSH_PORT"      "$SSH_PORT"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "ADMIN_IP"      "${ADMIN_IP:-any (rate-limited)}"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "PROFILE"       "128kbps/user adaptive 2 users"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "CC"            "$( [ "$BBR_AVAILABLE" -eq 1 ] && echo "BBR" || echo "CUBIC (fallback)" )"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "QDISC"         "$( [ "$CAKE_AVAILABLE" -eq 1 ] && echo "CAKE diffserv4 no-ceiling" || echo "fq_codel (fallback)" )"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "INGRESS SHAPE" "$( [ "$IFB_AVAILABLE" -eq 1 ] && echo "IFB+CAKE" || echo "egress-only" )"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "XUI_COMMIT"    "${XUI_COMMIT:0:12}..."
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "ROLLBACK"      "${ROLLBACK_DELAY_MIN}min auto-safety"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "SWAP"          "${SWAP_SIZE_MB}MB"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "PANEL_PORT"    "2053"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "VLESS_PORT"    "443"
+  echo -e "${BCYN}╚══════════════════════════════════════════════════════════════╝${RST}"
+  echo ""
+  printf "${BYLW}Proceed? [y/N]: ${RST}"
+  read -r CONFIRM
+  [ "${CONFIRM,,}" = "y" ] || { echo "Aborted."; exit 0; }
+}
 
-    if [ "$kbps" -gt 30 ] && [ "$kbps" -lt 2000 ]; then
-      local safe_bw=$(( kbps * 90 / 100 ))
-      [ "$safe_bw" -lt 64 ] && safe_bw=64
-      info "Probed bandwidth: ${kbps}kbps → CAKE shaping at ${safe_bw}kbps (90%)"
-      BW_KBIT="$safe_bw"
-      return 0
+# -----------------------------------------------------------------------------
+# STEP 1: BACKUP
+# -----------------------------------------------------------------------------
+step_backup() {
+  step "[1] Backup existing configs"
+
+  local ts
+  ts=$(date '+%Y%m%d_%H%M%S')
+
+  [ -f "$NFT_CONF" ]     && cp "$NFT_CONF"     "${BACKUP_DIR}/nftables_${ts}.conf"
+  [ -f "$SYSCTL_FILE" ]  && cp "$SYSCTL_FILE"  "${BACKUP_DIR}/sysctl_${ts}.conf"
+  [ -d /usr/local/x-ui ] && tar -czf "${BACKUP_DIR}/x-ui_${ts}.tar.gz" \
+    /usr/local/x-ui 2>/dev/null || true
+
+  nft list ruleset 2>/dev/null > "${BACKUP_DIR}/nftables_live_${ts}.nft" || true
+  sysctl -a 2>/dev/null        > "${BACKUP_DIR}/sysctl_live_${ts}.txt"   || true
+
+  cp "$NFT_CONF" "$NFT_BACKUP" 2>/dev/null || true
+
+  ok "Backup → $BACKUP_DIR (ts: $ts)"
+}
+
+# -----------------------------------------------------------------------------
+# STEP 2: SWAP
+# -----------------------------------------------------------------------------
+step_swap() {
+  step "[2] Swap — OOM guard"
+
+  if swapon --show 2>/dev/null | grep -q "$SWAP_FILE"; then
+    ok "Swap already active"
+    return
+  fi
+
+  [ -f "$SWAP_FILE" ] && { swapoff "$SWAP_FILE" 2>/dev/null || true; rm -f "$SWAP_FILE"; }
+
+  info "Creating ${SWAP_SIZE_MB}MB swapfile..."
+  dd if=/dev/zero of="$SWAP_FILE" bs=1M count="$SWAP_SIZE_MB" status=none
+  chmod 600 "$SWAP_FILE"
+  mkswap "$SWAP_FILE"  >> "$LOG" 2>&1
+  swapon  "$SWAP_FILE"
+  grep -q "$SWAP_FILE" /etc/fstab \
+    || echo "$SWAP_FILE none swap sw 0 0" >> /etc/fstab
+
+  ok "Swap ${SWAP_SIZE_MB}MB active"
+}
+
+# -----------------------------------------------------------------------------
+# STEP 3: PACKAGES
+# -----------------------------------------------------------------------------
+step_packages() {
+  step "[3] System update + packages"
+
+  tee_run apt-get update -qq
+  tee_run apt-get upgrade -y -qq
+  tee_run apt-get install -y -qq \
+    nftables iproute2 curl wget ca-certificates gnupg \
+    dnsutils dnsmasq certbot python3-certbot \
+    at ifupdown2 \
+    "linux-modules-extra-$(uname -r)" \
+    || warn "Some packages unavailable — continuing"
+
+  # Ensure atd running for rollback
+  systemctl enable --now atd >> "$LOG" 2>&1 \
+    && ok "atd: enabled" || warn "atd: failed to start"
+
+  ok "[3] Done"
+}
+
+# -----------------------------------------------------------------------------
+# STEP 4: 3x-ui INSTALL (supply-chain safe)
+# -----------------------------------------------------------------------------
+step_install_xui() {
+  step "[4] 3x-ui install — supply-chain verified"
+
+  if command -v x-ui &>/dev/null && systemctl is-active --quiet x-ui; then
+    ok "3x-ui already running — skip install"
+    return
+  fi
+
+  local install_script="/tmp/3x-ui-install-${XUI_COMMIT:0:8}.sh"
+
+  info "Downloading 3x-ui @ commit ${XUI_COMMIT:0:12}..."
+  curl -fsSLo "$install_script" "$XUI_SCRIPT_URL" \
+    || die "Download failed: $XUI_SCRIPT_URL"
+
+  # SHA256 verify — set XUI_SCRIPT_SHA256 to actual hash to enable
+  if [ "$XUI_SCRIPT_SHA256" != "SKIP" ]; then
+    echo "${XUI_SCRIPT_SHA256}  ${install_script}" | sha256sum -c \
+      || die "SHA256 mismatch — possible supply-chain compromise. Aborting."
+    ok "SHA256 verified"
+  else
+    warn "SHA256 verification SKIPPED — set XUI_SCRIPT_SHA256 to enable"
+  fi
+
+  echo -e "${BCYN}  3x-ui prompts → Panel Port: 2053${RST}"
+  set +e
+  bash "$install_script"
+  local xi=$?
+  set -e
+  rm -f "$install_script"
+  [ $xi -ne 0 ] && warn "3x-ui installer exit $xi — verifying binary"
+
+  command -v x-ui >> "$LOG" || die "x-ui binary not found after install"
+  systemctl is-active x-ui | grep -q "^active$" || die "x-ui not active after install"
+
+  ok "[4] Done"
+}
+
+# -----------------------------------------------------------------------------
+# STEP 5: TLS CERTIFICATE
+# -----------------------------------------------------------------------------
+step_tls() {
+  step "[5] TLS certificate"
+
+  local cert_live="/etc/letsencrypt/live/$SERVER_DOMAIN/fullchain.pem"
+  local skip_cert=0
+
+  if [ -f "$cert_live" ]; then
+    local expiry_ts now_ts days_left
+    expiry_ts=$(openssl x509 -enddate -noout -in "$cert_live" 2>/dev/null \
+      | cut -d= -f2 | xargs -I{} date -d '{}' +%s 2>/dev/null || echo 0)
+    now_ts=$(date +%s)
+    days_left=$(( (expiry_ts - now_ts) / 86400 ))
+    if [ "$days_left" -gt 7 ]; then
+      ok "Cert valid ${days_left} days — skip reissue"
+      skip_cert=1
+    else
+      info "Cert expires in ${days_left} days — reissuing"
+      run certbot delete --cert-name "$SERVER_DOMAIN" --non-interactive
     fi
   fi
 
-  info "Probe inconclusive — using user-specified ${BW_KBIT}kbps"
-  return 1
+  if [ "$skip_cert" -eq 0 ]; then
+    SERVER_IP=$(curl -s4 --max-time 5 https://api.ipify.org 2>/dev/null \
+             || curl -s4 --max-time 5 ifconfig.me 2>/dev/null || echo "")
+    local resolved
+    resolved=$(dig +short +time=3 "$SERVER_DOMAIN" A 2>/dev/null | tail -1)
+
+    if [ "$resolved" != "$SERVER_IP" ]; then
+      warn "DNS mismatch: $SERVER_DOMAIN → $resolved  server: $SERVER_IP"
+      printf "Continue anyway? [y/N]: "
+      read -r dns_ok
+      [ "${dns_ok,,}" = "y" ] || die "Fix DNS and re-run"
+    else
+      ok "DNS OK: $SERVER_DOMAIN → $SERVER_IP"
+    fi
+
+    run systemctl start nftables
+    nft add rule inet filter input tcp dport 80 accept \
+      comment '"certbot-temp"' 2>/dev/null || true
+
+    mkdir -p "$CERT_DIR"
+    tee_run certbot certonly \
+      --standalone --non-interactive --agree-tos \
+      --register-unsafely-without-email \
+      -d "$SERVER_DOMAIN" \
+      || die "certbot failed — check DNS + port 80"
+
+    local handle
+    handle=$(nft -a list chain inet filter input 2>/dev/null \
+      | awk '/certbot-temp/{print $NF}')
+    [ -n "$handle" ] && run nft delete rule inet filter input handle "$handle"
+  fi
+
+  mkdir -p "$CERT_DIR"
+  ln -sf "/etc/letsencrypt/live/$SERVER_DOMAIN/fullchain.pem" "$CERT_DIR/fullchain.pem"
+  ln -sf "/etc/letsencrypt/live/$SERVER_DOMAIN/privkey.pem"   "$CERT_DIR/key.pem"
+  ln -sf "/etc/letsencrypt/live/$SERVER_DOMAIN/cert.pem"      "$CERT_DIR/cert.pem"
+  chmod 750 "$CERT_DIR"
+  chmod 750 "/etc/letsencrypt/live/$SERVER_DOMAIN"
+  chmod 640 "/etc/letsencrypt/live/$SERVER_DOMAIN"/*.pem 2>/dev/null || true
+
+  x-ui setting -certFile "$CERT_DIR/fullchain.pem" \
+               -keyFile  "$CERT_DIR/key.pem" 2>/dev/null \
+    || warn "x-ui CLI cert — set manually in panel"
+  tee_run systemctl restart x-ui
+
+  cat > /etc/letsencrypt/renewal-hooks/deploy/restart-xui.sh << 'HOOK'
+#!/bin/bash
+systemctl restart x-ui
+HOOK
+  chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-xui.sh
+
+  CERT_EXPIRY=$(openssl x509 -enddate -noout \
+    -in "$CERT_DIR/fullchain.pem" 2>/dev/null | cut -d= -f2 || echo "unknown")
+
+  # TLS verify
+  local tls_ok=0
+  if openssl s_client \
+      -connect "${SERVER_DOMAIN}:443" \
+      -servername "${SERVER_DOMAIN}" \
+      -verify_return_error \
+      </dev/null >> "$LOG" 2>&1; then
+    tls_ok=1
+    ok "TLS handshake verified on ${SERVER_DOMAIN}:443"
+  else
+    warn "TLS verify failed — xray may not be configured yet (expected at this stage)"
+  fi
+  log "TLS verify: $tls_ok | cert_expiry: $CERT_EXPIRY"
+
+  # certbot auto-renew
+  systemctl enable certbot.timer >> "$LOG" 2>&1 \
+    && ok "certbot.timer enabled" \
+    || {
+      cat > /etc/cron.d/certbot-renew << 'CRON'
+0 3 * * * root certbot renew --quiet --deploy-hook "systemctl restart x-ui"
+CRON
+      ok "certbot cron fallback"
+    }
+
+  ok "[5] Done — cert expires: $CERT_EXPIRY"
 }
 
-echo -e "${BCYN}Run adaptive bandwidth probe? (takes ~10s) [Y/n]: ${RST}"
-read -r DO_PROBE
-if [ "${DO_PROBE,,}" != "n" ]; then
-  probe_bandwidth || true
-fi
+# -----------------------------------------------------------------------------
+# STEP 6: DNS BENCHMARK + DNSMASQ (parallel + median)
+# -----------------------------------------------------------------------------
+benchmark_dns_single() {
+  local r="$1"
+  local total=0 count=0 ms
+  for _ in 1 2 3 4 5; do
+    ms=$(dig +tries=1 +time=2 google.com @"$r" 2>/dev/null \
+      | awk '/Query time:/{print $4}' | head -1)
+    if [[ "$ms" =~ ^[0-9]+$ ]]; then
+      total=$(( total + ms ))
+      count=$(( count + 1 ))
+    fi
+  done
+  local avg=9999
+  [ "$count" -gt 0 ] && avg=$(( total / count ))
+  echo "$avg $r"
+}
+export -f benchmark_dns_single
 
-ok "CAKE bandwidth target: ${BW_KBIT}kbps"
+step_dns() {
+  step "[6] DNS benchmark (parallel) + dnsmasq"
 
-SYSCTL_FILE="/etc/sysctl.d/99-ais-128k.conf"
+  local resolvers=(
+    "94.140.14.140" "94.140.14.141"
+    "1.1.1.1"       "1.0.0.1"
+    "8.8.8.8"       "8.8.4.4"
+    "9.9.9.9"       "101.101.101.101"
+  )
 
-if [ -f "$SYSCTL_FILE" ] \
-   && sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null | grep -q "^bbr$" \
-   && sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null | grep -q "^16384$"; then
-  ok "[STEP 4] sysctl already applied — skipping write"
-else
-  cp /etc/sysctl.conf /etc/sysctl.conf.bak.$(date +%s) 2>/dev/null || true
+  info "Benchmarking ${#resolvers[@]} resolvers in parallel (5 rounds each)..."
+  local results
+  results=$(printf '%s\n' "${resolvers[@]}" \
+    | xargs -P8 -I{} bash -c 'benchmark_dns_single "$@"' _ {} 2>/dev/null \
+    | sort -n)
 
-  NOTSENT_LOWAT=16384
-  RMEM_MAX=4194304
-  WMEM_MAX=4194304
+  while IFS=' ' read -r ms r; do
+    info "  $r → ${ms}ms"
+    log "DNS_BENCH: $r = ${ms}ms"
+  done <<< "$results"
 
-  if [ "${VIRT_RESTRICTED:-0}" = "1" ]; then
-    warn "Restricted virt ($VIRT_TYPE): skipping nf_conntrack_max (may be locked)"
+  DNS_BEST=$(echo "$results" | head -1 | awk '{print $2}')
+  DNS_BEST_MS=$(echo "$results" | head -1 | awk '{print $1}')
+  local top3
+  top3=$(echo "$results" | head -3 | awk '{print $2}')
+  ok "Best DNS: $DNS_BEST (${DNS_BEST_MS}ms)"
+
+  run systemctl stop systemd-resolved || true
+  run systemctl stop dnsmasq          || true
+
+  grep -q "^DNSStubListener" /etc/systemd/resolved.conf 2>/dev/null \
+    && sed -i 's/^DNSStubListener=.*/DNSStubListener=no/' /etc/systemd/resolved.conf \
+    || echo "DNSStubListener=no" >> /etc/systemd/resolved.conf
+  must systemctl restart systemd-resolved
+
+  {
+    echo "listen-address=127.0.0.1"
+    echo "bind-interfaces"
+    echo "port=53"
+    while IFS= read -r r; do echo "server=$r"; done <<< "$top3"
+    cat << 'DEOF'
+cache-size=4096
+min-cache-ttl=120
+neg-ttl=10
+dns-forward-max=300
+no-resolv
+DEOF
+  } > /etc/dnsmasq.conf
+
+  chattr -i /etc/resolv.conf 2>/dev/null || true
+  echo "nameserver 127.0.0.1" > /etc/resolv.conf
+
+  if chattr +i /etc/resolv.conf 2>/dev/null; then
+    ok "resolv.conf locked (chattr +i)"
+  else
+    warn "chattr unsupported — using resolved override"
+    mkdir -p /etc/systemd/resolved.conf.d
+    printf '[Resolve]\nDNS=127.0.0.1\nDNSStubListener=no\nReadEtcHosts=yes\n' \
+      > /etc/systemd/resolved.conf.d/99-dnsmasq.conf
+    [ -d /etc/NetworkManager/conf.d ] && {
+      printf '[main]\ndns=none\n' > /etc/NetworkManager/conf.d/99-dns-none.conf
+      run systemctl reload NetworkManager
+    }
+    echo "nameserver 127.0.0.1" > /etc/resolv.conf
   fi
+
+  must systemctl enable --now dnsmasq || die "dnsmasq failed to start"
+
+  local dig_r
+  dig_r=$(dig +short google.com @127.0.0.1 2>/dev/null | head -1)
+  [ -n "$dig_r" ] && ok "dnsmasq: google.com → $dig_r" \
+    || warn "dnsmasq: google.com lookup failed"
+
+  ok "[6] Done"
+}
+
+# -----------------------------------------------------------------------------
+# STEP 7: SYSCTL — BBR + ADAPTIVE PROFILE
+# -----------------------------------------------------------------------------
+step_sysctl() {
+  step "[7] sysctl — BBR + adaptive profile"
+
+  local cc="cubic"
+  [ "$BBR_AVAILABLE" -eq 1 ] && cc="bbr"
+
+  local qdisc="fq_codel"
+  [ "$CAKE_AVAILABLE" -eq 1 ] && qdisc="cake"
 
   cat > "$SYSCTL_FILE" << EOF
-net.ipv4.tcp_congestion_control    = bbr
-net.core.default_qdisc             = fq_codel
-net.core.rmem_max                  = ${RMEM_MAX}
-net.core.wmem_max                  = ${WMEM_MAX}
-net.ipv4.tcp_rmem                  = 4096 87380 ${RMEM_MAX}
-net.ipv4.tcp_wmem                  = 4096 16384 ${WMEM_MAX}
-net.ipv4.tcp_notsent_lowat         = ${NOTSENT_LOWAT}
+net.core.default_qdisc             = ${qdisc}
+net.ipv4.tcp_congestion_control    = ${cc}
+
+net.core.rmem_max                  = 8388608
+net.core.wmem_max                  = 8388608
+net.ipv4.tcp_rmem                  = 4096 87380 8388608
+net.ipv4.tcp_wmem                  = 4096 65536 8388608
+
+net.ipv4.tcp_notsent_lowat         = 8192
+net.ipv4.tcp_limit_output_bytes    = 65536
+
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_thin_linear_timeouts  = 1
-net.ipv4.tcp_ecn                   = 1
-net.ipv4.tcp_fastopen              = 3
+net.ipv4.tcp_ecn                   = 2
 net.ipv4.tcp_mtu_probing           = 1
+net.ipv4.tcp_fastopen              = 3
+
+net.ipv4.tcp_keepalive_time        = 60
+net.ipv4.tcp_keepalive_intvl       = 10
+net.ipv4.tcp_keepalive_probes      = 5
+
+net.ipv4.tcp_syn_retries           = 3
+net.ipv4.tcp_retries2              = 8
+
+net.core.optmem_max                = 131072
+net.core.netdev_max_backlog        = 2000
+net.core.somaxconn                 = 2048
+net.ipv4.tcp_max_syn_backlog       = 2048
+
 net.ipv4.ip_forward                = 1
 net.ipv6.conf.all.forwarding       = 1
-net.core.netdev_max_backlog        = 5000
-net.core.somaxconn                 = 1024
-net.ipv4.tcp_max_syn_backlog       = 1024
-net.ipv4.tcp_limit_output_bytes    = 131072
+
 vm.swappiness                      = 10
+vm.vfs_cache_pressure              = 50
 EOF
 
-  if [ "${VIRT_RESTRICTED:-0}" != "1" ]; then
-    echo "net.netfilter.nf_conntrack_max = ${CONNTRACK_MAX}" >> "$SYSCTL_FILE"
-    echo "net.netfilter.nf_conntrack_tcp_timeout_established = 600" >> "$SYSCTL_FILE"
-    echo "net.netfilter.nf_conntrack_tcp_timeout_time_wait = 30" >> "$SYSCTL_FILE"
-    echo "net.netfilter.nf_conntrack_udp_timeout = 30" >> "$SYSCTL_FILE"
+  if [ "$VIRT_RESTRICTED" -ne 1 ]; then
+    cat >> "$SYSCTL_FILE" << EOF
+net.netfilter.nf_conntrack_max                     = ${CONNTRACK_MAX}
+net.netfilter.nf_conntrack_tcp_timeout_established = 120
+net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 15
+net.netfilter.nf_conntrack_udp_timeout             = 15
+net.netfilter.nf_conntrack_udp_timeout_stream      = 60
+EOF
   fi
-fi
 
-info "Applying sysctl settings ..."
-tee_run sysctl --system
+  sysctl --system >> "$LOG" 2>&1
 
-info "Live sysctl values:"
-sysctl net.ipv4.tcp_congestion_control
-sysctl net.core.default_qdisc
-sysctl net.ipv4.tcp_notsent_lowat
-sysctl net.ipv4.tcp_slow_start_after_idle
-sysctl net.ipv4.tcp_ecn
-sysctl net.ipv4.tcp_limit_output_bytes
+  # Validate critical keys
+  local actual_cc actual_qdisc
+  actual_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  actual_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
 
-lsmod | grep -q tcp_bbr \
-  && ok "BBR module loaded" \
-  || { modprobe tcp_bbr 2>/dev/null && ok "BBR loaded on demand" \
-       || warn "BBR unavailable — kernel may not support it"; }
+  [ "$actual_cc" = "$cc" ] \
+    && ok "CC verified: $actual_cc" \
+    || warn "CC mismatch: expected $cc got $actual_cc"
 
-ok "[STEP 4] Done"
+  [ "$actual_qdisc" = "$qdisc" ] \
+    && ok "default_qdisc verified: $actual_qdisc" \
+    || warn "qdisc mismatch: expected $qdisc got $actual_qdisc"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 5 — qdisc: Dual CAKE (Egress + IFB Ingress)
-# ═══════════════════════════════════════════════════════════════════════════════
+  # Validate other critical keys
+  local fwd
+  fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
+  [ "$fwd" = "1" ] && ok "ip_forward: 1" || warn "ip_forward not set"
 
-step "[STEP 5] qdisc — dual CAKE egress + IFB ingress"
+  ok "[7] Done"
+}
 
-IFACE=$(ip route show default | awk 'NR==1{print $5}')
-[ -z "$IFACE" ] && die "step5: cannot detect default interface"
-info "Default interface: $IFACE"
+# -----------------------------------------------------------------------------
+# STEP 8: PMTU PROBE + MSS CALCULATION
+# -----------------------------------------------------------------------------
+probe_mtu_mss() {
+  step "[8] PMTU probe → MSS calculation"
 
-CURRENT_QDISC=$(tc qdisc show dev "$IFACE" | head -1)
-if echo "$CURRENT_QDISC" | grep -qE "(cake|fq_codel)"; then
-  ok "[STEP 5] qdisc already applied ($CURRENT_QDISC) — skipping"
-  QDISC_APPLIED="$CURRENT_QDISC (pre-existing)"
+  local target="8.8.8.8"
+  local probed_mtu=1500
+  local mss=1240  # safe default for VLESS+Reality
+
+  if command -v tracepath &>/dev/null; then
+    local tp_mtu
+    tp_mtu=$(tracepath -n "$target" 2>/dev/null \
+      | awk '/pmtu/{match($0,/pmtu ([0-9]+)/,a); if(a[1]) print a[1]}' \
+      | tail -1)
+    if [[ "$tp_mtu" =~ ^[0-9]+$ ]] && [ "$tp_mtu" -gt 576 ]; then
+      probed_mtu="$tp_mtu"
+      info "tracepath PMTU: ${probed_mtu}"
+    fi
+  fi
+
+  # VLESS+Reality overhead: TLS(~60) + VLESS header(~20) = ~80 bytes
+  # MSS = MTU - IP(20) - TCP(20) - overhead(80) = MTU - 120
+  mss=$(( probed_mtu - 120 ))
+  [ "$mss" -lt 576  ] && mss=576
+  [ "$mss" -gt 1380 ] && mss=1380
+
+  info "PMTU: ${probed_mtu} → MSS clamp: ${mss}"
+  log "PMTU_PROBE: mtu=$probed_mtu mss=$mss"
+
+  # Export for use in nftables step
+  COMPUTED_MSS="$mss"
+  ok "[8] MSS: $COMPUTED_MSS"
+}
+
+# -----------------------------------------------------------------------------
+# STEP 9: QDISC — CAKE + IFB INGRESS (dynamic interface script)
+# -----------------------------------------------------------------------------
+step_qdisc() {
+  step "[9] qdisc — CAKE adaptive + IFB ingress"
+
+  local cake_opts="diffserv4 nat wash overhead 40 mpu 64"
+
+  # Write runtime-detect qdisc script (not hardcoded interface)
+  cat > "$QDISC_SCRIPT" << QEOF
+#!/usr/bin/env bash
+set -euo pipefail
+TC=/sbin/tc
+IFACE=\$(ip route show default 2>/dev/null | awk 'NR==1{print \$5}')
+[ -z "\$IFACE" ] && { echo "No default interface"; exit 1; }
+
+\$TC qdisc del dev "\$IFACE" root    2>/dev/null || true
+\$TC qdisc del dev "\$IFACE" ingress 2>/dev/null || true
+
+# Egress CAKE
+if \$TC qdisc add dev "\$IFACE" root cake ${cake_opts} 2>/dev/null; then
+  echo "CAKE egress applied on \$IFACE"
 else
-  if tc qdisc add dev lo root cake 2>/dev/null; then
-    CAKE_OK=1
-    tc qdisc del dev lo root 2>/dev/null || true
-    ok "CAKE module available"
-  else
-    CAKE_OK=0
-    warn "CAKE not available — fq_codel fallback"
-  fi
-
-  if [ "$CAKE_OK" = "1" ]; then
-    info "Applying CAKE egress on $IFACE at ${BW_KBIT}kbit ..."
-    tee_run tc qdisc replace dev "$IFACE" root cake \
-      bandwidth "${BW_KBIT}kbit" diffserv4 nat flowblind
-    QDISC_APPLIED="CAKE egress (${BW_KBIT}kbit diffserv4 nat flowblind)"
-    ok "CAKE egress applied on $IFACE at ${BW_KBIT}kbit"
-  else
-    info "Applying fq_codel egress on $IFACE ..."
-    tee_run tc qdisc replace dev "$IFACE" root fq_codel \
-      limit 512 target 5ms interval 100ms quantum 300
-    QDISC_APPLIED="fq_codel (limit 512 target 5ms quantum 300)"
-    warn "fq_codel egress applied (CAKE unavailable)"
-  fi
+  \$TC qdisc add dev "\$IFACE" root fq_codel \
+    limit 500 target 8ms interval 80ms quantum 300 2>/dev/null || true
+  echo "fq_codel egress fallback on \$IFACE"
 fi
 
-IFB_DEV="ifb0"
-INGRESS_APPLIED="none"
-
-if [ "$CAKE_OK" = "1" ] && [ "${VIRT_RESTRICTED:-0}" != "1" ]; then
-  info "Setting up IFB ingress shaping ..."
-
-  modprobe ifb numifbs=1 2>/dev/null || true
-  ip link add "$IFB_DEV" type ifb 2>/dev/null || true
-  ip link set "$IFB_DEV" up 2>/dev/null || true
-
-  if ip link show "$IFB_DEV" &>/dev/null; then
-    tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
-    tc qdisc add dev "$IFACE" handle ffff: ingress
-
-    tc filter add dev "$IFACE" parent ffff: protocol ip \
-      u32 match u32 0 0 action mirred egress redirect dev "$IFB_DEV"
-
-    INGRESS_BW=$(( BW_KBIT * 4 ))
-    info "Applying CAKE ingress on $IFB_DEV at ${INGRESS_BW}kbit ..."
-    tee_run tc qdisc replace dev "$IFB_DEV" root cake \
-      bandwidth "${INGRESS_BW}kbit" diffserv4 nat ingress
-
-    INGRESS_APPLIED="CAKE ingress on $IFB_DEV (${INGRESS_BW}kbit diffserv4)"
-    ok "IFB ingress CAKE applied at ${INGRESS_BW}kbit (4x egress for download)"
-  else
-    warn "IFB device not available — skipping ingress shaping"
-    INGRESS_APPLIED="unavailable (IFB device failed)"
-  fi
-else
-  if [ "${VIRT_RESTRICTED:-0}" = "1" ]; then
-    warn "IFB ingress skipped — restricted virt ($VIRT_TYPE)"
-    INGRESS_APPLIED="skipped (restricted virt)"
-  else
-    warn "IFB ingress skipped — CAKE unavailable"
-    INGRESS_APPLIED="skipped (CAKE unavailable)"
-  fi
+# Ingress via IFB
+if modprobe ifb 2>/dev/null && ip link show ifb0 &>/dev/null; then
+  ip link set dev ifb0 up 2>/dev/null || true
+  \$TC qdisc del dev "\$IFACE" ingress 2>/dev/null || true
+  \$TC qdisc add dev "\$IFACE" handle ffff: ingress
+  \$TC filter add dev "\$IFACE" parent ffff: protocol ip u32 \
+    match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
+  \$TC filter add dev "\$IFACE" parent ffff: protocol ipv6 u32 \
+    match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
+  \$TC qdisc del dev ifb0 root 2>/dev/null || true
+  \$TC qdisc add dev ifb0 root cake ${cake_opts} 2>/dev/null \
+    && echo "CAKE ingress applied via ifb0" \
+    || echo "ifb0 CAKE failed — ingress unmanaged"
 fi
+QEOF
+  chmod +x "$QDISC_SCRIPT"
 
-if [ "$CAKE_OK" = "1" ]; then
-  EGRESS_CMD="tc qdisc replace dev ${IFACE} root cake bandwidth ${BW_KBIT}kbit diffserv4 nat flowblind"
-  INGRESS_BW_PERSIST=$(( BW_KBIT * 4 ))
-  IFB_CMD="modprobe ifb numifbs=1; ip link set ifb0 up; tc qdisc del dev ${IFACE} ingress 2>/dev/null || true; tc qdisc add dev ${IFACE} handle ffff: ingress; tc filter add dev ${IFACE} parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0; tc qdisc replace dev ifb0 root cake bandwidth ${INGRESS_BW_PERSIST}kbit diffserv4 nat ingress"
-else
-  EGRESS_CMD="tc qdisc replace dev ${IFACE} root fq_codel limit 512 target 5ms interval 100ms quantum 300"
-  IFB_CMD=""
-fi
+  # Apply now
+  bash "$QDISC_SCRIPT" 2>&1 | tee -a "$LOG"
 
-SERVICE_FILE="/etc/systemd/system/ais-qdisc.service"
-if [ ! -f "$SERVICE_FILE" ] || ! grep -qF "ExecStart=${EGRESS_CMD}" "$SERVICE_FILE"; then
-  cat > "$SERVICE_FILE" << EOF
+  # Detect what was applied
+  local applied
+  applied=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1{print $2}')
+  QDISC_APPLIED="${applied} on ${IFACE}"
+  [ "$IFB_AVAILABLE" -eq 1 ] && QDISC_APPLIED+=" + IFB ingress"
+
+  # Systemd service using runtime script
+  rm -f /etc/systemd/system/gaming-qdisc.service
+  cat > /etc/systemd/system/gaming-qdisc.service << EOF
 [Unit]
-Description=AIS ${BW_KBIT}kbps anti-bufferbloat qdisc
-After=network.target
+Description=Adaptive CAKE qdisc — per-user 128kbps
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/bin/bash -c '${EGRESS_CMD}'
-$([ -n "$IFB_CMD" ] && echo "ExecStart=/bin/bash -c '${IFB_CMD}'")
+ExecStart=${QDISC_SCRIPT}
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-fi
-info "Enabling ais-qdisc service ..."
-tee_run systemctl enable --now ais-qdisc
 
-info "qdisc status on $IFACE:"
-tc qdisc show dev "$IFACE"
-[ "$INGRESS_APPLIED" != "none" ] && tc qdisc show dev "$IFB_DEV" 2>/dev/null || true
+  must systemctl daemon-reload
+  must systemctl enable gaming-qdisc
 
-ok "[STEP 5] Done"
+  ok "[9] qdisc: $QDISC_APPLIED"
+}
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 6 — nftables Firewall
-# ═══════════════════════════════════════════════════════════════════════════════
+# -----------------------------------------------------------------------------
+# STEP 10: NFTABLES — FULL DUAL-STACK + ROLLBACK SAFETY
+# -----------------------------------------------------------------------------
+schedule_rollback() {
+  if ! command -v at &>/dev/null || ! systemctl is-active --quiet atd 2>/dev/null; then
+    warn "atd unavailable — no automatic firewall rollback"
+    return
+  fi
+  AT_JOB_ID=$(echo "systemctl stop nftables && nft flush ruleset" \
+    | at "now + ${ROLLBACK_DELAY_MIN} minutes" 2>&1 \
+    | awk '/^job/{print $2}')
+  if [ -n "$AT_JOB_ID" ]; then
+    warn "ROLLBACK SCHEDULED: nftables will be cleared in ${ROLLBACK_DELAY_MIN}min (job #${AT_JOB_ID})"
+    warn "If SSH works, run: atrm ${AT_JOB_ID}"
+  fi
+}
 
-step "[STEP 6] nftables firewall"
+cancel_rollback() {
+  if [ -n "$AT_JOB_ID" ]; then
+    atrm "$AT_JOB_ID" 2>/dev/null && ok "Rollback job #${AT_JOB_ID} cancelled" || true
+    AT_JOB_ID=""
+  fi
+}
 
-[ -z "${SSH_PORT:-}" ] && die "step6: SSH_PORT empty"
-[[ "$SSH_PORT" =~ ^[0-9]+$ ]] || die "step6: SSH_PORT not numeric: $SSH_PORT"
+step_nftables() {
+  step "[10] nftables — dual-stack production ruleset"
 
-cp /etc/nftables.conf /etc/nftables.conf.bak.$(date +%s) 2>/dev/null || true
+  local panel_rule_v4 panel_rule_v6
 
-cat > /etc/nftables.conf << NFTEOF
+  if [ -n "$ADMIN_IP" ]; then
+    panel_rule_v4="ip saddr ${ADMIN_IP} tcp dport 2053 accept"
+    panel_rule_v6=""
+  else
+    panel_rule_v4="tcp dport 2053 limit rate 10/minute burst 8 packets accept"
+    panel_rule_v6="tcp dport 2053 limit rate 10/minute burst 8 packets accept"
+  fi
+
+  # Schedule safety rollback BEFORE loading new rules
+  schedule_rollback
+
+  cat > "$NFT_CONF" << NFTEOF
 #!/usr/sbin/nft -f
 flush ruleset
 
-# AIS 128 kbps — nftables ruleset v${SCRIPT_VER}
-
+# ── IPv4 SSH blocklist ──────────────────────────────────────────────────────
 table inet filter {
-  set ssh_blocklist {
+  set ssh_blocklist4 {
     type ipv4_addr
+    flags dynamic,timeout
+    timeout 1h
+    gc-interval 10m
+  }
+
+  set ssh_blocklist6 {
+    type ipv6_addr
     flags dynamic,timeout
     timeout 1h
     gc-interval 10m
@@ -683,19 +829,34 @@ table inet filter {
 
   chain input {
     type filter hook input priority 0; policy drop;
+
     iif "lo" accept
+
     ct state established,related accept
     ct state invalid drop
-    ip  protocol icmp  limit rate 10/second accept
-    ip6 nexthdr icmpv6 limit rate 10/second accept
-    ip saddr @ssh_blocklist drop
-    tcp dport SSH_PORT_PLACEHOLDER ct state new \
-      limit rate over 10/minute burst 5 packets \
-      add @ssh_blocklist { ip saddr timeout 1h }
-    tcp dport SSH_PORT_PLACEHOLDER ct state new limit rate 6/minute burst 10 packets accept
-    tcp dport 80 accept comment "certbot-renew"
+
+    # ICMP — dual-stack
+    ip  protocol icmp  icmp  type { echo-request, echo-reply, destination-unreachable, time-exceeded } limit rate 10/second accept
+    ip6 nexthdr icmpv6 icmpv6 type { echo-request, echo-reply, destination-unreachable, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } limit rate 10/second accept
+
+    # SSH — dual-stack blocklist + rate-limit
+    ip  saddr @ssh_blocklist4 drop
+    ip6 saddr @ssh_blocklist6 drop
+    tcp dport ${SSH_PORT} ct state new limit rate over 15/minute burst 8 packets \
+      add @ssh_blocklist4 { ip  saddr timeout 1h } \
+      add @ssh_blocklist6 { ip6 saddr timeout 1h }
+    tcp dport ${SSH_PORT} ct state new limit rate 15/minute burst 10 packets accept
+
+    # Web + VPN tunnel
+    tcp dport 80  accept
     tcp dport 443 accept
-    tcp dport 2053 limit rate 30/minute burst 20 packets accept
+    udp dport 443 accept
+
+    # Panel — IPv4 whitelist or rate-limit
+    ${panel_rule_v4}
+
+    # Panel — IPv6 rate-limit (no whitelist for IPv6 unless ADMIN_IP is IPv6)
+    ${panel_rule_v6}
   }
 
   chain forward {
@@ -707,218 +868,352 @@ table inet filter {
   }
 }
 
+# ── Traffic marking + MSS clamp ─────────────────────────────────────────────
 table inet mangle {
   chain prerouting {
     type filter hook prerouting priority -150;
-    udp dport 53 ip dscp set cs5
-    udp dport { 5000-5100, 7000-8999, 27000-27050, 5672, 17500, 3478-3480, 3074 } ip dscp set cs5
-    udp length < 128 ip dscp set cs5
-    tcp flags == ack ip length < 80 ip dscp set cs4
-    tcp dport { 80, 443 } ip length > 1000 ip dscp set cs3
-    tcp dport 443 ip length <= 1000 ip dscp set cs4
-  }
-}
 
-table inet nat {
+    # DSCP CS5 on tunnel port — both IPv4 and IPv6
+    tcp dport 443 ip  dscp set cs5
+    udp dport 443 ip  dscp set cs5
+    tcp dport 443 ip6 dscp set cs5
+    udp dport 443 ip6 dscp set cs5
+  }
+
   chain postrouting {
-    type nat hook postrouting priority 100;
-    oifname "IFACE_PLACEHOLDER" masquerade
+    type filter hook postrouting priority -150;
+
+    # MSS clamp — IPv4 + IPv6 (computed from PMTU probe)
+    oifname "${IFACE}" tcp flags & (syn|ack) == syn \
+      tcp option maxseg size set ${COMPUTED_MSS}
   }
 }
 NFTEOF
 
-sed -i \
-  -e "s/SSH_PORT_PLACEHOLDER/${SSH_PORT}/g" \
-  -e "s/IFACE_PLACEHOLDER/${IFACE}/g" \
-  /etc/nftables.conf
+  # Load and verify
+  if tee_run nft -f "$NFT_CONF"; then
+    ok "nftables ruleset loaded"
+    tee_run systemctl enable nftables
 
-info "Loading nftables ruleset ..."
-tee_run nft -f /etc/nftables.conf || die "step6: nft failed — check /etc/nftables.conf"
-tee_run systemctl enable nftables
+    # Verify critical rules present
+    local ruleset
+    ruleset=$(nft list ruleset 2>/dev/null)
 
-nft list ruleset | grep -E "dport.*${SSH_PORT}" \
-  && ok "SSH port ${SSH_PORT} in ruleset" || warn "SSH port rule not visible"
-nft list ruleset | grep -E "oifname.*${IFACE}" \
-  && ok "NAT interface ${IFACE} in ruleset" || warn "NAT interface rule not visible"
+    echo "$ruleset" | grep -qE "dport.*${SSH_PORT}" \
+      && ok "SSH port ${SSH_PORT} rule: present" \
+      || warn "SSH port ${SSH_PORT} rule not found in ruleset"
 
-ok "[STEP 6] Done"
+    echo "$ruleset" | grep -qE "dport.*443" \
+      && ok "Port 443 rule: present" \
+      || warn "Port 443 rule not found"
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 7 — Xray OS-Level Tuning
-# ═══════════════════════════════════════════════════════════════════════════════
+    echo "$ruleset" | grep -qE "ssh_blocklist" \
+      && ok "SSH blocklist sets: present" \
+      || warn "SSH blocklist sets not found"
 
-step "[STEP 7] Xray OS-level sockopt tuning"
+    # Cancel rollback — rules are good
+    cancel_rollback
+  else
+    warn "nft load failed — restoring backup"
+    [ -f "$NFT_BACKUP" ] && nft -f "$NFT_BACKUP" && ok "Backup restored" \
+      || warn "Backup restore also failed"
+    cancel_rollback
+    die "nftables configuration failed"
+  fi
 
-XUI_DB=$(find /etc/x-ui /usr/local/x-ui -name "*.db" 2>/dev/null | head -1 || echo "")
-XRAY_BIN=$(command -v xray 2>/dev/null \
-  || find /usr/local/x-ui /usr/local/bin -name "xray" 2>/dev/null | head -1 \
-  || find /root/.config/3x-ui -name "xray" 2>/dev/null | head -1 \
-  || echo "")
+  ok "[10] Done"
+}
 
-if [ -n "$XRAY_BIN" ]; then
-  ok "Xray binary found: $XRAY_BIN"
-else
-  warn "Xray binary not found — xray may be embedded inside x-ui"
-  warn "OS-level tuning via limits.conf will still apply"
-fi
+# -----------------------------------------------------------------------------
+# STEP 11: x-ui SYSTEMD SLICE + RESOURCE ISOLATION
+# -----------------------------------------------------------------------------
+step_xui_tuning() {
+  step "[11] x-ui resource isolation + limits"
 
-LIMITS_CONF="/etc/security/limits.conf"
-XRAY_LIMITS_MARKER="# xray-limits"
-if ! grep -q "$XRAY_LIMITS_MARKER" "$LIMITS_CONF" 2>/dev/null; then
-  cat >> "$LIMITS_CONF" << EOF
+  # systemd slice for xray/x-ui
+  cat > "$SLICE_CONF" << 'EOF'
+[Unit]
+Description=Xray VPN Slice
 
-$XRAY_LIMITS_MARKER
-root    soft    nofile  65535
-root    hard    nofile  65535
-*       soft    nofile  65535
-*       hard    nofile  65535
+[Slice]
+CPUQuota=80%
+MemoryMax=512M
+MemorySwapMax=256M
+IOWeight=100
+TasksMax=512
 EOF
-  ok "File descriptor limits set to 65535"
-else
-  ok "File descriptor limits already set"
-fi
 
-SYSTEMD_OVERRIDE_DIR="/etc/systemd/system/x-ui.service.d"
-mkdir -p "$SYSTEMD_OVERRIDE_DIR"
-OVERRIDE_FILE="${SYSTEMD_OVERRIDE_DIR}/override.conf"
-if [ ! -f "$OVERRIDE_FILE" ]; then
-  cat > "$OVERRIDE_FILE" << 'EOF'
+  # FD limits — idempotent
+  local limits_conf="/etc/security/limits.conf"
+  sed -i '/# xray-limits/,+4d' "$limits_conf" 2>/dev/null || true
+  cat >> "$limits_conf" << 'EOF'
+# xray-limits
+root    soft    nofile  32768
+root    hard    nofile  32768
+*       soft    nofile  32768
+*       hard    nofile  32768
+EOF
+
+  mkdir -p "$(dirname "$XUI_OVERRIDE")"
+  cat > "$XUI_OVERRIDE" << EOF
+[Unit]
+Slice=xray.slice
+
 [Service]
-LimitNOFILE=65535
-LimitNPROC=65535
+LimitNOFILE=32768
+LimitNPROC=16384
+Nice=-10
+OOMScoreAdjust=-500
+Restart=on-failure
+RestartSec=5
 EOF
-  ok "x-ui systemd limits override written"
-else
-  ok "x-ui systemd limits override already present"
-fi
 
-SYSCTL_XRAY="/etc/sysctl.d/99-xray-sockopt.conf"
-if [ ! -f "$SYSCTL_XRAY" ]; then
-  cat > "$SYSCTL_XRAY" << EOF
-net.core.optmem_max             = 131072
-net.ipv4.tcp_keepalive_time     = 600
-net.ipv4.tcp_keepalive_intvl    = 60
-net.ipv4.tcp_keepalive_probes   = 5
-EOF
-  info "Applying xray sockopt sysctl ..."
-  tee_run sysctl --system
-  ok "Xray sockopt sysctl applied"
-else
-  ok "Xray sockopt sysctl already present"
-fi
+  must systemctl daemon-reload
+  tee_run systemctl restart x-ui
+  sleep 2
 
-systemctl daemon-reload
-info "Restarting x-ui ..."
-tee_run systemctl restart x-ui
-ok "x-ui restarted with new limits"
+  systemctl is-active x-ui | grep -q "^active$" \
+    && ok "x-ui active" \
+    || warn "x-ui not active after restart"
 
-XRAY_HINT_FILE="/root/xray-inbound-settings.txt"
-cat > "$XRAY_HINT_FILE" << EOF
-# Xray Inbound Settings Hints (apply inside 3x-ui panel / JSON)
-# Generated by 3x-ui-ais-setup.sh v${SCRIPT_VER}
+  # Verify FD limit effective for x-ui process
+  local xui_pid xui_fdlimit
+  xui_pid=$(pgrep -f x-ui | head -1 || true)
+  if [ -n "$xui_pid" ]; then
+    xui_fdlimit=$(cat "/proc/${xui_pid}/limits" 2>/dev/null \
+      | awk '/Max open files/{print $4}' || echo "?")
+    ok "x-ui PID $xui_pid — FD limit: $xui_fdlimit"
+  fi
 
-Recommended sockopt for VLESS+Reality inbound:
-  "tcpNoDelay": true
-  "tcpKeepAliveInterval": 60
-  "tcpMaxSeg": 1440
+  # Write hints file
+  cat > /root/xray-production-settings.txt << 'XEOF'
+VLESS+Reality — Production Narrowband (128kbps/user, 2 users)
+==============================================================
 
-Recommended stream settings for AIS 128kbps:
-  "network": "tcp"
-  "security": "reality"
-  "flow": "xtls-rprx-vision"
+Protocol    : VLESS
+Port        : 443
+Network     : tcp
+Security    : reality
+Flow        : xtls-rprx-vision
+Dest / SNI  : th.speedtest.net:443
+uTLS        : firefox
 
-For Vision flow — DO NOT enable:
-  - mux (conflicts with xtls-rprx-vision)
-  - sniffing (adds latency per packet)
+sockopt:
+  tcpNoDelay          : true
+  tcpKeepAliveInterval: 15
+  mark                : 255
 
-DNS in Xray config (optional, since dnsmasq handles it):
-  "dns": {
-    "servers": ["127.0.0.1"],
-    "queryStrategy": "UseIPv4"
-  }
-EOF
-ok "Xray tuning hints saved to $XRAY_HINT_FILE"
+Inbound:
+  sniffing   : DISABLE
+  mux        : DISABLE
+  bufferSize : 16 (kb)
 
-ok "[STEP 7] Done"
+Per-user bandwidth limit in panel:
+  NONE — each user has independent 128kbps link
+  BBR self-regulates per session automatically
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# STEP 8 — Final Summary
-# ═══════════════════════════════════════════════════════════════════════════════
+Expected performance per user at 128kbps:
+  ROV/DOTA2  : excellent   (20-50kbps avg)
+  Valorant   : good        (40-80kbps avg)
+  YouTube 144p: usable     (80-100kbps, tight)
+  Discord voice: good      (32-64kbps Opus)
+  Browsing   : good
+  Streaming HD: not possible at 128kbps
+XEOF
 
-step "[STEP 8] Final summary"
+  ok "[11] Done"
+}
 
-XUI_VER=$(systemctl show x-ui --property=ExecStart 2>/dev/null | grep -oP 'x-ui \K[0-9]+\.[0-9]+\.[0-9]+' | head -1 \
-  || grep -oP 'Starting x-ui \K[0-9]+\.[0-9]+\.[0-9]+' /var/log/3x-ui-ais-setup.log 2>/dev/null | tail -1 \
-  || journalctl -u x-ui -n 50 2>/dev/null | grep -oP 'Starting x-ui \K[0-9]+\.[0-9]+\.[0-9]+' | tail -1 \
-  || echo "3.x (embedded)")
-XUI_STATUS=$(systemctl is-active x-ui 2>/dev/null || echo "inactive")
-SERVER_IP=$(curl -s4 https://api.ipify.org 2>/dev/null || curl -s4 ifconfig.me 2>/dev/null || echo "unknown")
-CERT_EXPIRY=$(openssl x509 -enddate -noout -in "$CERT_DIR/fullchain.pem" 2>/dev/null \
-              | cut -d= -f2 || echo "unknown")
-TCP_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
-TCP_ECN=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "unknown")
-TCP_LIMIT=$(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null || echo "unknown")
-NFT_STATUS=$(systemctl is-active nftables 2>/dev/null || echo "inactive")
-DNS_STATUS=$(systemctl is-active dnsmasq 2>/dev/null || echo "inactive")
+# -----------------------------------------------------------------------------
+# STEP 12: HEALTH CHECK SYSTEM
+# -----------------------------------------------------------------------------
+step_health_check() {
+  step "[12] Health verification"
 
-echo ""
-echo -e "${BCYN}╔══════════════════════════════════════╦════════════════════════════════════════╗${RST}"
-echo -e "${BCYN}║ Setting                              ║ Value                                  ║${RST}"
-echo -e "${BCYN}╠══════════════════════════════════════╬════════════════════════════════════════╣${RST}"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "3x-ui version"             "$XUI_VER"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "3x-ui service"             "$XUI_STATUS"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Server domain"             "$SERVER_DOMAIN"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Server IP"                 "$SERVER_IP"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Panel URL"                 "https://$SERVER_DOMAIN:2053/<path>/"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "TLS cert expires"          "$CERT_EXPIRY"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Cert dir"                  "$CERT_DIR/"
-echo -e "${BCYN}╠══════════════════════════════════════╬════════════════════════════════════════╣${RST}"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "CAKE egress"               "$QDISC_APPLIED"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "CAKE ingress (IFB)"        "$INGRESS_APPLIED"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "TCP congestion control"    "$TCP_CC"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "TCP ECN"                   "$TCP_ECN"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "TCP limit output bytes"    "$TCP_LIMIT"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Conntrack max"             "$CONNTRACK_MAX"
-echo -e "${BCYN}╠══════════════════════════════════════╬════════════════════════════════════════╣${RST}"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "nftables"                  "$NFT_STATUS"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "dnsmasq"                   "$DNS_STATUS"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Best DNS resolver"         "$DNS_BEST (${DNS_LATENCY[$DNS_BEST]:-?}ms)"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Virtualization"            "$VIRT_TYPE"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Log file"                  "$LOG"
-printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Xray hints"                "/root/xray-inbound-settings.txt"
-echo -e "${BCYN}╚══════════════════════════════════════╩════════════════════════════════════════╝${RST}"
-echo ""
+  local pass=0 fail=0
 
-echo -e "${BGRN}══════════════════════════════════════════════════════════════════${RST}"
-echo -e "${BGRN}  NEXT STEPS — Configure VLESS+Reality inside 3x-ui panel${RST}"
-echo -e "${BGRN}══════════════════════════════════════════════════════════════════${RST}"
-echo ""
-echo -e "  1. Open panel: ${BCYN}https://$SERVER_DOMAIN:2053/<your-path>/${RST}"
-echo -e "     (fallback)  ${BCYN}http://$SERVER_IP:2053/<path>/${RST}"
-echo    "     → Panel Settings → Panel Certificate"
-echo    "       Certificate : $CERT_DIR/fullchain.pem"
-echo    "       Private Key : $CERT_DIR/key.pem"
-echo    "     → Save → restart panel → use HTTPS URL"
-echo ""
-echo    "  2. Add Inbound:"
-echo    "     Protocol    : VLESS"
-echo    "     Port        : 443"
-echo    "     Security    : Reality"
-echo    "     Destination : th.speedtest.net:443"
-echo    "     uTLS        : firefox"
-echo    "     Flow        : xtls-rprx-vision"
-echo    "     Generate    : UUID + keypair + shortId via panel"
-echo    "     tcpNoDelay  : true  (in Advanced / Stream Settings)"
-echo ""
-echo    "  3. Add users → panel generates client URIs + QR codes"
-echo ""
-echo    "  4. Xray tuning hints: cat /root/xray-inbound-settings.txt"
-echo ""
-echo    "  5. Cert auto-renews via certbot cron + restart hook"
-echo ""
-echo -e "${BGRN}══════════════════════════════════════════════════════════════════${RST}"
-echo ""
-echo -e "${BCYN}   AIS 128Kbps  —  By (IG:peepogrob555  FB:Shogun)${RST}"
-echo ""
+  check_pass() { ok "  CHECK ✓ $*"; (( pass++ )) || true; }
+  check_fail() { warn "  CHECK ✗ $*"; (( fail++ )) || true; }
 
-log "========== Script v${SCRIPT_VER} completed successfully =========="
+  # 1. Services
+  systemctl is-active x-ui      | grep -q "^active$" \
+    && check_pass "x-ui: active"            || check_fail "x-ui: not active"
+  systemctl is-active nftables   | grep -q "^active$" \
+    && check_pass "nftables: active"        || check_fail "nftables: not active"
+  systemctl is-active dnsmasq    | grep -q "^active$" \
+    && check_pass "dnsmasq: active"         || check_fail "dnsmasq: not active"
+  systemctl is-active gaming-qdisc | grep -q "^active$" \
+    && check_pass "gaming-qdisc: active"   || check_fail "gaming-qdisc: not active"
+
+  # 2. Port binding
+  ss -tlnp 2>/dev/null | grep -q ":443 " \
+    && check_pass "Port 443: bound"         || check_fail "Port 443: not bound"
+  ss -tlnp 2>/dev/null | grep -q ":2053 " \
+    && check_pass "Port 2053: bound"        || check_fail "Port 2053: not bound"
+
+  # 3. Panel reachable
+  local panel_code
+  panel_code=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
+    "https://${SERVER_DOMAIN}:2053/" 2>/dev/null || echo "000")
+  [[ "$panel_code" =~ ^(200|301|302|401|403)$ ]] \
+    && check_pass "Panel HTTP: $panel_code" \
+    || check_fail "Panel HTTP: $panel_code (may need manual cert config)"
+
+  # 4. DNS
+  local dns_r
+  dns_r=$(dig +short +time=3 google.com @127.0.0.1 2>/dev/null | head -1)
+  [ -n "$dns_r" ] \
+    && check_pass "dnsmasq DNS: google.com → $dns_r" \
+    || check_fail "dnsmasq DNS: google.com lookup failed"
+
+  # 5. qdisc
+  local qdisc_active
+  qdisc_active=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1{print $2}')
+  [ -n "$qdisc_active" ] \
+    && check_pass "qdisc: $qdisc_active on $IFACE" \
+    || check_fail "qdisc: none detected on $IFACE"
+
+  # 6. BBR active
+  local actual_cc
+  actual_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  [ "$actual_cc" = "bbr" ] \
+    && check_pass "TCP CC: bbr"             || check_fail "TCP CC: $actual_cc (not bbr)"
+
+  # 7. nftables rules
+  nft list ruleset 2>/dev/null | grep -qE "dport.*443" \
+    && check_pass "nftables port 443 rule"  || check_fail "nftables port 443 missing"
+
+  # 8. Swap
+  swapon --show 2>/dev/null | grep -q "$SWAP_FILE" \
+    && check_pass "Swap: active"            || check_fail "Swap: not active"
+
+  echo ""
+  info "Health: ${pass} passed, ${fail} failed"
+  log "HEALTH: pass=$pass fail=$fail"
+
+  [ "$fail" -gt 0 ] && warn "Some checks failed — review above" || ok "All health checks passed"
+}
+
+# -----------------------------------------------------------------------------
+# STEP 13: OBSERVABILITY SNAPSHOT
+# -----------------------------------------------------------------------------
+step_observability() {
+  step "[13] Observability snapshot"
+
+  echo ""
+  metric "=== qdisc stats ==="
+  tc -s qdisc show dev "$IFACE" 2>/dev/null | tee -a "$LOG"
+
+  if ip link show "$IFB_DEV" &>/dev/null 2>/dev/null; then
+    metric "=== IFB ingress stats ==="
+    tc -s qdisc show dev "$IFB_DEV" 2>/dev/null | tee -a "$LOG"
+  fi
+
+  metric "=== conntrack ==="
+  if command -v conntrack &>/dev/null; then
+    conntrack -C 2>/dev/null | tee -a "$LOG" || true
+  else
+    cat /proc/net/nf_conntrack 2>/dev/null | wc -l | \
+      xargs -I{} echo "conntrack entries: {}" | tee -a "$LOG" || true
+  fi
+
+  metric "=== TCP sockets ==="
+  ss -s 2>/dev/null | tee -a "$LOG"
+
+  metric "=== Memory ==="
+  free -m 2>/dev/null | tee -a "$LOG"
+
+  metric "=== Swap usage ==="
+  swapon --show 2>/dev/null | tee -a "$LOG"
+
+  ok "[13] Snapshot saved to $LOG"
+}
+
+# -----------------------------------------------------------------------------
+# STEP 14: FINAL SUMMARY
+# -----------------------------------------------------------------------------
+step_summary() {
+  step "[14] Final summary"
+
+  local xui_status nft_status dns_status qds_status tcp_cc tcp_qd swap_info
+  xui_status=$(systemctl is-active x-ui          2>/dev/null || echo "inactive")
+  nft_status=$(systemctl is-active nftables      2>/dev/null || echo "inactive")
+  dns_status=$(systemctl is-active dnsmasq       2>/dev/null || echo "inactive")
+  qds_status=$(systemctl is-active gaming-qdisc  2>/dev/null || echo "inactive")
+  tcp_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+  tcp_qd=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1{print $2}')
+  swap_info=$(swapon --show 2>/dev/null | grep -c "$SWAP_FILE" \
+    && echo "${SWAP_SIZE_MB}MB active" || echo "inactive") 2>/dev/null || swap_info="inactive"
+
+  echo ""
+  echo -e "${BCYN}╔══════════════════════════════════════╦════════════════════════════════════════╗${RST}"
+  echo -e "${BCYN}║ Setting                              ║ Value                                  ║${RST}"
+  echo -e "${BCYN}╠══════════════════════════════════════╬════════════════════════════════════════╣${RST}"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "x-ui"              "$xui_status"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Panel URL"         "https://$SERVER_DOMAIN:2053/"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Cert expires"      "$CERT_EXPIRY"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Admin IP"          "${ADMIN_IP:-any (rate-limited)}"
+  echo -e "${BCYN}╠══════════════════════════════════════╬════════════════════════════════════════╣${RST}"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "TCP CC"            "$tcp_cc"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "qdisc egress"      "${tcp_qd} on ${IFACE}"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "qdisc ingress"     "$( ip link show ifb0 &>/dev/null 2>/dev/null && echo "CAKE on ifb0" || echo "none" )"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "MSS clamp"         "${COMPUTED_MSS} (PMTU-derived)"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Swap"              "$swap_info"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Conntrack max"     "$CONNTRACK_MAX"
+  echo -e "${BCYN}╠══════════════════════════════════════╬════════════════════════════════════════╣${RST}"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "nftables"          "$nft_status"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "dnsmasq"           "$dns_status"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Best DNS"          "${DNS_BEST} (${DNS_BEST_MS}ms)"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "gaming-qdisc"      "$qds_status"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "XUI commit"        "${XUI_COMMIT:0:12}..."
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Backup"            "$BACKUP_DIR"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Log"               "$LOG"
+  echo -e "${BCYN}╚══════════════════════════════════════╩════════════════════════════════════════╝${RST}"
+
+  echo ""
+  echo -e "${BGRN}══════════════════════════════════════════════════════${RST}"
+  echo -e "${BGRN}  NEXT — 3x-ui panel config${RST}"
+  echo -e "${BGRN}══════════════════════════════════════════════════════${RST}"
+  echo ""
+  echo -e "  1. Panel: ${BCYN}https://${SERVER_DOMAIN}:2053/${RST}"
+  echo    "     Settings → Cert: $CERT_DIR/fullchain.pem"
+  echo    "     Settings → Key : $CERT_DIR/key.pem"
+  echo    "     Save → Restart panel"
+  echo ""
+  echo    "  2. Add Inbound:"
+  echo    "     VLESS | Port 443 | Reality | xtls-rprx-vision"
+  echo    "     SNI: th.speedtest.net | uTLS: firefox"
+  echo    "     tcpNoDelay: ON | sniffing: OFF | mux: OFF"
+  echo    "     bufferSize: 16"
+  echo ""
+  echo    "  3. Add 2 users — NO bandwidth cap (each has 128kbps own link)"
+  echo    "  4. cat /root/xray-production-settings.txt"
+  echo ""
+  echo -e "${BGRN}══════════════════════════════════════════════════════${RST}"
+
+  log "========== Script v${SCRIPT_VER} completed =========="
+}
+
+# -----------------------------------------------------------------------------
+# MAIN
+# -----------------------------------------------------------------------------
+main() {
+  preflight
+  collect_input
+  step_backup
+  step_swap
+  step_packages
+  step_install_xui
+  step_tls
+  step_dns
+  step_sysctl
+  probe_mtu_mss
+  step_qdisc
+  step_nftables
+  step_xui_tuning
+  step_health_check
+  step_observability
+  step_summary
+}
+
+main "$@"
