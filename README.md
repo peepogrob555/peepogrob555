@@ -17,9 +17,8 @@ AIS Narrowband VPS Stack
 
 - AIS FUP 128kbps(+++)
 - เน็ต 128kbps
-- เล่นเกม
-- Discord
-- ใช้งานทั่วไป เล่นเกมส์,ดูหนัง,ทั่วๆไป
+- เน้นเล่นเกมส์
+- ใช้งานทั่วไป ท่องโซเชียล,โทร,ดูหนัง,ทั่วๆไป
 - VPS 1-2GB RAM
 - ใช้ 1-2 คน
 
@@ -119,12 +118,6 @@ Dest| th.speedtest.net:443
 
 - mux
 - sniffing
-
----
-
-เช็คสถานะหลังติดตั้ง
-
-bash <(curl -Ls https://raw.githubusercontent.com/peepogrob555/peepogrob555/main/Mypeepogrob555V2.sh)
 
 ---
 
