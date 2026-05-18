@@ -314,12 +314,60 @@ step_swap() {
 }
 
 # -----------------------------------------------------------------------------
+# STEP 3a: FIX APT MIRRORS
+# ตรวจสอบและแก้ mirror ที่ใช้งานไม่ได้อัตโนมัติ — เปลี่ยนเป็น official Ubuntu
+# -----------------------------------------------------------------------------
+fix_mirrors() {
+  step "[3a] Fix APT mirrors"
+
+  local sources="/etc/apt/sources.list"
+  local official="http://archive.ubuntu.com/ubuntu"
+
+  # ทดสอบว่า mirror ปัจจุบันใช้งานได้ไหม
+  if apt-get update -qq >> "$LOG" 2>&1; then
+    ok "APT mirrors: OK (no fix needed)"
+    return
+  fi
+
+  warn "APT update failed — replacing broken mirrors with official Ubuntu"
+
+  # Backup ก่อนแก้
+  cp "$sources" "${BACKUP_DIR}/sources.list.bak" 2>/dev/null || true
+
+  # เปลี่ยนทุก mirror เป็น official
+  local codename
+  codename=$(lsb_release -sc 2>/dev/null || echo "jammy")
+
+  cat > "$sources" << EOF
+deb ${official} ${codename} main restricted universe multiverse
+deb ${official} ${codename}-updates main restricted universe multiverse
+deb ${official} ${codename}-backports main restricted universe multiverse
+deb ${official} ${codename}-security main restricted universe multiverse
+EOF
+
+  # ลบ source files อื่นที่อาจมี mirror เสีย
+  if [ -d /etc/apt/sources.list.d ]; then
+    for f in /etc/apt/sources.list.d/*.list; do
+      [ -f "$f" ] || continue
+      if grep -qv "^#" "$f" 2>/dev/null; then
+        warn "Disabling: $f"
+        mv "$f" "${f}.disabled" 2>/dev/null || true
+      fi
+    done
+  fi
+
+  tee_run apt-get update -qq || die "APT update still failing after mirror fix"
+  ok "[3a] Mirrors fixed → $official"
+}
+
+# -----------------------------------------------------------------------------
 # STEP 3: PACKAGES
 # FIX: ลบ ifupdown2 (ไม่มีใน Ubuntu 22.04), เพิ่ม at และ install ก่อน start atd
 # -----------------------------------------------------------------------------
 step_packages() {
   step "[3] System update + packages"
 
+  fix_mirrors
   tee_run apt-get update -qq
   tee_run apt-get upgrade -y -qq
   tee_run apt-get install -y -qq \
