@@ -15,12 +15,11 @@ AIS Narrowband VPS Stack
 
 เหมาะกับ
 
-- AIS FUP 64kbps-512kbps
+- AIS FUP 128kbps(+++)
 - เน็ต 128kbps
 - เล่นเกม
 - Discord
-- YouTube 144p
-- ใช้งานทั่วไป
+- ใช้งานทั่วไป เล่นเกมส์,ดูหนัง,ทั่วๆไป
 - VPS 1-2GB RAM
 - ใช้ 1-2 คน
 
