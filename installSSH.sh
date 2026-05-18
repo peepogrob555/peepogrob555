@@ -249,23 +249,14 @@ configure_sshd() {
     grep -q "^Include" "${SSHD_CONF}" 2>/dev/null || \
         echo "Include /etc/ssh/sshd_config.d/*.conf" >> "${SSHD_CONF}"
 
-    # ตรวจว่า sshd_config หลัก (หรือ drop-in อื่น) มี Subsystem sftp อยู่แล้วไหม
-    local has_subsystem=false
-    if grep -qiE "^[[:space:]]*Subsystem[[:space:]]+sftp" "${SSHD_CONF}" \
-        "${SSHD_DROPIN_DIR}"/*.conf 2>/dev/null; then
-        has_subsystem=true
-        info "พบ Subsystem sftp อยู่แล้ว — จะไม่ใส่ซ้ำใน drop-in"
-    fi
+    # ลบ Subsystem sftp ออกจากทุกที่ก่อน แล้วให้ drop-in ของเราใส่เองเป็นที่เดียว
+    sed -i '/^[[:space:]]*Subsystem[[:space:]]\+sftp/d' "${SSHD_CONF}"
+    for f in "${SSHD_DROPIN_DIR}"/*.conf; do
+        [[ -f "$f" && "$f" != "${SSHD_DROPIN}" ]] && \
+            sed -i '/^[[:space:]]*Subsystem[[:space:]]\+sftp/d' "$f" || true
+    done
 
-    # ถ้า sshd_config หลักมี Subsystem sftp → ลบออก แล้วให้ drop-in จัดการแทน
-    # (drop-in ที่ชื่อ 99-* โหลดหลังสุด ควบคุมได้ง่ายกว่า)
-    if grep -qiE "^[[:space:]]*Subsystem[[:space:]]+sftp" "${SSHD_CONF}" 2>/dev/null; then
-        sed -i '/^[[:space:]]*Subsystem[[:space:]]\+sftp/d' "${SSHD_CONF}"
-        has_subsystem=false
-        info "ลบ Subsystem sftp ออกจาก sshd_config หลักแล้ว — drop-in จะใส่แทน"
-    fi
-
-    cat > "${SSHD_DROPIN}" <<EOF
+    cat > "${SSHD_DROPIN}" <<'EOF'
 Port 443
 PermitRootLogin prohibit-password
 PasswordAuthentication no
@@ -294,7 +285,7 @@ SyslogFacility AUTH
 
 PrintMotd no
 AcceptEnv LANG LC_*
-$(${has_subsystem} || echo "Subsystem sftp /usr/lib/openssh/sftp-server")
+Subsystem sftp /usr/lib/openssh/sftp-server
 EOF
 
     sshd -t || {
@@ -303,7 +294,7 @@ EOF
         exit 1
     }
 
-    systemctl reload sshd
+    systemctl restart sshd
     ok "sshd port 443 — key-only, VERBOSE"
 }
 
