@@ -26,10 +26,8 @@ readonly NFT_BACKUP="${BACKUP_DIR}/nftables.conf.bak"
 readonly ROLLBACK_DELAY_MIN=3
 
 # Pin 3x-ui to a specific commit — update this after testing new releases
-# 3x-ui installer source
-readonly XUI_SCRIPT_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh"
-
-# Optional SHA256 verification
+readonly XUI_COMMIT="9a5cbe5b3bb2978a850f0aea5a8ac99de3249302"
+readonly XUI_SCRIPT_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/${XUI_COMMIT}/install.sh"
 readonly XUI_SCRIPT_SHA256="SKIP"
 
 # -----------------------------------------------------------------------------
@@ -346,11 +344,20 @@ step_install_xui() {
     return
   fi
 
-  local install_script="/tmp/3x-ui-install.sh"
+  local install_script="/tmp/3x-ui-install-${XUI_COMMIT:0:8}.sh"
 
-  info "Downloading 3x-ui installer..."
+  info "Downloading 3x-ui @ commit ${XUI_COMMIT:0:12}..."
   curl -fsSLo "$install_script" "$XUI_SCRIPT_URL" \
     || die "Download failed: $XUI_SCRIPT_URL"
+
+  # SHA256 verify — set XUI_SCRIPT_SHA256 to actual hash to enable
+  if [ "$XUI_SCRIPT_SHA256" != "SKIP" ]; then
+    echo "${XUI_SCRIPT_SHA256}  ${install_script}" | sha256sum -c \
+      || die "SHA256 mismatch — possible supply-chain compromise. Aborting."
+    ok "SHA256 verified"
+  else
+    warn "SHA256 verification SKIPPED — set XUI_SCRIPT_SHA256 to enable"
+  fi
 
   echo -e "${BCYN}  3x-ui prompts → Panel Port: 2053${RST}"
   set +e
