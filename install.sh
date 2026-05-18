@@ -25,10 +25,11 @@ readonly NFT_CONF=/etc/nftables.conf
 readonly NFT_BACKUP="${BACKUP_DIR}/nftables.conf.bak"
 readonly ROLLBACK_DELAY_MIN=3
 
-# Pin 3x-ui to a specific commit — update this after testing new releases
-readonly XUI_COMMIT="9a5cbe5b3bb2978a850f0aea5a8ac99de3249302"
-readonly XUI_SCRIPT_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/${XUI_COMMIT}/install.sh"
+# FIX: ใช้ main branch แทน commit hash ที่ 404
+readonly XUI_SCRIPT_URL="https://raw.githubusercontent.com/mhsanaei/3x-ui/main/install.sh"
 readonly XUI_SCRIPT_SHA256="SKIP"
+# ใช้สำหรับ display เท่านั้น
+XUI_VERSION_LABEL="main"
 
 # -----------------------------------------------------------------------------
 # COLORS
@@ -57,6 +58,7 @@ CERT_EXPIRY="unknown"
 TOTAL_RAM_MB=0
 CPU_COUNT=0
 CONNTRACK_MAX=0
+COMPUTED_MSS=1240
 
 # -----------------------------------------------------------------------------
 # LOGGING
@@ -253,7 +255,7 @@ collect_input() {
   printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "CC"            "$( [ "$BBR_AVAILABLE" -eq 1 ] && echo "BBR" || echo "CUBIC (fallback)" )"
   printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "QDISC"         "$( [ "$CAKE_AVAILABLE" -eq 1 ] && echo "CAKE diffserv4 no-ceiling" || echo "fq_codel (fallback)" )"
   printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "INGRESS SHAPE" "$( [ "$IFB_AVAILABLE" -eq 1 ] && echo "IFB+CAKE" || echo "egress-only" )"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "XUI_COMMIT"    "${XUI_COMMIT:0:12}..."
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "XUI_VERSION"   "${XUI_VERSION_LABEL}"
   printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "ROLLBACK"      "${ROLLBACK_DELAY_MIN}min auto-safety"
   printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "SWAP"          "${SWAP_SIZE_MB}MB"
   printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "PANEL_PORT"    "2053"
@@ -313,6 +315,7 @@ step_swap() {
 
 # -----------------------------------------------------------------------------
 # STEP 3: PACKAGES
+# FIX: ลบ ifupdown2 (ไม่มีใน Ubuntu 22.04), เพิ่ม at และ install ก่อน start atd
 # -----------------------------------------------------------------------------
 step_packages() {
   step "[3] System update + packages"
@@ -322,11 +325,11 @@ step_packages() {
   tee_run apt-get install -y -qq \
     nftables iproute2 curl wget ca-certificates gnupg \
     dnsutils dnsmasq certbot python3-certbot \
-    at ifupdown2 \
+    at \
     "linux-modules-extra-$(uname -r)" \
     || warn "Some packages unavailable — continuing"
 
-  # Ensure atd running for rollback
+  # FIX: install at ก่อน แล้วค่อย enable+start atd
   systemctl enable --now atd >> "$LOG" 2>&1 \
     && ok "atd: enabled" || warn "atd: failed to start"
 
@@ -334,19 +337,20 @@ step_packages() {
 }
 
 # -----------------------------------------------------------------------------
-# STEP 4: 3x-ui INSTALL (supply-chain safe)
+# STEP 4: 3x-ui INSTALL
+# FIX: ใช้ main branch URL แทน commit hash ที่ 404
 # -----------------------------------------------------------------------------
 step_install_xui() {
-  step "[4] 3x-ui install — supply-chain verified"
+  step "[4] 3x-ui install"
 
   if command -v x-ui &>/dev/null && systemctl is-active --quiet x-ui; then
     ok "3x-ui already running — skip install"
     return
   fi
 
-  local install_script="/tmp/3x-ui-install-${XUI_COMMIT:0:8}.sh"
+  local install_script="/tmp/3x-ui-install.sh"
 
-  info "Downloading 3x-ui @ commit ${XUI_COMMIT:0:12}..."
+  info "Downloading 3x-ui (latest main)..."
   curl -fsSLo "$install_script" "$XUI_SCRIPT_URL" \
     || die "Download failed: $XUI_SCRIPT_URL"
 
@@ -356,7 +360,7 @@ step_install_xui() {
       || die "SHA256 mismatch — possible supply-chain compromise. Aborting."
     ok "SHA256 verified"
   else
-    warn "SHA256 verification SKIPPED — set XUI_SCRIPT_SHA256 to enable"
+    warn "SHA256 verification SKIPPED"
   fi
 
   echo -e "${BCYN}  3x-ui prompts → Panel Port: 2053${RST}"
@@ -451,7 +455,6 @@ HOOK
   CERT_EXPIRY=$(openssl x509 -enddate -noout \
     -in "$CERT_DIR/fullchain.pem" 2>/dev/null | cut -d= -f2 || echo "unknown")
 
-  # TLS verify
   local tls_ok=0
   if openssl s_client \
       -connect "${SERVER_DOMAIN}:443" \
@@ -465,7 +468,6 @@ HOOK
   fi
   log "TLS verify: $tls_ok | cert_expiry: $CERT_EXPIRY"
 
-  # certbot auto-renew
   systemctl enable certbot.timer >> "$LOG" 2>&1 \
     && ok "certbot.timer enabled" \
     || {
@@ -479,7 +481,7 @@ CRON
 }
 
 # -----------------------------------------------------------------------------
-# STEP 6: DNS BENCHMARK + DNSMASQ (parallel + median)
+# STEP 6: DNS BENCHMARK + DNSMASQ
 # -----------------------------------------------------------------------------
 benchmark_dns_single() {
   local r="$1"
@@ -634,7 +636,6 @@ EOF
 
   sysctl --system >> "$LOG" 2>&1
 
-  # Validate critical keys
   local actual_cc actual_qdisc
   actual_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
   actual_qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
@@ -647,7 +648,6 @@ EOF
     && ok "default_qdisc verified: $actual_qdisc" \
     || warn "qdisc mismatch: expected $qdisc got $actual_qdisc"
 
-  # Validate other critical keys
   local fwd
   fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo "0")
   [ "$fwd" = "1" ] && ok "ip_forward: 1" || warn "ip_forward not set"
@@ -663,7 +663,6 @@ probe_mtu_mss() {
 
   local target="8.8.8.8"
   local probed_mtu=1500
-  local mss=1240  # safe default for VLESS+Reality
 
   if command -v tracepath &>/dev/null; then
     local tp_mtu
@@ -676,29 +675,24 @@ probe_mtu_mss() {
     fi
   fi
 
-  # VLESS+Reality overhead: TLS(~60) + VLESS header(~20) = ~80 bytes
-  # MSS = MTU - IP(20) - TCP(20) - overhead(80) = MTU - 120
-  mss=$(( probed_mtu - 120 ))
-  [ "$mss" -lt 576  ] && mss=576
-  [ "$mss" -gt 1380 ] && mss=1380
+  COMPUTED_MSS=$(( probed_mtu - 120 ))
+  [ "$COMPUTED_MSS" -lt 576  ] && COMPUTED_MSS=576
+  [ "$COMPUTED_MSS" -gt 1380 ] && COMPUTED_MSS=1380
 
-  info "PMTU: ${probed_mtu} → MSS clamp: ${mss}"
-  log "PMTU_PROBE: mtu=$probed_mtu mss=$mss"
+  info "PMTU: ${probed_mtu} → MSS clamp: ${COMPUTED_MSS}"
+  log "PMTU_PROBE: mtu=$probed_mtu mss=$COMPUTED_MSS"
 
-  # Export for use in nftables step
-  COMPUTED_MSS="$mss"
   ok "[8] MSS: $COMPUTED_MSS"
 }
 
 # -----------------------------------------------------------------------------
-# STEP 9: QDISC — CAKE + IFB INGRESS (dynamic interface script)
+# STEP 9: QDISC — CAKE + IFB INGRESS
 # -----------------------------------------------------------------------------
 step_qdisc() {
   step "[9] qdisc — CAKE adaptive + IFB ingress"
 
   local cake_opts="diffserv4 nat wash overhead 40 mpu 64"
 
-  # Write runtime-detect qdisc script (not hardcoded interface)
   cat > "$QDISC_SCRIPT" << QEOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -709,7 +703,6 @@ IFACE=\$(ip route show default 2>/dev/null | awk 'NR==1{print \$5}')
 \$TC qdisc del dev "\$IFACE" root    2>/dev/null || true
 \$TC qdisc del dev "\$IFACE" ingress 2>/dev/null || true
 
-# Egress CAKE
 if \$TC qdisc add dev "\$IFACE" root cake ${cake_opts} 2>/dev/null; then
   echo "CAKE egress applied on \$IFACE"
 else
@@ -718,7 +711,6 @@ else
   echo "fq_codel egress fallback on \$IFACE"
 fi
 
-# Ingress via IFB
 if modprobe ifb 2>/dev/null && ip link show ifb0 &>/dev/null; then
   ip link set dev ifb0 up 2>/dev/null || true
   \$TC qdisc del dev "\$IFACE" ingress 2>/dev/null || true
@@ -735,16 +727,13 @@ fi
 QEOF
   chmod +x "$QDISC_SCRIPT"
 
-  # Apply now
   bash "$QDISC_SCRIPT" 2>&1 | tee -a "$LOG"
 
-  # Detect what was applied
   local applied
   applied=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1{print $2}')
   QDISC_APPLIED="${applied} on ${IFACE}"
   [ "$IFB_AVAILABLE" -eq 1 ] && QDISC_APPLIED+=" + IFB ingress"
 
-  # Systemd service using runtime script
   rm -f /etc/systemd/system/gaming-qdisc.service
   cat > /etc/systemd/system/gaming-qdisc.service << EOF
 [Unit]
@@ -804,14 +793,12 @@ step_nftables() {
     panel_rule_v6="tcp dport 2053 limit rate 10/minute burst 8 packets accept"
   fi
 
-  # Schedule safety rollback BEFORE loading new rules
   schedule_rollback
 
   cat > "$NFT_CONF" << NFTEOF
 #!/usr/sbin/nft -f
 flush ruleset
 
-# ── IPv4 SSH blocklist ──────────────────────────────────────────────────────
 table inet filter {
   set ssh_blocklist4 {
     type ipv4_addr
@@ -835,11 +822,9 @@ table inet filter {
     ct state established,related accept
     ct state invalid drop
 
-    # ICMP — dual-stack
     ip  protocol icmp  icmp  type { echo-request, echo-reply, destination-unreachable, time-exceeded } limit rate 10/second accept
     ip6 nexthdr icmpv6 icmpv6 type { echo-request, echo-reply, destination-unreachable, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } limit rate 10/second accept
 
-    # SSH — dual-stack blocklist + rate-limit
     ip  saddr @ssh_blocklist4 drop
     ip6 saddr @ssh_blocklist6 drop
     tcp dport ${SSH_PORT} ct state new limit rate over 15/minute burst 8 packets \
@@ -847,15 +832,12 @@ table inet filter {
       add @ssh_blocklist6 { ip6 saddr timeout 1h }
     tcp dport ${SSH_PORT} ct state new limit rate 15/minute burst 10 packets accept
 
-    # Web + VPN tunnel
     tcp dport 80  accept
     tcp dport 443 accept
     udp dport 443 accept
 
-    # Panel — IPv4 whitelist or rate-limit
     ${panel_rule_v4}
 
-    # Panel — IPv6 rate-limit (no whitelist for IPv6 unless ADMIN_IP is IPv6)
     ${panel_rule_v6}
   }
 
@@ -868,12 +850,10 @@ table inet filter {
   }
 }
 
-# ── Traffic marking + MSS clamp ─────────────────────────────────────────────
 table inet mangle {
   chain prerouting {
     type filter hook prerouting priority -150;
 
-    # DSCP CS5 on tunnel port — both IPv4 and IPv6
     tcp dport 443 ip  dscp set cs5
     udp dport 443 ip  dscp set cs5
     tcp dport 443 ip6 dscp set cs5
@@ -883,19 +863,16 @@ table inet mangle {
   chain postrouting {
     type filter hook postrouting priority -150;
 
-    # MSS clamp — IPv4 + IPv6 (computed from PMTU probe)
     oifname "${IFACE}" tcp flags & (syn|ack) == syn \
       tcp option maxseg size set ${COMPUTED_MSS}
   }
 }
 NFTEOF
 
-  # Load and verify
   if tee_run nft -f "$NFT_CONF"; then
     ok "nftables ruleset loaded"
     tee_run systemctl enable nftables
 
-    # Verify critical rules present
     local ruleset
     ruleset=$(nft list ruleset 2>/dev/null)
 
@@ -911,7 +888,6 @@ NFTEOF
       && ok "SSH blocklist sets: present" \
       || warn "SSH blocklist sets not found"
 
-    # Cancel rollback — rules are good
     cancel_rollback
   else
     warn "nft load failed — restoring backup"
@@ -930,7 +906,6 @@ NFTEOF
 step_xui_tuning() {
   step "[11] x-ui resource isolation + limits"
 
-  # systemd slice for xray/x-ui
   cat > "$SLICE_CONF" << 'EOF'
 [Unit]
 Description=Xray VPN Slice
@@ -943,7 +918,6 @@ IOWeight=100
 TasksMax=512
 EOF
 
-  # FD limits — idempotent
   local limits_conf="/etc/security/limits.conf"
   sed -i '/# xray-limits/,+4d' "$limits_conf" 2>/dev/null || true
   cat >> "$limits_conf" << 'EOF'
@@ -976,7 +950,6 @@ EOF
     && ok "x-ui active" \
     || warn "x-ui not active after restart"
 
-  # Verify FD limit effective for x-ui process
   local xui_pid xui_fdlimit
   xui_pid=$(pgrep -f x-ui | head -1 || true)
   if [ -n "$xui_pid" ]; then
@@ -985,7 +958,6 @@ EOF
     ok "x-ui PID $xui_pid — FD limit: $xui_fdlimit"
   fi
 
-  # Write hints file
   cat > /root/xray-production-settings.txt << 'XEOF'
 VLESS+Reality — Production Narrowband (128kbps/user, 2 users)
 ==============================================================
@@ -1035,7 +1007,6 @@ step_health_check() {
   check_pass() { ok "  CHECK ✓ $*"; (( pass++ )) || true; }
   check_fail() { warn "  CHECK ✗ $*"; (( fail++ )) || true; }
 
-  # 1. Services
   systemctl is-active x-ui      | grep -q "^active$" \
     && check_pass "x-ui: active"            || check_fail "x-ui: not active"
   systemctl is-active nftables   | grep -q "^active$" \
@@ -1045,13 +1016,11 @@ step_health_check() {
   systemctl is-active gaming-qdisc | grep -q "^active$" \
     && check_pass "gaming-qdisc: active"   || check_fail "gaming-qdisc: not active"
 
-  # 2. Port binding
   ss -tlnp 2>/dev/null | grep -q ":443 " \
     && check_pass "Port 443: bound"         || check_fail "Port 443: not bound"
   ss -tlnp 2>/dev/null | grep -q ":2053 " \
     && check_pass "Port 2053: bound"        || check_fail "Port 2053: not bound"
 
-  # 3. Panel reachable
   local panel_code
   panel_code=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
     "https://${SERVER_DOMAIN}:2053/" 2>/dev/null || echo "000")
@@ -1059,31 +1028,26 @@ step_health_check() {
     && check_pass "Panel HTTP: $panel_code" \
     || check_fail "Panel HTTP: $panel_code (may need manual cert config)"
 
-  # 4. DNS
   local dns_r
   dns_r=$(dig +short +time=3 google.com @127.0.0.1 2>/dev/null | head -1)
   [ -n "$dns_r" ] \
     && check_pass "dnsmasq DNS: google.com → $dns_r" \
     || check_fail "dnsmasq DNS: google.com lookup failed"
 
-  # 5. qdisc
   local qdisc_active
   qdisc_active=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1{print $2}')
   [ -n "$qdisc_active" ] \
     && check_pass "qdisc: $qdisc_active on $IFACE" \
     || check_fail "qdisc: none detected on $IFACE"
 
-  # 6. BBR active
   local actual_cc
   actual_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
   [ "$actual_cc" = "bbr" ] \
     && check_pass "TCP CC: bbr"             || check_fail "TCP CC: $actual_cc (not bbr)"
 
-  # 7. nftables rules
   nft list ruleset 2>/dev/null | grep -qE "dport.*443" \
     && check_pass "nftables port 443 rule"  || check_fail "nftables port 443 missing"
 
-  # 8. Swap
   swapon --show 2>/dev/null | grep -q "$SWAP_FILE" \
     && check_pass "Swap: active"            || check_fail "Swap: not active"
 
@@ -1165,7 +1129,7 @@ step_summary() {
   printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "dnsmasq"           "$dns_status"
   printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Best DNS"          "${DNS_BEST} (${DNS_BEST_MS}ms)"
   printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "gaming-qdisc"      "$qds_status"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "XUI commit"        "${XUI_COMMIT:0:12}..."
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "XUI version"       "${XUI_VERSION_LABEL}"
   printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Backup"            "$BACKUP_DIR"
   printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Log"               "$LOG"
   echo -e "${BCYN}╚══════════════════════════════════════╩════════════════════════════════════════╝${RST}"
