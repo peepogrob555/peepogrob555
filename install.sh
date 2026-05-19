@@ -2,7 +2,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VER="4.3-production"
+readonly SCRIPT_VER="4.4-bugfix"
 readonly LOG=/var/log/3x-ui-vpn.log
 readonly BACKUP_DIR=/var/backups/3x-ui-vpn
 readonly CERT_DIR=/etc/ssl/xray
@@ -170,11 +170,37 @@ detect_bandwidth() {
     fi
   fi
 
-  # Method 2: /sys/class/net (works when ethtool fails on VPS)
+  # Method 2: /sys/class/net
   if [ "$nic_speed" -eq 0 ]; then
     local sys_speed
     sys_speed=$(cat "/sys/class/net/${IFACE}/speed" 2>/dev/null || echo 0)
-    [[ "$sys_speed" =~ ^[0-9]+$ ]] && [ "$sys_speed" -gt 0 ] && nic_speed="$sys_speed"
+    [[ "$sys_speed" =~ ^[0-9]+$ ]] && [ "$sys_speed" -gt 0 ] && [ "$sys_speed" -lt 65535 ] \
+      && nic_speed="$sys_speed"
+  fi
+
+  # Method 2b: ip link max_bandwidth field (KVM VPS often reports here)
+  if [ "$nic_speed" -eq 0 ]; then
+    local ip_bw
+    ip_bw=$(ip -d link show "$IFACE" 2>/dev/null \
+      | awk '/maxchunksize|txqueuelen/{next} /altname|link/{next}'\
+      | grep -oP 'maxrate \K[0-9]+[KMG]bit' | head -1 || true)
+    if [ -z "$ip_bw" ]; then
+      # Fallback: read from ethtool advertised speeds if Speed: unknown
+      local adv
+      adv=$(ethtool "$IFACE" 2>/dev/null | awk '/Advertised link modes/{found=1} found && /[0-9]+base/{match($0,/([0-9]+)base/,a); print a[1]; exit}')
+      [[ "$adv" =~ ^[0-9]+$ ]] && nic_speed="$adv"
+    fi
+  fi
+
+  # Method 2c: assume 1Gbps if VPS — most modern VPS are 1G NIC
+  # Only used as last resort before speedtest
+  if [ "$nic_speed" -eq 0 ]; then
+    local virt_check
+    virt_check=$(systemd-detect-virt 2>/dev/null || echo none)
+    if [[ "$virt_check" =~ ^(kvm|vmware|xen|microsoft|oracle|amazon)$ ]]; then
+      nic_speed=1000
+      warn "NIC speed undetectable — assuming 1000Mbit (VPS: $virt_check)"
+    fi
   fi
 
   # Method 3: speedtest-cli quick single-server test (optional, skip if slow)
@@ -688,6 +714,12 @@ probe_mtu_mss() {
 step_qdisc() {
   step "[9] qdisc — CAKE + IFB ingress"
 
+  # Force-load modules now that linux-modules-extra is installed
+  modprobe sch_cake  >> "$LOG" 2>&1 && { CAKE_AVAILABLE=1; ok "sch_cake: loaded"; } \
+    || warn "sch_cake: still unavailable after modprobe"
+  modprobe ifb       >> "$LOG" 2>&1 && { IFB_AVAILABLE=1;  ok "ifb: loaded"; } \
+    || warn "ifb: still unavailable after modprobe"
+
   local cake_egress_opts="bandwidth ${CAKE_EGRESS_BW} diffserv4 dual-srchost dual-dsthost nat wash overhead 40 mpu 64 target 5ms interval 50ms"
   local cake_ingress_opts="bandwidth ${CAKE_INGRESS_BW} diffserv4 dual-srchost dual-dsthost nat wash overhead 40 mpu 64 target 5ms interval 50ms"
 
@@ -856,8 +888,9 @@ table inet filter {
 
     ip  saddr @ssh_blocklist4 drop
     ip6 saddr @ssh_blocklist6 drop
-    tcp dport ${SSH_PORT} ct state new limit rate over 15/minute burst 8 packets \
-      add @ssh_blocklist4 { ip  saddr timeout 1h } \
+    ip  version 4 tcp dport ${SSH_PORT} ct state new limit rate over 15/minute burst 8 packets \
+      add @ssh_blocklist4 { ip saddr timeout 1h }
+    ip6 version 6 tcp dport ${SSH_PORT} ct state new limit rate over 15/minute burst 8 packets \
       add @ssh_blocklist6 { ip6 saddr timeout 1h }
     tcp dport ${SSH_PORT} ct state new limit rate 15/minute burst 10 packets accept
 
