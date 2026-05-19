@@ -1,0 +1,1030 @@
+#!/usr/bin/env bash
+# VMESS WS — AIS Thailand Mobile VPN
+# | 2 Users | BBR + CAKE AQM | Ubuntu 22.04
+#
+# Usage:
+#   sudo bash vmess-ais-setup.sh
+#   sudo bash vmess-ais-setup.sh monitor
+#   sudo bash vmess-ais-setup.sh status
+#   sudo bash vmess-ais-setup.sh rollback
+#   sudo bash vmess-ais-setup.sh inject-inbound
+#   sudo bash vmess-ais-setup.sh jitter [IP]
+
+set -uo pipefail
+IFS=$'\n\t'
+
+R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m'
+B='\033[0;34m' C='\033[0;36m' M='\033[0;35m'
+W='\033[1;37m' DIM='\033[2m'  NC='\033[0m' BOLD='\033[1m'
+
+XRAY_INTERNAL_PORT=10086
+PANEL_PORT=2053
+WS_PATH="/speedtest"
+LOG=/var/log/vmess-setup.log
+
+TOTAL_STEPS=13
+CUR_STEP=0
+NIC=""
+DOMAIN=""
+CERT_EMAIL=""
+VPS_IP=""
+UUID1=""
+UUID2=""
+FAILED_STEPS=()
+WARN_STEPS=()
+
+# ── Utilities ────────────────────────────────────────────────────
+_log()  { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG"; }
+_info() { echo -e "${C}  ●  $*${NC}"; _log "INFO: $*"; }
+_ok()   { echo -e "${G}  ✔  $*${NC}"; _log "OK: $*"; }
+_warn() { echo -e "${Y}  ⚠  $*${NC}"; _log "WARN: $*"; }
+_fail() { echo -e "${R}  ✘  $*${NC}"; _log "FAIL: $*"; }
+_dim()  { echo -e "${DIM}     $*${NC}"; }
+
+_spin() {
+    local pid=$1 msg=$2
+    local frames=('⣾' '⣽' '⣻' '⢿' '⡿' '⣟' '⣯' '⣷')
+    local i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        printf "\r  ${C}%s${NC}  %s   " "${frames[i++ % ${#frames[@]}]}" "$msg"
+        sleep 0.08
+    done
+    printf "\r%60s\r" ""
+}
+
+_run() {
+    local label=$1; shift
+    "$@" >> "$LOG" 2>&1 &
+    local pid=$!
+    _spin $pid "$label"
+    if wait $pid; then
+        _ok "$label"; return 0
+    else
+        _fail "$label"
+        tail -4 "$LOG" | sed 's/^/     /' | while IFS= read -r line; do
+            echo -e "${Y}${line}${NC}"
+        done
+        return 1
+    fi
+}
+
+_step() {
+    CUR_STEP=$((CUR_STEP + 1))
+    local pct=$(( CUR_STEP * 100 / TOTAL_STEPS ))
+    local filled=$(( pct * 24 / 100 ))
+    local bar="" i
+    for ((i=0; i<filled; i++));  do bar+="█"; done
+    for ((i=filled; i<24; i++)); do bar+="░"; done
+    echo ""
+    echo -e "${BOLD}${B}┌─ [${CUR_STEP}/${TOTAL_STEPS}] $1${NC}"
+    printf "${B}│${NC} ${G}%s${NC} ${DIM}%d%%${NC}\n" "$bar" "$pct"
+    echo -e "${B}└${NC}"
+    _log "═══ STEP ${CUR_STEP}/${TOTAL_STEPS}: $1 ═══"
+}
+
+_safe_step() {
+    local name=$1; shift
+    local rc=0
+    "$@" || rc=$?
+    if [[ $rc -ne 0 ]]; then
+        FAILED_STEPS+=("Step ${CUR_STEP}: ${name}")
+        echo -e "${R}  ✘  Step นี้พัง (exit $rc) — ข้ามต่อไป จะสรุปตอนท้าย${NC}"
+        _log "STEP FAILED: $name (exit $rc)"
+        return 1
+    fi
+    return 0
+}
+
+# ── Banner ───────────────────────────────────────────────────────
+_banner() {
+    clear
+    echo ""
+    echo -e "${BOLD}${B}  ╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${B}  ║${NC}${BOLD}${W}   VMESS WS Setup — AIS Thailand 128kbps Mobile VPN  ${NC}${BOLD}${B}║${NC}"
+    echo -e "${BOLD}${B}  ║${NC}${DIM}   ReadyIDC นนทบุรี · 2 Users · BBR + CAKE AQM        ${NC}${BOLD}${B}║${NC}"
+    echo -e "${BOLD}${B}  ╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "${DIM}  Log: ${LOG}${NC}"
+    echo ""
+}
+
+# ── Step 1: Detect NIC ───────────────────────────────────────────
+do_detect_nic() {
+    _step "Detecting network interface + public IP"
+
+    NIC=$(ip route get 1.1.1.1 2>/dev/null \
+        | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' \
+        | head -1) || true
+
+    if [[ -z "$NIC" ]]; then
+        NIC=$(ip link show \
+            | awk -F': ' '/^[0-9]+: (eth|ens|enp|eno|veth)/{print $2}' \
+            | grep -v lo | head -1) || true
+    fi
+
+    [[ -z "$NIC" ]] && { _fail "หา NIC ไม่เจอ"; return 1; }
+
+    VPS_IP=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null \
+          || curl -s --max-time 8 https://ifconfig.me 2>/dev/null \
+          || ip addr show "$NIC" | awk '/inet /{print $2}' | cut -d/ -f1 | head -1) || true
+
+    [[ -z "$VPS_IP" ]] && { _fail "หา public IP ไม่ได้"; return 1; }
+
+    _ok "Interface: ${BOLD}${NIC}${NC}  |  IP: ${BOLD}${VPS_IP}${NC}"
+}
+
+# ── Step 2: Domain input ─────────────────────────────────────────
+do_get_domain() {
+    _step "Domain + TLS certificate configuration"
+
+    echo ""
+    echo -e "  ${BOLD}VPS IP ของคุณ: ${C}${VPS_IP}${NC}"
+    echo -e "  ${Y}ตรวจสอบว่า A record ของ domain ชี้มาที่ IP นี้ก่อน${NC}"
+    echo ""
+
+    while true; do
+        echo -ne "  ${BOLD}กรอก domain (เช่น sub.example.com): ${NC}"
+        read -r DOMAIN
+        [[ -n "$DOMAIN" ]] && break
+        echo -e "  ${R}domain ห้ามว่าง${NC}"
+    done
+
+    while true; do
+        echo -ne "  ${BOLD}กรอก email สำหรับ Let's Encrypt cert: ${NC}"
+        read -r CERT_EMAIL
+        [[ -n "$CERT_EMAIL" ]] && break
+        echo -e "  ${R}email ห้ามว่าง${NC}"
+    done
+
+    _ok "Domain: ${BOLD}${DOMAIN}${NC}"
+}
+
+# ── Step 3: System update ────────────────────────────────────────
+do_system_update() {
+    _step "System update + base packages"
+
+    export DEBIAN_FRONTEND=noninteractive
+
+    _run "apt-get update"   apt-get update -y || return 1
+    _run "apt-get upgrade"  apt-get upgrade -y \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confold" || return 1
+    _run "Installing packages" apt-get install -y \
+        curl wget unzip git socat openssl \
+        nginx certbot python3-certbot-nginx \
+        iproute2 iptables nftables \
+        net-tools htop iotop dstat \
+        cron logrotate ufw sqlite3 \
+        build-essential python3 || return 1
+
+    _ok "Packages installed"
+}
+
+# ── Step 4: Kernel modules ───────────────────────────────────────
+do_kernel_modules() {
+    _step "Kernel modules (BBR + CAKE + IFB)"
+
+    local mods=(tcp_bbr sch_cake ifb sch_fq)
+    for m in "${mods[@]}"; do
+        if lsmod | grep -q "^${m}"; then
+            _ok "Module ${m} — already loaded"
+        else
+            if modprobe "$m" 2>/dev/null; then
+                _ok "Loaded: ${m}"
+            else
+                _warn "Cannot load ${m} — may use fallback"
+                WARN_STEPS+=("kernel module ${m} ไม่สามารถโหลดได้")
+            fi
+        fi
+    done
+
+    cat > /etc/modules-load.d/vmess-modules.conf << 'EOF'
+tcp_bbr
+sch_cake
+ifb
+sch_fq
+EOF
+    _ok "Modules persisted across reboot"
+}
+
+# ── Step 5: Install 3X-UI ────────────────────────────────────────
+do_install_xui() {
+    _step "Installing 3X-UI + Xray-core"
+
+    _info "ดาวน์โหลด 3X-UI installer..."
+
+    if bash -c "$(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)" \
+        -- --nostart >> "$LOG" 2>&1; then
+        _ok "3X-UI + Xray-core installed"
+    else
+        _warn "3X-UI installer ล้มเหลว — ลอง fallback..."
+        bash -c "$(curl -Ls https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)" \
+            -- install >> "$LOG" 2>&1 || true
+        WARN_STEPS+=("3X-UI installer พัง — ได้แค่ Xray-core ต้องติดตั้ง 3X-UI panel แยก")
+        return 1
+    fi
+}
+
+# ── Step 6: Panel port ───────────────────────────────────────────
+do_panel_port() {
+    _step "Configure 3X-UI panel port → ${PANEL_PORT}"
+
+    if command -v x-ui &>/dev/null; then
+        x-ui setting -port "$PANEL_PORT" >> "$LOG" 2>&1 || true
+        _ok "Panel port set via x-ui CLI"
+    else
+        _warn "x-ui CLI ไม่พบ — verify panel port ใน panel หลัง login"
+        WARN_STEPS+=("x-ui CLI ไม่พบ — verify panel port ใน panel หลัง login")
+    fi
+
+    local xconf="/usr/local/x-ui/bin/config.json"
+    [[ -f "$xconf" ]] && cp "$xconf" "${xconf}.bak.$(date +%s)" || true
+
+    _ok "Panel port configured: ${PANEL_PORT}"
+}
+
+# ── Step 7: TLS cert ─────────────────────────────────────────────
+do_tls_cert() {
+    _step "Let's Encrypt TLS certificate for ${DOMAIN}"
+
+    systemctl stop nginx 2>/dev/null || true
+    fuser -k 80/tcp 2>/dev/null || true
+    sleep 1
+
+    if certbot certonly \
+        --standalone \
+        --non-interactive \
+        --agree-tos \
+        --email "$CERT_EMAIL" \
+        -d "$DOMAIN" \
+        >> "$LOG" 2>&1; then
+        _ok "TLS cert issued"
+    else
+        _fail "certbot ล้มเหลว"
+        _warn "ตรวจสอบ: domain ชี้มาที่ ${VPS_IP} หรือยัง? (dig ${DOMAIN} A)"
+        FAILED_STEPS+=("Step ${CUR_STEP}: TLS cert — domain อาจยังไม่ชี้มาที่ VPS")
+        return 1
+    fi
+
+    local cert="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+    [[ -f "$cert" ]] || { _fail "cert file ไม่พบ"; return 1; }
+
+    (crontab -l 2>/dev/null; \
+     echo "30 3 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") \
+        | sort -u | crontab -
+    _ok "Auto-renewal cron configured"
+}
+
+# ── Step 8: Nginx config ─────────────────────────────────────────
+do_nginx_config() {
+    _step "Nginx reverse proxy (port 80 + 443 → Xray)"
+
+    local CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+    local KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+    local NGINX_SITE="/etc/nginx/sites-available/vmess"
+
+    rm -f /etc/nginx/sites-enabled/default
+
+    cat > /etc/nginx/conf.d/vmess-tune.conf << 'NGXTUNE'
+sendfile           on;
+tcp_nopush         on;
+tcp_nodelay        on;
+keepalive_timeout  65;
+keepalive_requests 2000;
+gzip               off;
+server_tokens      off;
+client_max_body_size 64m;
+NGXTUNE
+
+    cat > "$NGINX_SITE" << NGINXEOF
+upstream xray_ws {
+    server 127.0.0.1:${XRAY_INTERNAL_PORT};
+    keepalive 4;
+}
+
+server {
+    listen 80 fastopen=256;
+    server_name ${DOMAIN};
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+
+    location ${WS_PATH} {
+        proxy_pass              http://xray_ws;
+        proxy_http_version      1.1;
+        proxy_set_header        Upgrade \$http_upgrade;
+        proxy_set_header        Connection "upgrade";
+        proxy_set_header        Host \$host;
+        proxy_set_header        X-Real-IP \$remote_addr;
+        proxy_set_header        X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_buffering         off;
+        proxy_request_buffering off;
+        proxy_read_timeout      86400s;
+        proxy_send_timeout      86400s;
+        proxy_connect_timeout   10s;
+        tcp_nodelay             on;
+    }
+}
+
+server {
+    listen 443 ssl fastopen=256;
+    server_name ${DOMAIN};
+
+    ssl_certificate         ${CERT_PATH};
+    ssl_certificate_key     ${KEY_PATH};
+    ssl_protocols           TLSv1.2 TLSv1.3;
+    ssl_ciphers             TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache       shared:SSL:10m;
+    ssl_session_timeout     4h;
+    ssl_session_tickets     on;
+    ssl_stapling            on;
+    ssl_stapling_verify     on;
+    resolver                1.1.1.1 8.8.8.8 valid=300s;
+    resolver_timeout        5s;
+
+    add_header Strict-Transport-Security "max-age=31536000" always;
+
+    location / {
+        return 200 'OK';
+        add_header Content-Type text/plain;
+    }
+
+    location ${WS_PATH} {
+        proxy_pass              http://xray_ws;
+        proxy_http_version      1.1;
+        proxy_set_header        Upgrade \$http_upgrade;
+        proxy_set_header        Connection "upgrade";
+        proxy_set_header        Host \$host;
+        proxy_set_header        X-Real-IP \$remote_addr;
+        proxy_set_header        X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header        X-Forwarded-Proto https;
+        proxy_buffering         off;
+        proxy_request_buffering off;
+        proxy_read_timeout      86400s;
+        proxy_send_timeout      86400s;
+        proxy_connect_timeout   10s;
+        tcp_nodelay             on;
+    }
+}
+NGINXEOF
+
+    ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/vmess
+
+    if nginx -t >> "$LOG" 2>&1; then
+        _ok "Nginx config valid"
+    else
+        _fail "Nginx config test ล้มเหลว"
+        tail -5 "$LOG" | sed 's/^/  /'
+        return 1
+    fi
+}
+
+# ── Step 9: Xray config ──────────────────────────────────────────
+do_xray_config() {
+    _step "Xray VMESS WS inbound config (2 users)"
+
+    local XCONF_DIR="/usr/local/etc/xray"
+    local XUI_DB="/etc/x-ui/x-ui.db"
+    mkdir -p "$XCONF_DIR" /var/log/xray
+
+    UUID1=$(cat /proc/sys/kernel/random/uuid)
+    UUID2=$(cat /proc/sys/kernel/random/uuid)
+
+    cat > "${XCONF_DIR}/config.json.template" << XRAYEOF
+{
+  "log": {
+    "loglevel": "warning",
+    "access": "/var/log/xray/access.log",
+    "error":  "/var/log/xray/error.log"
+  },
+  "inbounds": [{
+    "tag":      "vmess-ws",
+    "port":     ${XRAY_INTERNAL_PORT},
+    "listen":   "127.0.0.1",
+    "protocol": "vmess",
+    "settings": {
+      "clients": [
+        { "id": "${UUID1}", "alterId": 0, "email": "user1@ais.th", "level": 0 },
+        { "id": "${UUID2}", "alterId": 0, "email": "user2@ais.th", "level": 0 }
+      ],
+      "disableInsecureEncryption": true
+    },
+    "streamSettings": {
+      "network": "ws",
+      "wsSettings": {
+        "path": "${WS_PATH}",
+        "headers": { "Host": "${DOMAIN}" }
+      },
+      "sockopt": {
+        "tcpKeepAliveInterval": 30,
+        "tcpKeepAliveIdle":     60
+      }
+    },
+    "sniffing": {
+      "enabled":      true,
+      "destOverride": ["http", "tls"],
+      "routeOnly":    false
+    }
+  }],
+  "outbounds": [
+    { "tag": "direct", "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" } },
+    { "tag": "block",  "protocol": "blackhole", "settings": {} }
+  ],
+  "routing": {
+    "domainStrategy": "IPIfNonMatch",
+    "rules": [
+      { "type": "field", "ip": ["geoip:private"], "outboundTag": "block" },
+      { "type": "field", "outboundTag": "direct" }
+    ]
+  },
+  "dns": { "servers": ["1.1.1.1", "8.8.8.8"] },
+  "policy": {
+    "levels": {
+      "0": { "handshakeSec": 4, "connIdle": 300, "uplinkOnly": 5, "downlinkOnly": 30, "bufferSize": 4 }
+    }
+  }
+}
+XRAYEOF
+
+    local INJECT_OK=false
+
+    if [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
+        _info "Injecting inbound เข้า 3X-UI database..."
+
+        local IB_SETTINGS="{\"clients\":[{\"id\":\"${UUID1}\",\"alterId\":0,\"email\":\"user1@ais.th\",\"level\":0},{\"id\":\"${UUID2}\",\"alterId\":0,\"email\":\"user2@ais.th\",\"level\":0}],\"disableInsecureEncryption\":true}"
+        local SS_SETTINGS="{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"${WS_PATH}\",\"headers\":{\"Host\":\"${DOMAIN}\"}},\"sockopt\":{\"tcpKeepAliveInterval\":30,\"tcpKeepAliveIdle\":60}}"
+        local SN_SETTINGS='{"enabled":true,"destOverride":["http","tls"],"routeOnly":false}'
+
+        cp "$XUI_DB" "${XUI_DB}.bak.$(date +%s)"
+
+        sqlite3 "$XUI_DB" << SQLEOF 2>> "$LOG"
+DELETE FROM inbounds WHERE port = ${XRAY_INTERNAL_PORT};
+INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate)
+VALUES (1, 0, 0, 0, 'vmess-ws-ais', 1, 0, '127.0.0.1', ${XRAY_INTERNAL_PORT}, 'vmess', '${IB_SETTINGS}', '${SS_SETTINGS}', 'vmess-ws', '${SN_SETTINGS}', '{}');
+SQLEOF
+
+        if [[ $? -eq 0 ]]; then
+            INJECT_OK=true
+            _ok "Inbound injected เข้า 3X-UI database สำเร็จ"
+        else
+            _warn "SQLite inject ล้มเหลว — fallback เขียน config ตรง"
+        fi
+    fi
+
+    if [[ "$INJECT_OK" == "false" ]]; then
+        cp "${XCONF_DIR}/config.json.template" "${XCONF_DIR}/config.json"
+        _warn "เขียน config ตรง — อาจถูก 3X-UI override ตอน restart"
+        _warn "ถ้าใช้ไม่ได้หลัง restart ให้รัน: bash vmess-ais-setup.sh inject-inbound"
+        WARN_STEPS+=("Xray config เขียนตรง — verify ใน panel ถ้า inbound หาย")
+    fi
+
+    _ok "Xray config ready"
+    _dim "User 1 UUID: ${UUID1}"
+    _dim "User 2 UUID: ${UUID2}"
+}
+
+# ── Step 10: sysctl ──────────────────────────────────────────────
+do_sysctl() {
+    _step "sysctl tuning — BBR + Low-Jitter Mobile"
+
+    cat > /etc/sysctl.d/99-vmess-ais.conf << 'SYSCTLEOF'
+net.core.default_qdisc          = fq
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_notsent_lowat      = 32768
+
+net.core.rmem_default = 131072
+net.core.rmem_max     = 2097152
+net.core.wmem_default = 131072
+net.core.wmem_max     = 2097152
+net.ipv4.tcp_rmem = 4096  87380  2097152
+net.ipv4.tcp_wmem = 4096  16384  2097152
+
+net.ipv4.tcp_keepalive_time   = 60
+net.ipv4.tcp_keepalive_intvl  = 10
+net.ipv4.tcp_keepalive_probes = 5
+
+net.ipv4.tcp_ecn            = 2
+net.ipv4.tcp_retries1       = 3
+net.ipv4.tcp_retries2       = 8
+net.ipv4.tcp_syn_retries    = 4
+net.ipv4.tcp_synack_retries = 3
+net.ipv4.tcp_mtu_probing    = 1
+net.ipv4.tcp_base_mss       = 1024
+net.ipv4.tcp_fastopen       = 3
+net.ipv4.tcp_tw_reuse        = 1
+net.ipv4.tcp_fin_timeout     = 30
+
+vm.swappiness             = 10
+vm.dirty_ratio            = 15
+vm.dirty_background_ratio = 5
+
+net.ipv4.ip_forward              = 1
+net.ipv4.conf.all.rp_filter      = 1
+net.ipv4.conf.default.rp_filter  = 1
+net.core.somaxconn               = 512
+net.ipv4.tcp_max_syn_backlog     = 256
+net.core.netdev_max_backlog      = 1000
+
+net.netfilter.nf_conntrack_max                     = 16384
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+net.netfilter.nf_conntrack_tcp_timeout_close_wait  = 60
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait    = 60
+net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 30
+SYSCTLEOF
+
+    if sysctl -p /etc/sysctl.d/99-vmess-ais.conf >> "$LOG" 2>&1; then
+        _ok "sysctl applied"
+        _dim "tcp_notsent_lowat = $(sysctl -n net.ipv4.tcp_notsent_lowat)"
+        _dim "congestion_control = $(sysctl -n net.ipv4.tcp_congestion_control)"
+    else
+        _warn "บาง sysctl อาจ apply ไม่ได้ — check log"
+        WARN_STEPS+=("sysctl บางค่า apply ไม่ได้ ดูรายละเอียดใน ${LOG}")
+    fi
+}
+
+# ── Step 11: CAKE AQM ────────────────────────────────────────────
+do_cake_aqm() {
+    _step "CAKE AQM — ลด bufferbloat โดยไม่ shape rate"
+
+    local CAKE_SCRIPT="/usr/local/bin/vmess-cake.sh"
+
+    cat > "$CAKE_SCRIPT" << 'CAKEOF'
+#!/usr/bin/env bash
+NIC="$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
+log() { logger -t vmess-cake "$*"; }
+
+[[ -z "$NIC" ]] && { log "NIC not found"; exit 1; }
+
+tc qdisc del dev "$NIC" root 2>/dev/null || true
+tc qdisc add dev "$NIC" root cake \
+    diffserv4 dual-dsthost wash ack-filter rtt 20ms noatm
+
+log "CAKE egress active on $NIC"
+
+if lsmod | grep -q ifb; then
+    ip link add ifb0 type ifb 2>/dev/null || true
+    ip link set ifb0 up 2>/dev/null || true
+    tc qdisc del dev "$NIC" ingress 2>/dev/null || true
+    tc qdisc add dev "$NIC" handle ffff: ingress
+    tc filter add dev "$NIC" parent ffff: protocol all u32 \
+        match u32 0 0 action mirred egress redirect dev ifb0
+    tc qdisc del dev ifb0 root 2>/dev/null || true
+    tc qdisc add dev ifb0 root cake \
+        diffserv4 dual-srchost wash ingress rtt 20ms noatm
+    log "CAKE ingress active on ifb0"
+else
+    log "IFB not available — egress only"
+fi
+CAKEOF
+
+    chmod +x "$CAKE_SCRIPT"
+
+    cat > /etc/systemd/system/vmess-cake.service << 'SVCEOF'
+[Unit]
+Description=CAKE AQM — VMESS AIS Mobile
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vmess-cake.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+
+    systemctl daemon-reload
+    systemctl enable vmess-cake.service
+
+    if bash "$CAKE_SCRIPT" >> "$LOG" 2>&1; then
+        _ok "CAKE AQM active"
+        if tc qdisc show dev "$NIC" 2>/dev/null | grep -q cake; then
+            _ok "Verified: CAKE running on ${NIC}"
+        fi
+    else
+        _warn "CAKE ไม่ work — fallback fq_codel"
+        tc qdisc del dev "$NIC" root 2>/dev/null || true
+        tc qdisc add dev "$NIC" root fq_codel 2>/dev/null && \
+            _ok "fq_codel fallback active" || \
+            _warn "qdisc fallback ล้มเหลวด้วย"
+        WARN_STEPS+=("CAKE ไม่ work — ใช้ fq_codel แทน")
+    fi
+}
+
+# ── Step 12: Limits ──────────────────────────────────────────────
+do_limits() {
+    _step "System limits (file descriptors)"
+
+    cat > /etc/security/limits.d/99-vmess.conf << 'LIMEOF'
+*    soft nofile 65535
+*    hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+*    soft nproc  4096
+*    hard nproc  8192
+LIMEOF
+
+    mkdir -p /etc/systemd/system.conf.d
+    cat > /etc/systemd/system.conf.d/vmess-limits.conf << 'SDLIMEOF'
+[Manager]
+DefaultLimitNOFILE=65535
+DefaultLimitNPROC=8192
+SDLIMEOF
+
+    _ok "Limits configured (65535 fd)"
+}
+
+# ── Step 13: Firewall + Start ────────────────────────────────────
+do_firewall_and_start() {
+    _step "Firewall (ufw) + Start all services"
+
+    ufw --force reset               >> "$LOG" 2>&1 || true
+    ufw allow ssh                   >> "$LOG" 2>&1 || true
+    ufw allow 80/tcp                >> "$LOG" 2>&1 || true
+    ufw allow 443/tcp               >> "$LOG" 2>&1 || true
+    ufw allow "${PANEL_PORT}/tcp"   >> "$LOG" 2>&1 || true
+    ufw --force enable              >> "$LOG" 2>&1 || true
+
+    _ok "UFW configured"
+    _dim "22    SSH"
+    _dim "80    VMESS WS plain (fallback)"
+    _dim "443   VMESS WS TLS (หลัก)"
+    _dim "${PANEL_PORT}   3X-UI panel"
+    _dim "${XRAY_INTERNAL_PORT}  Xray internal (localhost only)"
+
+    echo ""
+    _info "Starting services..."
+    _run "Start Nginx"  systemctl restart nginx  || return 1
+    _run "Enable Nginx" systemctl enable nginx   || true
+    _run "Start 3X-UI"  systemctl restart x-ui  || return 1
+    _run "Enable 3X-UI" systemctl enable x-ui   || true
+    _ok "All services started"
+}
+
+# ── inject-inbound (standalone) ──────────────────────────────────
+do_inject_inbound() {
+    local XUI_DB="/etc/x-ui/x-ui.db"
+    local XCONF_DIR="/usr/local/etc/xray"
+    echo ""
+    echo -e "${BOLD}Re-inject inbound เข้า 3X-UI database${NC}"
+    echo ""
+
+    if [[ -z "${UUID1:-}" || -z "${UUID2:-}" ]]; then
+        if [[ -f "${XCONF_DIR}/config.json.template" ]]; then
+            UUID1=$(grep -oP '"id":\s*"\K[^"]+' "${XCONF_DIR}/config.json.template" | head -1) || true
+            UUID2=$(grep -oP '"id":\s*"\K[^"]+' "${XCONF_DIR}/config.json.template" | tail -1) || true
+            DOMAIN=$(grep -oP '"Host":\s*"\K[^"]+' "${XCONF_DIR}/config.json.template" | head -1) || true
+        fi
+    fi
+
+    [[ -z "${UUID1:-}" ]] && { echo -e "${R}ไม่พบ UUID — run full install ก่อน${NC}"; return 1; }
+    [[ -f "$XUI_DB" ]]   || { echo -e "${R}3X-UI DB ไม่พบ${NC}"; return 1; }
+    command -v sqlite3 &>/dev/null || apt-get install -y sqlite3 >> "$LOG" 2>&1
+
+    cp "$XUI_DB" "${XUI_DB}.bak.$(date +%s)"
+
+    local IB_SETTINGS="{\"clients\":[{\"id\":\"${UUID1}\",\"alterId\":0,\"email\":\"user1@ais.th\",\"level\":0},{\"id\":\"${UUID2}\",\"alterId\":0,\"email\":\"user2@ais.th\",\"level\":0}],\"disableInsecureEncryption\":true}"
+    local SS_SETTINGS="{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"${WS_PATH}\",\"headers\":{\"Host\":\"${DOMAIN}\"}},\"sockopt\":{\"tcpKeepAliveInterval\":30,\"tcpKeepAliveIdle\":60}}"
+    local SN_SETTINGS='{"enabled":true,"destOverride":["http","tls"],"routeOnly":false}'
+
+    sqlite3 "$XUI_DB" << SQLEOF
+DELETE FROM inbounds WHERE port = ${XRAY_INTERNAL_PORT};
+INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate)
+VALUES (1, 0, 0, 0, 'vmess-ws-ais', 1, 0, '127.0.0.1', ${XRAY_INTERNAL_PORT}, 'vmess', '${IB_SETTINGS}', '${SS_SETTINGS}', 'vmess-ws', '${SN_SETTINGS}', '{}');
+SQLEOF
+
+    echo -e "${G}  ✔ Injected สำเร็จ — restarting x-ui${NC}"
+    systemctl restart x-ui && echo -e "${G}  ✔ x-ui restarted${NC}"
+}
+
+# ── Summary ──────────────────────────────────────────────────────
+do_summary() {
+    echo ""
+    echo -e "${BOLD}${G}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${G}║              HEALTH CHECK                            ║${NC}"
+    echo -e "${BOLD}${G}╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    for svc in nginx x-ui; do
+        systemctl is-active --quiet "$svc" && \
+            echo -e "  ${G}✔ $svc running${NC}" || \
+            echo -e "  ${R}✘ $svc NOT running${NC}  → journalctl -u $svc -n 20"
+    done
+
+    for port in 80 443 "$PANEL_PORT" "$XRAY_INTERNAL_PORT"; do
+        ss -tlnp 2>/dev/null | grep -q ":${port} " && \
+            echo -e "  ${G}✔ port $port listening${NC}" || \
+            echo -e "  ${Y}⚠ port $port ไม่ listening${NC}"
+    done
+
+    local NIC_CHK
+    NIC_CHK=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1) || true
+    tc qdisc show dev "$NIC_CHK" 2>/dev/null | grep -q "cake\|fq_codel" && \
+        echo -e "  ${G}✔ AQM active on ${NIC_CHK}${NC}" || \
+        echo -e "  ${Y}⚠ AQM ไม่พบ → bash /usr/local/bin/vmess-cake.sh${NC}"
+
+    local CC
+    CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || CC="unknown"
+    [[ "$CC" == "bbr" ]] && \
+        echo -e "  ${G}✔ BBR active${NC}" || \
+        echo -e "  ${Y}⚠ cc=$CC (BBR preferred)${NC}"
+
+    nginx -T 2>/dev/null | grep -q "fastopen" && \
+        echo -e "  ${G}✔ TCP Fast Open active บน Nginx${NC}" || \
+        echo -e "  ${Y}⚠ fastopen ไม่พบใน Nginx${NC}"
+
+    local XUI_DB="/etc/x-ui/x-ui.db"
+    if [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
+        local IB_COUNT
+        IB_COUNT=$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM inbounds WHERE port=${XRAY_INTERNAL_PORT};" 2>/dev/null) || IB_COUNT=0
+        [[ "$IB_COUNT" -gt 0 ]] && \
+            echo -e "  ${G}✔ 3X-UI inbound registered (${IB_COUNT} record)${NC}" || \
+            echo -e "  ${Y}⚠ ไม่พบ inbound ใน 3X-UI DB → bash $0 inject-inbound${NC}"
+    fi
+
+    if [[ ${#FAILED_STEPS[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "  ${R}${BOLD}━━ Failed Steps ━━${NC}"
+        for f in "${FAILED_STEPS[@]}"; do echo -e "  ${R}✘ ${f}${NC}"; done
+        echo -e "  ${DIM}Full log: ${LOG}${NC}"
+    fi
+
+    if [[ ${#WARN_STEPS[@]} -gt 0 ]]; then
+        echo ""
+        echo -e "  ${Y}${BOLD}━━ Warnings ━━${NC}"
+        for w in "${WARN_STEPS[@]}"; do echo -e "  ${Y}⚠ ${w}${NC}"; done
+    fi
+
+    echo ""
+    echo -e "${BOLD}${G}╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${BOLD}${G}║           CONNECTION INFO                            ║${NC}"
+    echo -e "${BOLD}${G}╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${BOLD}3X-UI Panel:${NC}"
+    echo -e "    ${C}http://${VPS_IP}:${PANEL_PORT}${NC}"
+    echo -e "    ${Y}Default login: admin / admin ← เปลี่ยนทันที!${NC}"
+    echo ""
+    echo -e "  ${BOLD}Port 443 (TLS — แนะนำ):${NC}"
+    echo -e "    Protocol : VMESS"
+    echo -e "    Address  : ${C}${DOMAIN}${NC}"
+    echo -e "    Port     : 443"
+    echo -e "    UUID 1   : ${C}${UUID1}${NC}"
+    echo -e "    UUID 2   : ${C}${UUID2}${NC}"
+    echo -e "    AlterID  : 0"
+    echo -e "    Security : auto"
+    echo -e "    Network  : ws"
+    echo -e "    WS Path  : ${WS_PATH}"
+    echo -e "    TLS      : tls"
+    echo -e "    SNI      : ${DOMAIN}"
+    echo ""
+    echo -e "  ${BOLD}Port 80 (plain — fallback):${NC}"
+    echo -e "    เหมือนบนทุกอย่าง ยกเว้น Port=80, TLS=none"
+    echo ""
+
+    local INFO_FILE="/root/vmess-info.txt"
+    {
+        echo "VMESS WS Connection — $(date)"
+        echo "========================================================"
+        echo "Domain : ${DOMAIN}"
+        echo "VPS IP : ${VPS_IP}"
+        echo "Panel  : http://${VPS_IP}:${PANEL_PORT}"
+        echo ""
+        echo "Port 443 (TLS):"
+        echo "  address=${DOMAIN} port=443 uuid1=${UUID1} uuid2=${UUID2}"
+        echo "  alterid=0 security=auto network=ws path=${WS_PATH} tls=tls sni=${DOMAIN}"
+        echo ""
+        echo "Port 80 (plain):"
+        echo "  address=${DOMAIN} port=80 uuid1=${UUID1} uuid2=${UUID2}"
+        echo "  alterid=0 security=auto network=ws path=${WS_PATH} tls=none"
+        [[ ${#FAILED_STEPS[@]} -gt 0 ]] && { echo ""; echo "FAILED:"; for f in "${FAILED_STEPS[@]}"; do echo "  $f"; done; }
+    } > "$INFO_FILE"
+
+    echo -e "  Saved: ${C}${INFO_FILE}${NC}"
+    echo ""
+    [[ ${#FAILED_STEPS[@]} -eq 0 ]] && \
+        echo -e "${BOLD}${G}  ✔ Setup complete!${NC}" || \
+        echo -e "${BOLD}${Y}  ⚠ Setup เสร็จแต่มี ${#FAILED_STEPS[@]} step พัง — ดูด้านบน${NC}"
+    echo ""
+    echo -e "  ${DIM}monitor: sudo bash $(realpath "$0") monitor${NC}"
+    echo -e "  ${DIM}rollback: sudo bash $(realpath "$0") rollback${NC}"
+    echo -e "  ${DIM}re-inject: sudo bash $(realpath "$0") inject-inbound${NC}"
+    echo ""
+}
+
+# ── Monitor ──────────────────────────────────────────────────────
+do_monitor() {
+    local NIC_M
+    NIC_M=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1) || true
+
+    while true; do
+        clear
+        echo -e "${BOLD}${B}╔═══════════════════════════════════════════════════════╗${NC}"
+        printf "${BOLD}${B}║${NC}${BOLD}  VMESS Monitor — ReadyIDC นนทบุรี         %s  ${BOLD}${B}║${NC}\n" "$(date '+%H:%M:%S')"
+        echo -e "${BOLD}${B}╚═══════════════════════════════════════════════════════╝${NC}"
+        echo ""
+
+        echo -e "${BOLD}  Services:${NC}"
+        for svc in nginx x-ui; do
+            systemctl is-active --quiet "$svc" && \
+                printf "    ${G}✔ %-10s running${NC}\n" "$svc" || \
+                printf "    ${R}✘ %-10s DEAD${NC}\n" "$svc"
+        done
+        echo ""
+
+        local WS_C HTTPS_C
+        WS_C=$(ss -tnp 2>/dev/null | grep -c ":${XRAY_INTERNAL_PORT} " || echo 0)
+        HTTPS_C=$(ss -tnp 2>/dev/null | grep -c ":443 " || echo 0)
+        echo -e "${BOLD}  Connections:${NC}"
+        echo -e "    Xray WS  : ${C}${WS_C}${NC}"
+        echo -e "    HTTPS    : ${C}${HTTPS_C}${NC}"
+        echo ""
+
+        echo -e "${BOLD}  Throughput (1s):${NC}"
+        local R1 T1 R2 T2
+        R1=$(cat /sys/class/net/"$NIC_M"/statistics/rx_bytes 2>/dev/null || echo 0)
+        T1=$(cat /sys/class/net/"$NIC_M"/statistics/tx_bytes 2>/dev/null || echo 0)
+        sleep 1
+        R2=$(cat /sys/class/net/"$NIC_M"/statistics/rx_bytes 2>/dev/null || echo 0)
+        T2=$(cat /sys/class/net/"$NIC_M"/statistics/tx_bytes 2>/dev/null || echo 0)
+        echo -e "    RX: ${C}$(( (R2-R1)*8/1024 )) kbps${NC}"
+        echo -e "    TX: ${C}$(( (T2-T1)*8/1024 )) kbps${NC}"
+        echo ""
+
+        echo -e "${BOLD}  CAKE:${NC}"
+        tc qdisc show dev "$NIC_M" 2>/dev/null | grep -q cake && \
+            echo -e "    ${G}✔ active${NC}" || \
+            echo -e "    ${Y}⚠ ไม่ active${NC}"
+        echo ""
+
+        echo -e "${BOLD}  TCP:${NC}"
+        local CC NL RT
+        CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || CC="?"
+        NL=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null) || NL="?"
+        RT=$(awk '/^Tcp:/{getline; print $13}' /proc/net/snmp 2>/dev/null || echo 0)
+        echo -e "    cc=$CC  notsent_lowat=${NL}  retransmits=${RT}"
+        echo ""
+
+        local MF MT
+        MF=$(free -m | awk '/^Mem:/{print $4}')
+        MT=$(free -m | awk '/^Mem:/{print $2}')
+        echo -e "${BOLD}  Memory:${NC}  ${C}${MF}/${MT} MB${NC}"
+        echo ""
+        echo -e "  ${DIM}Ctrl+C to exit${NC}"
+        sleep 2
+    done
+}
+
+# ── Status ───────────────────────────────────────────────────────
+do_status() {
+    echo ""
+    echo -e "${BOLD}Quick Status:${NC}"
+    echo ""
+
+    local NIC_S
+    NIC_S=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1) || true
+
+    for svc in nginx x-ui; do
+        systemctl is-active --quiet "$svc" && \
+            echo -e "  ${G}✔ $svc${NC}" || echo -e "  ${R}✘ $svc${NC}"
+    done
+
+    for port in 80 443 "$PANEL_PORT" "$XRAY_INTERNAL_PORT"; do
+        ss -tlnp 2>/dev/null | grep -q ":${port} " && \
+            echo -e "  ${G}✔ port $port${NC}" || \
+            echo -e "  ${Y}⚠ port $port ไม่ listen${NC}"
+    done
+
+    tc qdisc show dev "$NIC_S" 2>/dev/null | grep -q cake && \
+        echo -e "  ${G}✔ CAKE active${NC}" || echo -e "  ${Y}⚠ CAKE ไม่ active${NC}"
+
+    local CC
+    CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || CC="?"
+    [[ "$CC" == "bbr" ]] && echo -e "  ${G}✔ BBR${NC}" || echo -e "  ${Y}⚠ cc=$CC${NC}"
+
+    nginx -T 2>/dev/null | grep -q "fastopen" && \
+        echo -e "  ${G}✔ TFO on Nginx${NC}" || echo -e "  ${Y}⚠ TFO ไม่พบ${NC}"
+
+    local XUI_DB="/etc/x-ui/x-ui.db"
+    if [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
+        local IB_COUNT
+        IB_COUNT=$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM inbounds WHERE port=${XRAY_INTERNAL_PORT};" 2>/dev/null) || IB_COUNT=0
+        [[ "$IB_COUNT" -gt 0 ]] && \
+            echo -e "  ${G}✔ 3X-UI inbound OK${NC}" || \
+            echo -e "  ${Y}⚠ inbound ไม่พบ → bash $0 inject-inbound${NC}"
+    fi
+
+    echo ""
+    [[ -f /root/vmess-info.txt ]] && cat /root/vmess-info.txt
+}
+
+# ── Jitter test ──────────────────────────────────────────────────
+do_jitter() {
+    local TARGET=${2:-8.8.8.8}
+    echo ""
+    echo -e "${BOLD}Jitter Test → ${TARGET} (60 pings @ 0.2s)${NC}"
+    echo ""
+    ping -c 60 -i 0.2 "$TARGET"
+    echo ""
+    echo -e "  ${G}mdev < 3ms${NC}  excellent"
+    echo -e "  ${Y}mdev 3-10ms${NC} ยอมรับได้"
+    echo -e "  ${R}mdev > 10ms${NC} unstable"
+}
+
+# ── Rollback ─────────────────────────────────────────────────────
+do_rollback() {
+    echo ""
+    echo -e "${BOLD}${Y}Rollback — ลบ CAKE + sysctl (ไม่แตะ Nginx/Xray/cert)${NC}"
+    echo ""
+    echo -ne "  Continue? [y/N]: "
+    read -r ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { echo "Aborted."; return 0; }
+
+    local NIC_R
+    NIC_R=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1) || true
+
+    tc qdisc del dev "$NIC_R" root    2>/dev/null && echo -e "  ${G}✔ egress removed${NC}"  || true
+    tc qdisc del dev "$NIC_R" ingress 2>/dev/null && echo -e "  ${G}✔ ingress removed${NC}" || true
+    if ip link show ifb0 &>/dev/null; then
+        tc qdisc del dev ifb0 root 2>/dev/null || true
+        ip link del ifb0 2>/dev/null && echo -e "  ${G}✔ ifb0 removed${NC}" || true
+    fi
+
+    rm -f /etc/sysctl.d/99-vmess-ais.conf
+    sysctl --system >> /dev/null 2>&1 || true
+    echo -e "  ${G}✔ sysctl reset${NC}"
+
+    systemctl disable vmess-cake.service 2>/dev/null && \
+        echo -e "  ${G}✔ vmess-cake disabled${NC}" || true
+
+    echo ""
+    echo -e "  ${G}Done.${NC}"
+}
+
+# ── Main ─────────────────────────────────────────────────────────
+main_install() {
+    [[ $EUID -eq 0 ]] || { echo "Run as root: sudo bash $0"; exit 1; }
+    mkdir -p "$(dirname "$LOG")"
+    touch "$LOG"
+
+    _banner
+
+    _safe_step "Detect NIC"       do_detect_nic
+    _safe_step "Domain config"    do_get_domain
+    _safe_step "System update"    do_system_update
+    _safe_step "Kernel modules"   do_kernel_modules
+    _safe_step "Install 3X-UI"    do_install_xui
+    _safe_step "Panel port"       do_panel_port
+    _safe_step "TLS cert"         do_tls_cert
+    _safe_step "Nginx config"     do_nginx_config
+    _safe_step "Xray config"      do_xray_config
+    _safe_step "sysctl tuning"    do_sysctl
+    _safe_step "CAKE AQM"         do_cake_aqm
+    _safe_step "System limits"    do_limits
+    _safe_step "Firewall + Start" do_firewall_and_start
+
+    do_summary
+}
+
+# ── Dispatch ─────────────────────────────────────────────────────
+CMD=${1:-install}
+
+case "$CMD" in
+    install|"")      main_install ;;
+    monitor)         do_monitor ;;
+    status)          do_status ;;
+    jitter)          do_jitter "$@" ;;
+    rollback)        do_rollback ;;
+    inject-inbound)  do_inject_inbound ;;
+    cake)
+        NIC_C=$(ip route get 1.1.1.1 | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1) || true
+        tc -s qdisc show dev "$NIC_C"
+        ip link show ifb0 &>/dev/null && tc -s qdisc show dev ifb0
+        ;;
+    bbr)
+        sysctl net.ipv4.tcp_congestion_control
+        sysctl net.core.default_qdisc
+        sysctl net.ipv4.tcp_notsent_lowat
+        ss -tni 2>/dev/null | grep -E "bbr|cubic" | head -10
+        ;;
+    help|--help|-h)
+        echo ""
+        echo -e "${BOLD}Usage:${NC}  sudo bash $0 [command]"
+        echo ""
+        echo -e "  ${C}(no args)${NC}        ติดตั้ง"
+        echo -e "  ${C}monitor${NC}          live dashboard"
+        echo -e "  ${C}status${NC}           ตรวจสอบด่วน"
+        echo -e "  ${C}jitter [IP]${NC}      ทดสอบ jitter"
+        echo -e "  ${C}inject-inbound${NC}   re-inject inbound เข้า 3X-UI DB"
+        echo -e "  ${C}cake${NC}             CAKE stats"
+        echo -e "  ${C}bbr${NC}              BBR/TCP stats"
+        echo -e "  ${C}rollback${NC}         ยกเลิก tuning"
+        echo ""
+        ;;
+    *)
+        echo "Unknown: $CMD  |  bash $0 help"
+        exit 1
+        ;;
+esac
