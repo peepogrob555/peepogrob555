@@ -2,7 +2,7 @@
 set -euo pipefail
 IFS=$'\n\t'
 
-readonly SCRIPT_VER="4.4-bugfix"
+readonly SCRIPT_VER="4.5"
 readonly LOG=/var/log/3x-ui-vpn.log
 readonly BACKUP_DIR=/var/backups/3x-ui-vpn
 readonly CERT_DIR=/etc/ssl/xray
@@ -30,6 +30,8 @@ DNS_BEST=""
 DNS_BEST_MS="9999"
 QDISC_APPLIED="none"
 CAKE_AVAILABLE=0
+CAKE_SUPPORTS_TARGET=0
+CAKE_SUPPORTS_RTT_KEYWORD=0
 BBR_AVAILABLE=0
 IFB_AVAILABLE=0
 AT_JOB_ID=""
@@ -47,6 +49,8 @@ HAS_IPV6=0
 CAKE_EGRESS_BW="380mbit"
 CAKE_INGRESS_BW="900mbit"
 NIC_SPEED_MBIT=0
+# CAKE rtt preset — "internet" ≈ rtt 100ms (default), "metro" ≈ 10ms, "lan" ≈ 1ms
+CAKE_RTT="internet"
 
 log()    { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$LOG"; }
 info()   { echo -e "${BCYN}  $*${RST}";          log "INFO:  $*"; }
@@ -70,6 +74,56 @@ cleanup_on_die() {
   cancel_rollback 2>/dev/null || true
   echo -e "${BRED}Script exited with error. Check: $LOG${RST}"
   echo -e "${BYLW}If nftables is broken: reboot VPS from provider console.${RST}"
+}
+
+# Probe which CAKE timing options this kernel's iproute2 supports.
+# Priority: target/interval > rtt keyword > bare (no timing param).
+probe_cake_options() {
+  CAKE_SUPPORTS_TARGET=0
+  CAKE_SUPPORTS_RTT_KEYWORD=0
+
+  if tc qdisc add dev lo root cake bandwidth 100mbit target 5ms interval 50ms 2>/dev/null; then
+    tc qdisc del dev lo root 2>/dev/null || true
+    CAKE_SUPPORTS_TARGET=1
+    ok "CAKE timing: target/interval supported"
+    return
+  fi
+
+  if tc qdisc add dev lo root cake bandwidth 100mbit internet 2>/dev/null; then
+    tc qdisc del dev lo root 2>/dev/null || true
+    CAKE_SUPPORTS_RTT_KEYWORD=1
+    ok "CAKE timing: rtt keyword (internet/metro/lan) supported"
+    return
+  fi
+
+  if tc qdisc add dev lo root cake bandwidth 100mbit rtt 100ms 2>/dev/null; then
+    tc qdisc del dev lo root 2>/dev/null || true
+    CAKE_SUPPORTS_RTT_KEYWORD=1
+    ok "CAKE timing: rtt TIME value supported"
+    return
+  fi
+
+  warn "CAKE timing: no rtt/target param supported — using bare CAKE (kernel defaults)"
+}
+
+# Build full CAKE option string for tc qdisc add.
+# Usage: build_cake_opts <bandwidth> <rtt_keyword>
+# Outputs the option string; caller appends to tc command.
+build_cake_opts() {
+  local bw="$1" rtt_kw="$2"
+  local base="bandwidth ${bw} diffserv4 dual-srchost dual-dsthost nat wash overhead 40 mpu 64"
+
+  if [ "$CAKE_SUPPORTS_TARGET" -eq 1 ]; then
+    case "$rtt_kw" in
+      lan)        echo "${base} target 1ms  interval 10ms"  ;;
+      metro)      echo "${base} target 2ms  interval 20ms"  ;;
+      internet|*) echo "${base} target 5ms  interval 50ms"  ;;
+    esac
+  elif [ "$CAKE_SUPPORTS_RTT_KEYWORD" -eq 1 ]; then
+    echo "${base} ${rtt_kw}"
+  else
+    echo "${base}"
+  fi
 }
 
 preflight() {
@@ -129,9 +183,9 @@ detect_kernel_caps() {
     BBR_AVAILABLE=0; warn "BBR: not available — will use CUBIC"
   fi
 
-  if modprobe sch_cake >> "$LOG" 2>&1 || tc qdisc add dev lo root cake 2>/dev/null; then
+  if modprobe sch_cake >> "$LOG" 2>&1; then
     CAKE_AVAILABLE=1
-    tc qdisc del dev lo root 2>/dev/null || true
+    probe_cake_options
     ok "CAKE: available"
   else
     CAKE_AVAILABLE=0; warn "CAKE: not available — will use fq_codel fallback"
@@ -154,13 +208,11 @@ detect_kernel_caps() {
   fi
 }
 
-
 detect_bandwidth() {
   step "Bandwidth auto-detection"
 
   local nic_speed=0
 
-  # Method 1: ethtool (most reliable on KVM)
   if command -v ethtool &>/dev/null; then
     local raw
     raw=$(ethtool "$IFACE" 2>/dev/null | awk '/Speed:/{print $2}')
@@ -170,7 +222,6 @@ detect_bandwidth() {
     fi
   fi
 
-  # Method 2: /sys/class/net
   if [ "$nic_speed" -eq 0 ]; then
     local sys_speed
     sys_speed=$(cat "/sys/class/net/${IFACE}/speed" 2>/dev/null || echo 0)
@@ -178,22 +229,13 @@ detect_bandwidth() {
       && nic_speed="$sys_speed"
   fi
 
-  # Method 2b: ip link max_bandwidth field (KVM VPS often reports here)
   if [ "$nic_speed" -eq 0 ]; then
-    local ip_bw
-    ip_bw=$(ip -d link show "$IFACE" 2>/dev/null \
-      | awk '/maxchunksize|txqueuelen/{next} /altname|link/{next}'\
-      | grep -oP 'maxrate \K[0-9]+[KMG]bit' | head -1 || true)
-    if [ -z "$ip_bw" ]; then
-      # Fallback: read from ethtool advertised speeds if Speed: unknown
-      local adv
-      adv=$(ethtool "$IFACE" 2>/dev/null | awk '/Advertised link modes/{found=1} found && /[0-9]+base/{match($0,/([0-9]+)base/,a); print a[1]; exit}')
-      [[ "$adv" =~ ^[0-9]+$ ]] && nic_speed="$adv"
-    fi
+    local adv
+    adv=$(ethtool "$IFACE" 2>/dev/null \
+      | awk '/Advertised link modes/{found=1} found && /[0-9]+base/{match($0,/([0-9]+)base/,a); print a[1]; exit}')
+    [[ "$adv" =~ ^[0-9]+$ ]] && nic_speed="$adv"
   fi
 
-  # Method 2c: assume 1Gbps if VPS — most modern VPS are 1G NIC
-  # Only used as last resort before speedtest
   if [ "$nic_speed" -eq 0 ]; then
     local virt_check
     virt_check=$(systemd-detect-virt 2>/dev/null || echo none)
@@ -203,7 +245,6 @@ detect_bandwidth() {
     fi
   fi
 
-  # Method 3: speedtest-cli quick single-server test (optional, skip if slow)
   local speedtest_mbit=0
   if [ "$nic_speed" -le 0 ] && command -v speedtest-cli &>/dev/null; then
     info "Running speedtest (single server, 10s timeout)..."
@@ -215,17 +256,13 @@ detect_bandwidth() {
 
   NIC_SPEED_MBIT="$nic_speed"
 
-  # Derive CAKE bandwidths
-  # Egress: 95% of detected uplink so CAKE owns the bottleneck
-  # Ingress: capped at 950mbit (1G NIC headroom) or 2x uplink if asymmetric VPS
   if [ "$nic_speed" -gt 0 ]; then
     local egress_raw=$(( nic_speed * 95 / 100 ))
     local ingress_raw=$(( nic_speed * 95 / 100 ))
-    # Floor at 50mbit, ceil at 950mbit
-    [ "$egress_raw"  -lt 50   ] && egress_raw=50
-    [ "$egress_raw"  -gt 950  ] && egress_raw=950
-    [ "$ingress_raw" -lt 50   ] && ingress_raw=50
-    [ "$ingress_raw" -gt 950  ] && ingress_raw=950
+    [ "$egress_raw"  -lt 50  ] && egress_raw=50
+    [ "$egress_raw"  -gt 950 ] && egress_raw=950
+    [ "$ingress_raw" -lt 50  ] && ingress_raw=50
+    [ "$ingress_raw" -gt 950 ] && ingress_raw=950
     CAKE_EGRESS_BW="${egress_raw}mbit"
     CAKE_INGRESS_BW="${ingress_raw}mbit"
     ok "Auto BW: NIC ${nic_speed}Mbit → egress=${CAKE_EGRESS_BW} ingress=${CAKE_INGRESS_BW}"
@@ -287,21 +324,21 @@ collect_input() {
 
   echo ""
   echo -e "${BCYN}╔══════════════════════════════════════════════════════════════╗${RST}"
-  echo -e "${BCYN}║       3x-ui VPN PRODUCTION STACK v${SCRIPT_VER}         ║${RST}"
+  echo -e "${BCYN}║       3x-ui VPN PRODUCTION STACK v${SCRIPT_VER}           ║${RST}"
   echo -e "${BCYN}╠══════════════════════════════════════════════════════════════╣${RST}"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "DOMAIN"         "$SERVER_DOMAIN"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "SSH_PORT"       "$SSH_PORT"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "ADMIN_IP"       "${ADMIN_IP:-any (rate-limited)}"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "PROFILE"        "balanced — 2 users 200Mbps/user"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "CC"             "$cc_label"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "QDISC"          "$qdisc_label"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "INGRESS"        "$ingress_label"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "EGRESS BW"      "$CAKE_EGRESS_BW (CAKE owns queue)"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "XUI_VERSION"    "${XUI_VERSION_LABEL}"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "ROLLBACK"       "${ROLLBACK_DELAY_MIN}min auto-safety"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "SWAP"           "${SWAP_SIZE_MB}MB"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "PANEL_PORT"     "2053"
-  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "VLESS_PORT"     "443"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "DOMAIN"      "$SERVER_DOMAIN"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "SSH_PORT"    "$SSH_PORT"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "ADMIN_IP"    "${ADMIN_IP:-any (rate-limited)}"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "PROFILE"     "balanced — 2 users 200Mbps/user"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "CC"          "$cc_label"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "QDISC"       "$qdisc_label"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "INGRESS"     "$ingress_label"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "EGRESS BW"   "$CAKE_EGRESS_BW (CAKE owns queue)"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "XUI_VERSION" "${XUI_VERSION_LABEL}"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "ROLLBACK"    "${ROLLBACK_DELAY_MIN}min auto-safety"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "SWAP"        "${SWAP_SIZE_MB}MB"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "PANEL_PORT"  "2053"
+  printf "${BCYN}║${RST}  %-26s : %-32s${BCYN}║${RST}\n" "VLESS_PORT"  "443"
   echo -e "${BCYN}╚══════════════════════════════════════════════════════════════╝${RST}"
   echo ""
   printf "${BYLW}Proceed? [y/N]: ${RST}"
@@ -392,6 +429,13 @@ step_packages() {
     at \
     "linux-modules-extra-$(uname -r)" \
     || warn "Some packages unavailable — continuing"
+
+  # Re-probe CAKE after linux-modules-extra — module build may have changed
+  if modprobe sch_cake >> "$LOG" 2>&1; then
+    CAKE_AVAILABLE=1
+    probe_cake_options
+    ok "CAKE re-probed after package install"
+  fi
 
   systemctl enable --now atd >> "$LOG" 2>&1 \
     && ok "atd: enabled" || warn "atd: failed to start"
@@ -552,8 +596,6 @@ step_dns() {
 
   DNS_BEST=$(echo "$results" | head -1 | awk '{print $2}')
   DNS_BEST_MS=$(echo "$results" | head -1 | awk '{print $1}')
-  local top3
-  top3=$(echo "$results" | head -3 | awk '{print $2}')
   ok "Best DNS: $DNS_BEST (${DNS_BEST_MS}ms)"
 
   local top1 top2 top3_list
@@ -561,8 +603,6 @@ step_dns() {
   top2=$(echo "$results" | awk "NR==2{print \$2}")
   top3_list=$(echo "$results" | head -3 | awk "{print \$2}" | tr "\n" " ")
 
-  # Use systemd-resolved native (no dnsmasq, no chattr)
-  # This is safer across VPS providers and distros
   mkdir -p /etc/systemd/resolved.conf.d
   cat > /etc/systemd/resolved.conf.d/99-vpn-dns.conf << REOF
 [Resolve]
@@ -576,7 +616,6 @@ REOF
 
   must systemctl restart systemd-resolved
 
-  # Point resolv.conf at resolved stub (standard path — no chattr needed)
   local stub_link="/etc/resolv.conf"
   local resolved_stub="/run/systemd/resolve/stub-resolv.conf"
   if [ -f "$resolved_stub" ]; then
@@ -589,15 +628,16 @@ REOF
     warn "resolved stub not ready — writing top DNS directly"
   fi
 
-  # Disable NetworkManager DNS override if present (gentle — not aggressive)
   if [ -d /etc/NetworkManager/conf.d ]; then
-    printf "[main]\ndns=systemd-resolved\n"       > /etc/NetworkManager/conf.d/99-dns-resolved.conf
+    printf "[main]\ndns=systemd-resolved\n" > /etc/NetworkManager/conf.d/99-dns-resolved.conf
     run systemctl reload NetworkManager
   fi
 
   local dig_r
   dig_r=$(dig +short +time=3 google.com 2>/dev/null | head -1)
-  [ -n "$dig_r" ]     && ok "DNS resolved: google.com → $dig_r (via resolved, top DNS: $top1)"     || warn "DNS lookup failed — check systemd-resolved"
+  [ -n "$dig_r" ] \
+    && ok "DNS resolved: google.com → $dig_r (top DNS: $top1)" \
+    || warn "DNS lookup failed — check systemd-resolved"
 
   info "Top 3 DNS used: $top3_list"
   ok "[6] Done"
@@ -714,15 +754,22 @@ probe_mtu_mss() {
 step_qdisc() {
   step "[9] qdisc — CAKE + IFB ingress"
 
-  # Force-load modules now that linux-modules-extra is installed
-  modprobe sch_cake  >> "$LOG" 2>&1 && { CAKE_AVAILABLE=1; ok "sch_cake: loaded"; } \
+  modprobe sch_cake >> "$LOG" 2>&1 && { CAKE_AVAILABLE=1; ok "sch_cake: loaded"; } \
     || warn "sch_cake: still unavailable after modprobe"
-  modprobe ifb       >> "$LOG" 2>&1 && { IFB_AVAILABLE=1;  ok "ifb: loaded"; } \
+  modprobe ifb >> "$LOG" 2>&1 && { IFB_AVAILABLE=1; ok "ifb: loaded"; } \
     || warn "ifb: still unavailable after modprobe"
 
-  local cake_egress_opts="bandwidth ${CAKE_EGRESS_BW} diffserv4 dual-srchost dual-dsthost nat wash overhead 40 mpu 64 target 5ms interval 50ms"
-  local cake_ingress_opts="bandwidth ${CAKE_INGRESS_BW} diffserv4 dual-srchost dual-dsthost nat wash overhead 40 mpu 64 target 5ms interval 50ms"
+  # Re-probe timing support now module is confirmed loaded
+  [ "$CAKE_AVAILABLE" -eq 1 ] && probe_cake_options
 
+  local cake_egress_opts cake_ingress_opts
+  cake_egress_opts=$(build_cake_opts "${CAKE_EGRESS_BW}"  "${CAKE_RTT}")
+  cake_ingress_opts=$(build_cake_opts "${CAKE_INGRESS_BW}" "${CAKE_RTT}")
+
+  log "CAKE egress opts : $cake_egress_opts"
+  log "CAKE ingress opts: $cake_ingress_opts"
+
+  # Write qdisc script — bake the resolved option strings in at generation time
   cat > "$QDISC_SCRIPT" << QEOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -736,8 +783,7 @@ IFACE=\$(ip route show default 2>/dev/null | awk 'NR==1{print \$5}')
 if \$TC qdisc add dev "\$IFACE" root cake ${cake_egress_opts} 2>/dev/null; then
   echo "CAKE egress applied on \$IFACE (${CAKE_EGRESS_BW})"
 else
-  \$TC qdisc add dev "\$IFACE" root fq_codel \
-    limit 1000 target 5ms interval 50ms quantum 1514 2>/dev/null || true
+  \$TC qdisc add dev "\$IFACE" root fq_codel limit 1000 quantum 1514 2>/dev/null || true
   echo "fq_codel egress fallback on \$IFACE"
 fi
 
@@ -750,9 +796,12 @@ if modprobe ifb 2>/dev/null && ip link show ifb0 &>/dev/null; then
   \$TC filter add dev "\$IFACE" parent ffff: protocol ipv6 u32 \
     match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
   \$TC qdisc del dev ifb0 root 2>/dev/null || true
-  \$TC qdisc add dev ifb0 root cake ${cake_ingress_opts} 2>/dev/null \
-    && echo "CAKE ingress applied via ifb0 (${CAKE_INGRESS_BW})" \
-    || echo "ifb0 CAKE failed — ingress unmanaged"
+  if \$TC qdisc add dev ifb0 root cake ${cake_ingress_opts} 2>/dev/null; then
+    echo "CAKE ingress applied via ifb0 (${CAKE_INGRESS_BW})"
+  else
+    \$TC qdisc add dev ifb0 root fq_codel limit 1000 quantum 1514 2>/dev/null || true
+    echo "fq_codel ingress fallback on ifb0"
+  fi
 fi
 QEOF
   chmod +x "$QDISC_SCRIPT"
@@ -788,14 +837,13 @@ EOF
 step_nat() {
   step "[9b] Full-tunnel NAT + routing verification"
 
-  SERVER_IPV6=$(ip -6 addr show dev "$IFACE" scope global 2>/dev/null     | awk '/inet6/{print $2; exit}' | cut -d/ -f1 || true)
+  SERVER_IPV6=$(ip -6 addr show dev "$IFACE" scope global 2>/dev/null \
+    | awk '/inet6/{print $2; exit}' | cut -d/ -f1 || true)
 
   if [ -n "$SERVER_IPV6" ]; then
-    HAS_IPV6=1
-    ok "IPv6 detected: $SERVER_IPV6"
+    HAS_IPV6=1; ok "IPv6 detected: $SERVER_IPV6"
   else
-    HAS_IPV6=0
-    warn "No global IPv6 on $IFACE — IPv6 NAT will be skipped"
+    HAS_IPV6=0; warn "No global IPv6 on $IFACE — IPv6 NAT will be skipped"
   fi
 
   if ! modprobe nf_nat 2>/dev/null && ! modprobe nf_nat_ipv4 2>/dev/null; then
@@ -810,14 +858,12 @@ step_nat() {
   v4_fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
   [ "$v4_fwd" = "1" ] && ok "ip_forward: verified" || die "ip_forward not active"
 
-  local rp
-  rp=$(sysctl -n net.ipv4.conf.all.rp_filter 2>/dev/null || echo "?")
-  info "rp_filter: $rp"
-
-  ping -c1 -W3 8.8.8.8 >> "$LOG" 2>&1     && ok "Outbound IPv4: reachable" || warn "Outbound IPv4: ping failed (may be filtered)"
+  ping -c1 -W3 8.8.8.8 >> "$LOG" 2>&1 \
+    && ok "Outbound IPv4: reachable" || warn "Outbound IPv4: ping failed (may be filtered)"
 
   [ "$HAS_IPV6" -eq 1 ] && {
-    ping6 -c1 -W3 2001:4860:4860::8888 >> "$LOG" 2>&1       && ok "Outbound IPv6: reachable" || warn "Outbound IPv6: ping6 failed"
+    ping6 -c1 -W3 2001:4860:4860::8888 >> "$LOG" 2>&1 \
+      && ok "Outbound IPv6: reachable" || warn "Outbound IPv6: ping6 failed"
   }
 
   ok "[9b] Done — full-tunnel NAT ready"
@@ -883,8 +929,8 @@ table inet filter {
     ct state established,related accept
     ct state invalid drop
 
-    ip  protocol icmp  icmp  type { echo-request, echo-reply, destination-unreachable, time-exceeded } limit rate 10/second accept
-    ip6 nexthdr icmpv6 icmpv6 type { echo-request, echo-reply, destination-unreachable, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } limit rate 10/second accept
+    ip  protocol icmp   icmp  type { echo-request, echo-reply, destination-unreachable, time-exceeded } limit rate 10/second accept
+    ip6 nexthdr icmpv6  icmpv6 type { echo-request, echo-reply, destination-unreachable, time-exceeded, nd-neighbor-solicit, nd-neighbor-advert, nd-router-advert } limit rate 10/second accept
 
     ip  saddr @ssh_blocklist4 drop
     ip6 saddr @ssh_blocklist6 drop
@@ -899,7 +945,6 @@ table inet filter {
     udp dport 443 accept
 
     ${panel_rule_v4}
-
     ${panel_rule_v6}
   }
 
@@ -922,7 +967,6 @@ table inet filter {
 table ip nat {
   chain postrouting {
     type nat hook postrouting priority 100;
-
     oifname "${IFACE}" masquerade fully-random
   }
 }
@@ -930,7 +974,6 @@ table ip nat {
 table ip6 nat {
   chain postrouting {
     type nat hook postrouting priority 100;
-
     oifname "${IFACE}" masquerade fully-random
   }
 }
@@ -938,7 +981,6 @@ table ip6 nat {
 table inet mangle {
   chain prerouting {
     type filter hook prerouting priority -150;
-
     tcp dport 443 ip  dscp set cs4
     udp dport 443 ip  dscp set cs4
     tcp dport 443 ip6 dscp set cs4
@@ -947,7 +989,6 @@ table inet mangle {
 
   chain postrouting {
     type filter hook postrouting priority -150;
-
     oifname "${IFACE}" tcp flags & (syn|ack) == syn \
       tcp option maxseg size set ${COMPUTED_MSS}
   }
@@ -967,6 +1008,10 @@ NFTEOF
       && ok "Port 443 rule: present" || warn "Port 443 rule not found"
     echo "$ruleset" | grep -qE "ssh_blocklist" \
       && ok "SSH blocklist sets: present" || warn "SSH blocklist sets not found"
+    echo "$ruleset" | grep -q "masquerade" \
+      && ok "NAT masquerade: present" || warn "NAT masquerade: missing"
+    echo "$ruleset" | grep -q "ct state new oifname" \
+      && ok "Forward rule: present" || warn "Forward rule: missing"
 
     cancel_rollback
   else
@@ -1060,13 +1105,6 @@ Users: 2 — no bandwidth cap needed in panel
 CAKE dual-srchost/dsthost handles fair-share automatically
 Each user gets up to ~190 Mbps (380Mbps CAKE / 2 users)
 Gaming traffic prioritized via diffserv4 + cs4 DSCP
-
-Expected performance (client RTT 25-45ms):
-  ROV/DOTA2  : excellent  — low-latency tier in CAKE
-  Valorant   : excellent  — UDP 443 gets cs4 priority
-  YouTube    : excellent  — CAKE fills available bandwidth
-  Discord    : excellent  — voice gets cs4 tier
-  Downloads  : good       — bulk gets fair share, no starvation
 XEOF
 
   ok "[11] Done"
@@ -1079,30 +1117,30 @@ step_health_check() {
   check_pass() { ok "  CHECK ✓ $*";   (( pass++ )) || true; }
   check_fail() { warn "  CHECK ✗ $*"; (( fail++ )) || true; }
 
-  systemctl is-active x-ui      | grep -q "^active$" \
-    && check_pass "x-ui: active"           || check_fail "x-ui: not active"
-  systemctl is-active nftables   | grep -q "^active$" \
-    && check_pass "nftables: active"       || check_fail "nftables: not active"
+  systemctl is-active x-ui | grep -q "^active$" \
+    && check_pass "x-ui: active"              || check_fail "x-ui: not active"
+  systemctl is-active nftables | grep -q "^active$" \
+    && check_pass "nftables: active"          || check_fail "nftables: not active"
   systemctl is-active systemd-resolved | grep -q "^active$" \
-    && check_pass "systemd-resolved: active" || check_fail "systemd-resolved: not active"
-  systemctl is-active vpn-qdisc  | grep -q "^active$" \
-    && check_pass "vpn-qdisc: active"      || check_fail "vpn-qdisc: not active"
+    && check_pass "systemd-resolved: active"  || check_fail "systemd-resolved: not active"
+  systemctl is-active vpn-qdisc | grep -q "^active$" \
+    && check_pass "vpn-qdisc: active"         || check_fail "vpn-qdisc: not active"
 
   ss -tlnp 2>/dev/null | grep -q ":443 " \
-    && check_pass "Port 443: bound"        || check_fail "Port 443: not bound"
+    && check_pass "Port 443: bound"           || check_fail "Port 443: not bound"
   ss -tlnp 2>/dev/null | grep -q ":2053 " \
-    && check_pass "Port 2053: bound"       || check_fail "Port 2053: not bound"
+    && check_pass "Port 2053: bound"          || check_fail "Port 2053: not bound"
 
   local panel_code
   panel_code=$(curl -sk --max-time 5 -o /dev/null -w "%{http_code}" \
     "https://${SERVER_DOMAIN}:2053/" 2>/dev/null || echo "000")
   [[ "$panel_code" =~ ^(200|301|302|401|403)$ ]] \
-    && check_pass "Panel HTTP: $panel_code" || check_fail "Panel HTTP: $panel_code"
+    && check_pass "Panel HTTP: $panel_code"   || check_fail "Panel HTTP: $panel_code"
 
   local dns_r
   dns_r=$(dig +short +time=3 google.com 2>/dev/null | head -1)
   [ -n "$dns_r" ] \
-    && check_pass "DNS: google.com → $dns_r" || check_fail "DNS: lookup failed"
+    && check_pass "DNS: google.com → $dns_r"  || check_fail "DNS: lookup failed"
 
   local qdisc_active
   qdisc_active=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1{print $2}')
@@ -1112,24 +1150,22 @@ step_health_check() {
   local actual_cc
   actual_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
   [ "$actual_cc" = "bbr" ] \
-    && check_pass "TCP CC: bbr" || check_fail "TCP CC: $actual_cc (not bbr)"
+    && check_pass "TCP CC: bbr"               || check_fail "TCP CC: $actual_cc (not bbr)"
 
   nft list ruleset 2>/dev/null | grep -qE "dport.*443" \
-    && check_pass "nftables port 443" || check_fail "nftables port 443 missing"
-
+    && check_pass "nftables port 443"         || check_fail "nftables port 443 missing"
   nft list ruleset 2>/dev/null | grep -q "masquerade" \
-    && check_pass "NAT masquerade: present" || check_fail "NAT masquerade: missing"
-
+    && check_pass "NAT masquerade: present"   || check_fail "NAT masquerade: missing"
   nft list ruleset 2>/dev/null | grep -q "ct state new oifname" \
-    && check_pass "Forward rule: present" || check_fail "Forward rule: missing"
+    && check_pass "Forward rule: present"     || check_fail "Forward rule: missing"
 
   local v4_fwd
   v4_fwd=$(sysctl -n net.ipv4.ip_forward 2>/dev/null || echo 0)
   [ "$v4_fwd" = "1" ] \
-    && check_pass "ip_forward: 1" || check_fail "ip_forward: not set"
+    && check_pass "ip_forward: 1"             || check_fail "ip_forward: not set"
 
   swapon --show 2>/dev/null | grep -q "$SWAP_FILE" \
-    && check_pass "Swap: active" || check_fail "Swap: not active"
+    && check_pass "Swap: active"              || check_fail "Swap: not active"
 
   echo ""
   info "Health: ${pass} passed, ${fail} failed"
@@ -1172,43 +1208,48 @@ step_summary() {
   step "[14] Final summary"
 
   local xui_status nft_status dns_status qds_status tcp_cc tcp_qd swap_info
-  xui_status=$(systemctl is-active x-ui        2>/dev/null || echo "inactive")
-  nft_status=$(systemctl is-active nftables    2>/dev/null || echo "inactive")
+  xui_status=$(systemctl is-active x-ui             2>/dev/null || echo "inactive")
+  nft_status=$(systemctl is-active nftables         2>/dev/null || echo "inactive")
   dns_status=$(systemctl is-active systemd-resolved 2>/dev/null || echo "inactive")
-  qds_status=$(systemctl is-active vpn-qdisc   2>/dev/null || echo "inactive")
+  qds_status=$(systemctl is-active vpn-qdisc        2>/dev/null || echo "inactive")
   tcp_cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
   tcp_qd=$(tc qdisc show dev "$IFACE" 2>/dev/null | awk 'NR==1{print $2}')
   swap_info=$(swapon --show 2>/dev/null | grep -c "$SWAP_FILE" \
     && echo "${SWAP_SIZE_MB}MB active" || echo "inactive") 2>/dev/null || swap_info="inactive"
 
+  local cake_opt_label="bare (kernel defaults)"
+  [ "${CAKE_SUPPORTS_TARGET}"      -eq 1 ] && cake_opt_label="target/interval"
+  [ "${CAKE_SUPPORTS_RTT_KEYWORD}" -eq 1 ] && cake_opt_label="rtt keyword (${CAKE_RTT})"
+
   echo ""
   echo -e "${BCYN}╔══════════════════════════════════════╦════════════════════════════════════════╗${RST}"
   echo -e "${BCYN}║ Setting                              ║ Value                                  ║${RST}"
   echo -e "${BCYN}╠══════════════════════════════════════╬════════════════════════════════════════╣${RST}"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "x-ui"           "$xui_status"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Panel URL"      "https://$SERVER_DOMAIN:2053/"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Cert expires"   "$CERT_EXPIRY"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Admin IP"       "${ADMIN_IP:-any (rate-limited)}"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "x-ui"             "$xui_status"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Panel URL"        "https://$SERVER_DOMAIN:2053/"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Cert expires"     "$CERT_EXPIRY"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Admin IP"         "${ADMIN_IP:-any (rate-limited)}"
   echo -e "${BCYN}╠══════════════════════════════════════╬════════════════════════════════════════╣${RST}"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "TCP CC"         "$tcp_cc"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "qdisc egress"   "${tcp_qd} on ${IFACE} (${CAKE_EGRESS_BW})"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "qdisc ingress"  "$( ip link show ifb0 &>/dev/null 2>/dev/null && echo "CAKE on ifb0 (${CAKE_INGRESS_BW})" || echo "none" )"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "NIC speed"      "${NIC_SPEED_MBIT}Mbit → egress=${CAKE_EGRESS_BW} ingress=${CAKE_INGRESS_BW}"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "CAKE mode"      "diffserv4 dual-srchost dual-dsthost"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "NAT masquerade" "ip + ip6 → $IFACE (full tunnel)"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "TCP CC"           "$tcp_cc"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "qdisc egress"     "${tcp_qd} on ${IFACE} (${CAKE_EGRESS_BW})"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "qdisc ingress"    "$(ip link show ifb0 &>/dev/null 2>/dev/null && echo "CAKE on ifb0 (${CAKE_INGRESS_BW})" || echo "none")"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "CAKE timing mode" "$cake_opt_label"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "NIC speed"        "${NIC_SPEED_MBIT}Mbit → egress=${CAKE_EGRESS_BW} ingress=${CAKE_INGRESS_BW}"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "CAKE mode"        "diffserv4 dual-srchost dual-dsthost"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "NAT masquerade"   "ip + ip6 postrouting → $IFACE"
   local ipv6_label; [ "$HAS_IPV6" -eq 1 ] && ipv6_label="$SERVER_IPV6" || ipv6_label="none detected"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "IPv6"           "$ipv6_label"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "MSS clamp"      "${COMPUTED_MSS}"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Swap"           "$swap_info"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Conntrack max"  "$CONNTRACK_MAX"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "IPv6"             "$ipv6_label"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "MSS clamp"        "${COMPUTED_MSS}"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Swap"             "$swap_info"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Conntrack max"    "$CONNTRACK_MAX"
   echo -e "${BCYN}╠══════════════════════════════════════╬════════════════════════════════════════╣${RST}"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "nftables"       "$nft_status"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "nftables"         "$nft_status"
   printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "systemd-resolved" "$dns_status"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Best DNS"       "${DNS_BEST} (${DNS_BEST_MS}ms)"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "vpn-qdisc"      "$qds_status"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "XUI version"    "${XUI_VERSION_LABEL}"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Backup"         "$BACKUP_DIR"
-  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Log"            "$LOG"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Best DNS"         "${DNS_BEST} (${DNS_BEST_MS}ms)"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "vpn-qdisc"        "$qds_status"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "XUI version"      "${XUI_VERSION_LABEL}"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Backup"           "$BACKUP_DIR"
+  printf "${BCYN}║${RST} %-36s ${BCYN}║${RST} %-38s ${BCYN}║${RST}\n" "Log"              "$LOG"
   echo -e "${BCYN}╚══════════════════════════════════════╩════════════════════════════════════════╝${RST}"
 
   echo ""
