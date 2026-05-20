@@ -13,9 +13,9 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-# เก็บ path ของ script ตั้งแต่ต้น ก่อนที่ $0 จะกลายเป็น pipe fd
+# ต้องเก็บก่อน $0 กลายเป็น /dev/fd หรือ /proc/... ตอนรันผ่าน pipe
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
-[[ "$SCRIPT_PATH" == /proc/* ]] && SCRIPT_PATH="vmess-ais-setup.sh"
+case "$SCRIPT_PATH" in /proc/*|/dev/*) SCRIPT_PATH="vmess-ais-setup.sh" ;; esac
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m'
 B='\033[0;34m' C='\033[0;36m' M='\033[0;35m'
@@ -56,19 +56,32 @@ _spin() {
     printf "\r%60s\r" ""
 }
 
+# _run: รัน command ใน background + spinner + log output ทุก line แบบ real-time
 _run() {
     local label=$1; shift
-    "$@" >> "$LOG" 2>&1 &
+    # pipe stdout+stderr → tee → log  แล้วเก็บ exit code จาก command จริง
+    local tmp_rc
+    tmp_rc=$(mktemp)
+    (
+        "$@" 2>&1
+        echo $? > "$tmp_rc"
+    ) | while IFS= read -r line; do
+        echo "    $line"
+        echo "[$(date '+%H:%M:%S')] $line" >> "$LOG"
+    done &
     local pid=$!
-    _spin $pid "$label"
-    if wait $pid; then
+    # spinner วิ่งคู่ขนาน (แสดงแค่ตอน tty)
+    if [[ -t 1 ]]; then
+        _spin $pid "$label"
+    fi
+    wait $pid 2>/dev/null || true
+    local rc=0
+    [[ -f "$tmp_rc" ]] && rc=$(cat "$tmp_rc") || rc=1
+    rm -f "$tmp_rc"
+    if [[ $rc -eq 0 ]]; then
         _ok "$label"; return 0
     else
-        _fail "$label"
-        tail -4 "$LOG" | sed 's/^/     /' | while IFS= read -r line; do
-            echo -e "${Y}${line}${NC}"
-        done
-        return 1
+        _fail "$label"; return 1
     fi
 }
 
@@ -119,19 +132,16 @@ do_detect_nic() {
     NIC=$(ip route get 1.1.1.1 2>/dev/null \
         | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' \
         | head -1) || true
-
     if [[ -z "$NIC" ]]; then
         NIC=$(ip link show \
             | awk -F': ' '/^[0-9]+: (eth|ens|enp|eno|veth)/{print $2}' \
             | grep -v lo | head -1) || true
     fi
-
     [[ -z "$NIC" ]] && { _fail "หา NIC ไม่เจอ"; return 1; }
 
     VPS_IP=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null \
           || curl -s --max-time 8 https://ifconfig.me 2>/dev/null \
           || ip addr show "$NIC" | awk '/inet /{print $2}' | cut -d/ -f1 | head -1) || true
-
     [[ -z "$VPS_IP" ]] && { _fail "หา public IP ไม่ได้"; return 1; }
 
     _ok "Interface: ${BOLD}${NIC}${NC}  |  IP: ${BOLD}${VPS_IP}${NC}"
@@ -169,8 +179,8 @@ do_system_update() {
 
     export DEBIAN_FRONTEND=noninteractive
 
-    _run "apt-get update"   apt-get update -y || return 1
-    _run "apt-get upgrade"  apt-get upgrade -y \
+    _run "apt-get update"      apt-get update -y || return 1
+    _run "apt-get upgrade"     apt-get upgrade -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" || return 1
     _run "Installing packages" apt-get install -y \
@@ -219,46 +229,49 @@ do_install_xui() {
 
     local XUI_SCRIPT
     XUI_SCRIPT=$(mktemp /tmp/3xui-install.XXXXXX.sh)
-    if ! curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o "$XUI_SCRIPT"; then
+    if ! curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh \
+         -o "$XUI_SCRIPT" 2>>"$LOG"; then
         _fail "ดาวน์โหลด 3X-UI script ไม่ได้"
         rm -f "$XUI_SCRIPT"
         return 1
     fi
     chmod +x "$XUI_SCRIPT"
 
-    # ส่ง "0" เพื่อ skip auto-start prompt ถ้า installer ถาม
-    if echo "0" | bash "$XUI_SCRIPT" >> "$LOG" 2>&1; then
+    # รัน installer แบบ interactive — แสดง output ให้เห็น
+    # installer ถาม "Do you want to start x-ui now?" → ส่ง "n" เพราะ
+    # เราจะ start เองใน Step 13 หลัง config ครบ
+    echo ""
+    echo -e "${DIM}  ── 3X-UI installer output ────────────────────────────${NC}"
+    if echo "n" | bash "$XUI_SCRIPT" 2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
+        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
         _ok "3X-UI + Xray-core installed"
         rm -f "$XUI_SCRIPT"
     else
+        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
         rm -f "$XUI_SCRIPT"
-        _warn "3X-UI installer ล้มเหลว — ลอง latest release โดยตรง..."
-
-        # Fallback: ดึง latest release tag แล้วติดตั้งตรง
-        local LATEST
-        LATEST=$(curl -s https://api.github.com/repos/mhsanaei/3x-ui/releases/latest \
-                 | grep '"tag_name"' | cut -d'"' -f4)
-        _dim "Latest release: ${LATEST:-unknown}"
+        _warn "3X-UI installer ล้มเหลว — ลอง direct binary download..."
 
         local ARCH
         ARCH=$(uname -m)
         [[ "$ARCH" == "x86_64" ]] && ARCH="amd64" || ARCH="arm64"
 
-        local DL_URL="https://github.com/mhsanaei/3x-ui/releases/latest/download/x-ui-linux-${ARCH}.tar.gz"
         local TMP_DIR
         TMP_DIR=$(mktemp -d)
+        local DL_URL="https://github.com/mhsanaei/3x-ui/releases/latest/download/x-ui-linux-${ARCH}.tar.gz"
 
-        if curl -L "$DL_URL" -o "${TMP_DIR}/x-ui.tar.gz" >> "$LOG" 2>&1; then
-            tar -xzf "${TMP_DIR}/x-ui.tar.gz" -C "${TMP_DIR}" >> "$LOG" 2>&1 || true
+        echo -e "${DIM}    Downloading: ${DL_URL}${NC}"
+        if curl -L --progress-bar "$DL_URL" -o "${TMP_DIR}/x-ui.tar.gz" 2>&1 | tee -a "$LOG"; then
+            tar -xzf "${TMP_DIR}/x-ui.tar.gz" -C "${TMP_DIR}" 2>>"$LOG" || true
             if [[ -f "${TMP_DIR}/x-ui/x-ui" ]]; then
                 mkdir -p /usr/local/x-ui
                 cp -r "${TMP_DIR}/x-ui/"* /usr/local/x-ui/
                 ln -sf /usr/local/x-ui/x-ui /usr/bin/x-ui
-                chmod +x /usr/local/x-ui/x-ui /usr/local/x-ui/bin/xray-linux-* 2>/dev/null || true
+                chmod +x /usr/local/x-ui/x-ui
+                chmod +x /usr/local/x-ui/bin/xray-linux-* 2>/dev/null || true
                 cat > /etc/systemd/system/x-ui.service << 'XUISVC'
 [Unit]
 Description=x-ui Service
-After=network.target
+After=network.target nss-lookup.target
 
 [Service]
 Type=simple
@@ -266,20 +279,21 @@ WorkingDirectory=/usr/local/x-ui/
 ExecStart=/usr/local/x-ui/x-ui
 Restart=on-failure
 RestartSec=5
+LimitNOFILE=65535
 
 [Install]
 WantedBy=multi-user.target
 XUISVC
                 systemctl daemon-reload
-                _ok "3X-UI installed via direct download"
+                _ok "3X-UI installed via direct binary"
             else
-                _fail "ไม่พบ binary หลัง extract"
+                _fail "ไม่พบ x-ui binary หลัง extract"
                 rm -rf "$TMP_DIR"
-                WARN_STEPS+=("3X-UI install ล้มเหลวทั้ง 2 methods — ติดตั้งเองด้วย: bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)")
+                WARN_STEPS+=("3X-UI install ล้มเหลว — ติดตั้งเองด้วย: bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)")
                 return 1
             fi
         else
-            _fail "ดาวน์โหลด release binary ไม่ได้"
+            _fail "ดาวน์โหลด binary ไม่ได้"
             rm -rf "$TMP_DIR"
             WARN_STEPS+=("3X-UI install ล้มเหลว — ติดตั้งเองด้วย: bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)")
             return 1
@@ -292,28 +306,46 @@ XUISVC
 do_panel_port() {
     _step "Configure 3X-UI panel port → ${PANEL_PORT}"
 
+    # start x-ui ชั่วคราวเพื่อให้ DB initialize ก่อน
+    systemctl start x-ui 2>/dev/null || true
+    sleep 3
+
+    local XUI_DB="/etc/x-ui/x-ui.db"
+
     if command -v x-ui &>/dev/null; then
+        # x-ui setting เขียนลง DB โดยตรง ต้อง stop ก่อนแก้
+        systemctl stop x-ui 2>/dev/null || true
+        sleep 1
         x-ui setting -port "$PANEL_PORT" >> "$LOG" 2>&1 || true
-        _ok "Panel port set via x-ui CLI"
+        x-ui setting -username "admin"   >> "$LOG" 2>&1 || true
+        _ok "Panel port set via x-ui CLI: ${PANEL_PORT}"
+    elif [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
+        systemctl stop x-ui 2>/dev/null || true
+        sleep 1
+        # แก้ port โดยตรงใน settings table
+        sqlite3 "$XUI_DB" \
+            "UPDATE settings SET value='${PANEL_PORT}' WHERE key='webPort';" \
+            2>>"$LOG" || true
+        _ok "Panel port patched via SQLite: ${PANEL_PORT}"
     else
-        _warn "x-ui CLI ไม่พบ — verify panel port ใน panel หลัง login"
-        WARN_STEPS+=("x-ui CLI ไม่พบ — verify panel port ใน panel หลัง login")
+        _warn "ไม่สามารถ set panel port — x-ui DB ยังไม่ถูกสร้าง"
+        _warn "หลัง install เสร็จ ให้เข้า panel แล้วเปลี่ยน port เป็น ${PANEL_PORT} เอง"
+        WARN_STEPS+=("Panel port ยังไม่ถูก set — เปลี่ยนเองใน panel setting")
     fi
-
-    local xconf="/usr/local/x-ui/bin/config.json"
-    [[ -f "$xconf" ]] && cp "$xconf" "${xconf}.bak.$(date +%s)" || true
-
-    _ok "Panel port configured: ${PANEL_PORT}"
 }
 
 # ── Step 7: TLS cert ─────────────────────────────────────────────
 do_tls_cert() {
     _step "Let's Encrypt TLS certificate for ${DOMAIN}"
 
+    # หยุดทุกอย่างที่ใช้ port 80
     systemctl stop nginx 2>/dev/null || true
+    systemctl stop x-ui  2>/dev/null || true
     fuser -k 80/tcp 2>/dev/null || true
     sleep 2
 
+    echo ""
+    echo -e "${DIM}  ── certbot output ────────────────────────────────────${NC}"
     if certbot certonly \
         --standalone \
         --preferred-challenges http \
@@ -321,11 +353,14 @@ do_tls_cert() {
         --agree-tos \
         --email "$CERT_EMAIL" \
         -d "$DOMAIN" \
-        >> "$LOG" 2>&1; then
+        2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
+        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
         _ok "TLS cert issued"
     else
+        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
         _fail "certbot ล้มเหลว"
-        _warn "ตรวจสอบ: domain ชี้มาที่ ${VPS_IP} หรือยัง? (dig ${DOMAIN} A)"
+        _warn "ตรวจสอบ: domain ชี้มาที่ ${VPS_IP} หรือยัง?"
+        _dim  "dig ${DOMAIN} A"
         FAILED_STEPS+=("Step ${CUR_STEP}: TLS cert — domain อาจยังไม่ชี้มาที่ VPS")
         return 1
     fi
@@ -348,17 +383,16 @@ do_nginx_config() {
     local NGINX_SITE="/etc/nginx/sites-available/vmess"
 
     rm -f /etc/nginx/sites-enabled/default
+    # ลบ conf.d ที่อาจสร้างไว้จาก run ก่อนหน้า
     rm -f /etc/nginx/conf.d/vmess-tune.conf
 
-    # Patch nginx.conf http block — override ค่าที่ต้องการ ไม่สร้าง conf.d ซ้ำ
-    # sendfile/tcp_nopush/tcp_nodelay มีอยู่แล้วใน default nginx.conf
-    # เพิ่มแค่ที่ขาด: keepalive_requests, gzip off, server_tokens off
-    if ! grep -q "keepalive_requests" /etc/nginx/nginx.conf; then
+    # patch nginx.conf http block — เพิ่มเฉพาะที่ขาด
+    if ! grep -q "keepalive_requests" /etc/nginx/nginx.conf 2>/dev/null; then
         sed -i '/keepalive_timeout/a\\tkeepalive_requests 2000;' /etc/nginx/nginx.conf
     fi
-    sed -i 's/^\s*gzip\s*on/\tgzip off/'         /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/server_tokens/d'                      /etc/nginx/nginx.conf 2>/dev/null || true
-    sed -i '/keepalive_timeout/a\\tserver_tokens off;' /etc/nginx/nginx.conf 2>/dev/null || true
+    sed -i 's/^\s*gzip\s\+on\s*;/\tgzip off;/'   /etc/nginx/nginx.conf 2>/dev/null || true
+    grep -q "server_tokens" /etc/nginx/nginx.conf || \
+        sed -i '/keepalive_timeout/a\\tserver_tokens off;' /etc/nginx/nginx.conf
 
     cat > "$NGINX_SITE" << NGINXEOF
 upstream xray_ws {
@@ -436,11 +470,15 @@ NGINXEOF
 
     ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/vmess
 
+    if nginx -t 2>&1 | tee -a "$LOG" | grep -E "error|warn" | sed 's/^/    /'; then
+        :
+    fi
+
     if nginx -t >> "$LOG" 2>&1; then
         _ok "Nginx config valid"
     else
         _fail "Nginx config test ล้มเหลว"
-        tail -5 "$LOG" | sed 's/^/  /'
+        nginx -t 2>&1 | tail -5 | sed 's/^/    /'
         return 1
     fi
 }
@@ -456,6 +494,7 @@ do_xray_config() {
     UUID1=$(cat /proc/sys/kernel/random/uuid)
     UUID2=$(cat /proc/sys/kernel/random/uuid)
 
+    # เขียน template ไว้เสมอ — ใช้ fallback หรือ reference
     cat > "${XCONF_DIR}/config.json.template" << XRAYEOF
 {
   "log": {
@@ -514,33 +553,68 @@ XRAYEOF
 
     local INJECT_OK=false
 
+    # ── ลอง inject เข้า 3X-UI DB ───────────────────────────────
     if [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
         _info "Injecting inbound เข้า 3X-UI database..."
 
-        local IB_SETTINGS="{\"clients\":[{\"id\":\"${UUID1}\",\"alterId\":0,\"email\":\"user1@ais.th\",\"level\":0},{\"id\":\"${UUID2}\",\"alterId\":0,\"email\":\"user2@ais.th\",\"level\":0}],\"disableInsecureEncryption\":true}"
-        local SS_SETTINGS="{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"${WS_PATH}\",\"headers\":{\"Host\":\"${DOMAIN}\"}},\"sockopt\":{\"tcpKeepAliveInterval\":30,\"tcpKeepAliveIdle\":60}}"
-        local SN_SETTINGS='{"enabled":true,"destOverride":["http","tls"],"routeOnly":false}'
+        # ตรวจ schema จริงก่อน — version ต่างกัน column ต่างกัน
+        local HAS_ALLOCATE HAS_ENABLE
+        HAS_ALLOCATE=$(sqlite3 "$XUI_DB" \
+            "SELECT COUNT(*) FROM pragma_table_info('inbounds') WHERE name='allocate';" 2>/dev/null) || HAS_ALLOCATE=0
+        HAS_ENABLE=$(sqlite3 "$XUI_DB" \
+            "SELECT COUNT(*) FROM pragma_table_info('inbounds') WHERE name='enable';" 2>/dev/null) || HAS_ENABLE=0
+
+        local IB="{\"clients\":[{\"id\":\"${UUID1}\",\"alterId\":0,\"email\":\"user1@ais.th\",\"level\":0},{\"id\":\"${UUID2}\",\"alterId\":0,\"email\":\"user2@ais.th\",\"level\":0}],\"disableInsecureEncryption\":true}"
+        local SS="{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"${WS_PATH}\",\"headers\":{\"Host\":\"${DOMAIN}\"}},\"sockopt\":{\"tcpKeepAliveInterval\":30,\"tcpKeepAliveIdle\":60}}"
+        local SN='{"enabled":true,"destOverride":["http","tls"],"routeOnly":false}'
 
         cp "$XUI_DB" "${XUI_DB}.bak.$(date +%s)"
 
-        sqlite3 "$XUI_DB" << SQLEOF 2>> "$LOG"
+        local SQL_RC=0
+        if [[ "$HAS_ALLOCATE" -gt 0 ]]; then
+            # schema เดิม (มี allocate column)
+            sqlite3 "$XUI_DB" 2>>"$LOG" << SQLEOF || SQL_RC=$?
 DELETE FROM inbounds WHERE port = ${XRAY_INTERNAL_PORT};
 INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate)
-VALUES (1, 0, 0, 0, 'vmess-ws-ais', 1, 0, '127.0.0.1', ${XRAY_INTERNAL_PORT}, 'vmess', '${IB_SETTINGS}', '${SS_SETTINGS}', 'vmess-ws', '${SN_SETTINGS}', '{}');
+VALUES (1, 0, 0, 0, 'vmess-ws-ais', 1, 0, '127.0.0.1', ${XRAY_INTERNAL_PORT}, 'vmess', '${IB}', '${SS}', 'vmess-ws', '${SN}', '{}');
 SQLEOF
-
-        if [[ $? -eq 0 ]]; then
-            INJECT_OK=true
-            _ok "Inbound injected เข้า 3X-UI database สำเร็จ"
         else
-            _warn "SQLite inject ล้มเหลว — fallback เขียน config ตรง"
+            # schema ใหม่ (ไม่มี allocate)
+            sqlite3 "$XUI_DB" 2>>"$LOG" << SQLEOF || SQL_RC=$?
+DELETE FROM inbounds WHERE port = ${XRAY_INTERNAL_PORT};
+INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+VALUES (1, 0, 0, 0, 'vmess-ws-ais', 1, 0, '127.0.0.1', ${XRAY_INTERNAL_PORT}, 'vmess', '${IB}', '${SS}', 'vmess-ws', '${SN}');
+SQLEOF
         fi
+
+        if [[ $SQL_RC -eq 0 ]]; then
+            INJECT_OK=true
+            _ok "Inbound injected เข้า 3X-UI DB สำเร็จ"
+            _dim "Schema: allocate_col=${HAS_ALLOCATE}"
+        else
+            _warn "SQLite inject ล้มเหลว (exit ${SQL_RC}) — ดู schema จริง:"
+            sqlite3 "$XUI_DB" ".schema inbounds" 2>/dev/null | sed 's/^/    /' || true
+            _warn "Fallback: เขียน Xray config ตรง"
+        fi
+    else
+        _warn "3X-UI DB ยังไม่มี หรือไม่มี sqlite3 — ใช้ config ตรง"
     fi
 
+    # ── Fallback: เขียน config.json ตรงที่ Xray ใช้ ───────────
+    # 3X-UI version ใหม่ใช้ path: /usr/local/x-ui/bin/config.json
+    # และ symlink จาก /usr/local/etc/xray/config.json
     if [[ "$INJECT_OK" == "false" ]]; then
         cp "${XCONF_DIR}/config.json.template" "${XCONF_DIR}/config.json"
-        _warn "เขียน config ตรง — อาจถูก 3X-UI override ตอน restart"
-        _warn "ถ้าใช้ไม่ได้หลัง restart ให้รัน: bash vmess-ais-setup.sh inject-inbound"
+
+        # symlink ให้ x-ui binary เห็น config เดียวกัน
+        local XUI_CONF="/usr/local/x-ui/bin/config.json"
+        if [[ -d "/usr/local/x-ui/bin" ]]; then
+            cp "${XCONF_DIR}/config.json.template" "$XUI_CONF"
+            _dim "Copied config → ${XUI_CONF}"
+        fi
+
+        _warn "เขียน config ตรง — ถ้า inbound หายหลัง x-ui restart ให้รัน:"
+        _warn "  bash ${SCRIPT_PATH} inject-inbound"
         WARN_STEPS+=("Xray config เขียนตรง — verify ใน panel ถ้า inbound หาย")
     fi
 
@@ -590,22 +664,38 @@ net.ipv4.conf.default.rp_filter  = 1
 net.core.somaxconn               = 512
 net.ipv4.tcp_max_syn_backlog     = 256
 net.core.netdev_max_backlog      = 1000
+SYSCTLEOF
 
+    # conntrack — โหลด module ก่อนแล้ว set
+    if modprobe nf_conntrack 2>/dev/null; then
+        cat >> /etc/sysctl.d/99-vmess-ais.conf << 'CTEOF'
 net.netfilter.nf_conntrack_max                     = 16384
 net.netfilter.nf_conntrack_tcp_timeout_established = 600
 net.netfilter.nf_conntrack_tcp_timeout_close_wait  = 60
 net.netfilter.nf_conntrack_tcp_timeout_fin_wait    = 60
 net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 30
-SYSCTLEOF
-
-    if sysctl -p /etc/sysctl.d/99-vmess-ais.conf >> "$LOG" 2>&1; then
-        _ok "sysctl applied"
-        _dim "tcp_notsent_lowat = $(sysctl -n net.ipv4.tcp_notsent_lowat)"
-        _dim "congestion_control = $(sysctl -n net.ipv4.tcp_congestion_control)"
-    else
-        _warn "บาง sysctl อาจ apply ไม่ได้ — check log"
-        WARN_STEPS+=("sysctl บางค่า apply ไม่ได้ ดูรายละเอียดใน ${LOG}")
+CTEOF
     fi
+
+    local FAIL_KEYS=()
+    while IFS= read -r line; do
+        [[ "$line" =~ ^# || -z "$line" ]] && continue
+        local key val
+        key=$(echo "$line" | cut -d= -f1 | tr -d ' ')
+        val=$(echo "$line" | cut -d= -f2- | tr -d ' ')
+        if ! sysctl -w "${key}=${val}" >> "$LOG" 2>&1; then
+            FAIL_KEYS+=("$key")
+        fi
+    done < /etc/sysctl.d/99-vmess-ais.conf
+
+    if [[ ${#FAIL_KEYS[@]} -eq 0 ]]; then
+        _ok "sysctl applied ทุกค่า"
+    else
+        _warn "sysctl ที่ apply ไม่ได้: ${FAIL_KEYS[*]}"
+        _dim  "อาจ OK ถ้า kernel ไม่รองรับ"
+        WARN_STEPS+=("sysctl บางค่า apply ไม่ได้: ${FAIL_KEYS[*]}")
+    fi
+    _dim "cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)  notsent_lowat=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)"
 }
 
 # ── Step 11: CAKE AQM ────────────────────────────────────────────
@@ -618,7 +708,6 @@ do_cake_aqm() {
 #!/usr/bin/env bash
 NIC="$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
 log() { logger -t vmess-cake "$*"; }
-
 [[ -z "$NIC" ]] && { log "NIC not found"; exit 1; }
 
 tc qdisc del dev "$NIC" root 2>/dev/null || true
@@ -642,7 +731,6 @@ else
     log "IFB not available — egress only"
 fi
 CAKEOF
-
     chmod +x "$CAKE_SCRIPT"
 
     cat > /etc/systemd/system/vmess-cake.service << 'SVCEOF'
@@ -663,12 +751,15 @@ SVCEOF
     systemctl daemon-reload
     systemctl enable vmess-cake.service
 
-    if bash "$CAKE_SCRIPT" >> "$LOG" 2>&1; then
+    echo ""
+    echo -e "${DIM}  ── CAKE setup output ─────────────────────────────────${NC}"
+    if bash "$CAKE_SCRIPT" 2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
+        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
         _ok "CAKE AQM active"
-        if tc qdisc show dev "$NIC" 2>/dev/null | grep -q cake; then
+        tc qdisc show dev "$NIC" 2>/dev/null | grep -q cake && \
             _ok "Verified: CAKE running on ${NIC}"
-        fi
     else
+        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
         _warn "CAKE ไม่ work — fallback fq_codel"
         tc qdisc del dev "$NIC" root 2>/dev/null || true
         tc qdisc add dev "$NIC" root fq_codel 2>/dev/null && \
@@ -698,6 +789,7 @@ DefaultLimitNOFILE=65535
 DefaultLimitNPROC=8192
 SDLIMEOF
 
+    systemctl daemon-reload
     _ok "Limits configured (65535 fd)"
 }
 
@@ -721,11 +813,29 @@ do_firewall_and_start() {
 
     echo ""
     _info "Starting services..."
-    _run "Start Nginx"  systemctl restart nginx  || return 1
-    _run "Enable Nginx" systemctl enable nginx   || true
-    _run "Start 3X-UI"  systemctl restart x-ui  || return 1
-    _run "Enable 3X-UI" systemctl enable x-ui   || true
-    _ok "All services started"
+
+    echo ""
+    echo -e "${DIM}  ── nginx start ───────────────────────────────────────${NC}"
+    if systemctl restart nginx 2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
+        systemctl enable nginx >> "$LOG" 2>&1 || true
+        _ok "Nginx started"
+    else
+        _fail "Nginx ไม่ start — ดู log:"
+        journalctl -u nginx -n 15 --no-pager | sed 's/^/    /'
+        return 1
+    fi
+
+    echo ""
+    echo -e "${DIM}  ── x-ui start ────────────────────────────────────────${NC}"
+    if systemctl restart x-ui 2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
+        systemctl enable x-ui >> "$LOG" 2>&1 || true
+        sleep 3  # รอ x-ui initialize DB และ bind port
+        _ok "x-ui started"
+    else
+        _fail "x-ui ไม่ start — ดู log:"
+        journalctl -u x-ui -n 15 --no-pager | sed 's/^/    /'
+        return 1
+    fi
 }
 
 # ── inject-inbound (standalone) ──────────────────────────────────
@@ -750,15 +860,27 @@ do_inject_inbound() {
 
     cp "$XUI_DB" "${XUI_DB}.bak.$(date +%s)"
 
-    local IB_SETTINGS="{\"clients\":[{\"id\":\"${UUID1}\",\"alterId\":0,\"email\":\"user1@ais.th\",\"level\":0},{\"id\":\"${UUID2}\",\"alterId\":0,\"email\":\"user2@ais.th\",\"level\":0}],\"disableInsecureEncryption\":true}"
-    local SS_SETTINGS="{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"${WS_PATH}\",\"headers\":{\"Host\":\"${DOMAIN}\"}},\"sockopt\":{\"tcpKeepAliveInterval\":30,\"tcpKeepAliveIdle\":60}}"
-    local SN_SETTINGS='{"enabled":true,"destOverride":["http","tls"],"routeOnly":false}'
+    local HAS_ALLOCATE
+    HAS_ALLOCATE=$(sqlite3 "$XUI_DB" \
+        "SELECT COUNT(*) FROM pragma_table_info('inbounds') WHERE name='allocate';" 2>/dev/null) || HAS_ALLOCATE=0
 
-    sqlite3 "$XUI_DB" << SQLEOF
+    local IB="{\"clients\":[{\"id\":\"${UUID1}\",\"alterId\":0,\"email\":\"user1@ais.th\",\"level\":0},{\"id\":\"${UUID2}\",\"alterId\":0,\"email\":\"user2@ais.th\",\"level\":0}],\"disableInsecureEncryption\":true}"
+    local SS="{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"${WS_PATH}\",\"headers\":{\"Host\":\"${DOMAIN}\"}},\"sockopt\":{\"tcpKeepAliveInterval\":30,\"tcpKeepAliveIdle\":60}}"
+    local SN='{"enabled":true,"destOverride":["http","tls"],"routeOnly":false}'
+
+    if [[ "$HAS_ALLOCATE" -gt 0 ]]; then
+        sqlite3 "$XUI_DB" << SQLEOF
 DELETE FROM inbounds WHERE port = ${XRAY_INTERNAL_PORT};
 INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate)
-VALUES (1, 0, 0, 0, 'vmess-ws-ais', 1, 0, '127.0.0.1', ${XRAY_INTERNAL_PORT}, 'vmess', '${IB_SETTINGS}', '${SS_SETTINGS}', 'vmess-ws', '${SN_SETTINGS}', '{}');
+VALUES (1, 0, 0, 0, 'vmess-ws-ais', 1, 0, '127.0.0.1', ${XRAY_INTERNAL_PORT}, 'vmess', '${IB}', '${SS}', 'vmess-ws', '${SN}', '{}');
 SQLEOF
+    else
+        sqlite3 "$XUI_DB" << SQLEOF
+DELETE FROM inbounds WHERE port = ${XRAY_INTERNAL_PORT};
+INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
+VALUES (1, 0, 0, 0, 'vmess-ws-ais', 1, 0, '127.0.0.1', ${XRAY_INTERNAL_PORT}, 'vmess', '${IB}', '${SS}', 'vmess-ws', '${SN}');
+SQLEOF
+    fi
 
     echo -e "${G}  ✔ Injected สำเร็จ — restarting x-ui${NC}"
     systemctl restart x-ui && echo -e "${G}  ✔ x-ui restarted${NC}"
@@ -772,6 +894,9 @@ do_summary() {
     echo -e "${BOLD}${G}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
 
+    # wait ให้ x-ui bind port
+    sleep 2
+
     for svc in nginx x-ui; do
         systemctl is-active --quiet "$svc" && \
             echo -e "  ${G}✔ $svc running${NC}" || \
@@ -779,7 +904,7 @@ do_summary() {
     done
 
     for port in 80 443 "$PANEL_PORT" "$XRAY_INTERNAL_PORT"; do
-        ss -tlnp 2>/dev/null | grep -q ":${port} " && \
+        ss -tlnp 2>/dev/null | grep -q ":${port}[[:space:]]" && \
             echo -e "  ${G}✔ port $port listening${NC}" || \
             echo -e "  ${Y}⚠ port $port ไม่ listening${NC}"
     done
@@ -797,16 +922,17 @@ do_summary() {
         echo -e "  ${Y}⚠ cc=$CC (BBR preferred)${NC}"
 
     nginx -T 2>/dev/null | grep -q "fastopen" && \
-        echo -e "  ${G}✔ TCP Fast Open active บน Nginx${NC}" || \
-        echo -e "  ${Y}⚠ fastopen ไม่พบใน Nginx${NC}"
+        echo -e "  ${G}✔ TCP Fast Open on Nginx${NC}" || \
+        echo -e "  ${Y}⚠ fastopen ไม่พบ (Nginx < 1.21 ไม่รองรับ — ใช้งานได้ปกติ)${NC}"
 
     local XUI_DB="/etc/x-ui/x-ui.db"
     if [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
         local IB_COUNT
-        IB_COUNT=$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM inbounds WHERE port=${XRAY_INTERNAL_PORT};" 2>/dev/null) || IB_COUNT=0
+        IB_COUNT=$(sqlite3 "$XUI_DB" \
+            "SELECT COUNT(*) FROM inbounds WHERE port=${XRAY_INTERNAL_PORT};" 2>/dev/null) || IB_COUNT=0
         [[ "$IB_COUNT" -gt 0 ]] && \
             echo -e "  ${G}✔ 3X-UI inbound registered (${IB_COUNT} record)${NC}" || \
-            echo -e "  ${Y}⚠ ไม่พบ inbound ใน 3X-UI DB → bash $0 inject-inbound${NC}"
+            echo -e "  ${Y}⚠ ไม่พบ inbound ใน 3X-UI DB → bash ${SCRIPT_PATH} inject-inbound${NC}"
     fi
 
     if [[ ${#FAILED_STEPS[@]} -gt 0 ]]; then
@@ -863,7 +989,11 @@ do_summary() {
         echo "Port 80 (plain):"
         echo "  address=${DOMAIN} port=80 uuid1=${UUID1} uuid2=${UUID2}"
         echo "  alterid=0 security=auto network=ws path=${WS_PATH} tls=none"
-        [[ ${#FAILED_STEPS[@]} -gt 0 ]] && { echo ""; echo "FAILED:"; for f in "${FAILED_STEPS[@]}"; do echo "  $f"; done; }
+        [[ ${#FAILED_STEPS[@]} -gt 0 ]] && {
+            echo ""
+            echo "FAILED:"
+            for f in "${FAILED_STEPS[@]}"; do echo "  $f"; done
+        }
     } > "$INFO_FILE"
 
     echo -e "  Saved: ${C}${INFO_FILE}${NC}"
@@ -872,9 +1002,9 @@ do_summary() {
         echo -e "${BOLD}${G}  ✔ Setup complete!${NC}" || \
         echo -e "${BOLD}${Y}  ⚠ Setup เสร็จแต่มี ${#FAILED_STEPS[@]} step พัง — ดูด้านบน${NC}"
     echo ""
-    echo -e "  ${DIM}monitor: sudo bash ${SCRIPT_PATH} monitor${NC}"
-    echo -e "  ${DIM}rollback: sudo bash ${SCRIPT_PATH} rollback${NC}"
-    echo -e "  ${DIM}re-inject: sudo bash ${SCRIPT_PATH} inject-inbound${NC}"
+    echo -e "  ${DIM}monitor:      sudo bash ${SCRIPT_PATH} monitor${NC}"
+    echo -e "  ${DIM}rollback:     sudo bash ${SCRIPT_PATH} rollback${NC}"
+    echo -e "  ${DIM}inject again: sudo bash ${SCRIPT_PATH} inject-inbound${NC}"
     echo ""
 }
 
@@ -899,8 +1029,8 @@ do_monitor() {
         echo ""
 
         local WS_C HTTPS_C
-        WS_C=$(ss -tnp 2>/dev/null | grep -c ":${XRAY_INTERNAL_PORT} " || echo 0)
-        HTTPS_C=$(ss -tnp 2>/dev/null | grep -c ":443 " || echo 0)
+        WS_C=$(ss -tnp 2>/dev/null | grep -c ":${XRAY_INTERNAL_PORT}[[:space:]]" || echo 0)
+        HTTPS_C=$(ss -tnp 2>/dev/null | grep -c ":443[[:space:]]" || echo 0)
         echo -e "${BOLD}  Connections:${NC}"
         echo -e "    Xray WS  : ${C}${WS_C}${NC}"
         echo -e "    HTTPS    : ${C}${HTTPS_C}${NC}"
@@ -919,8 +1049,7 @@ do_monitor() {
 
         echo -e "${BOLD}  CAKE:${NC}"
         tc qdisc show dev "$NIC_M" 2>/dev/null | grep -q cake && \
-            echo -e "    ${G}✔ active${NC}" || \
-            echo -e "    ${Y}⚠ ไม่ active${NC}"
+            echo -e "    ${G}✔ active${NC}" || echo -e "    ${Y}⚠ ไม่ active${NC}"
         echo ""
 
         echo -e "${BOLD}  TCP:${NC}"
@@ -956,7 +1085,7 @@ do_status() {
     done
 
     for port in 80 443 "$PANEL_PORT" "$XRAY_INTERNAL_PORT"; do
-        ss -tlnp 2>/dev/null | grep -q ":${port} " && \
+        ss -tlnp 2>/dev/null | grep -q ":${port}[[:space:]]" && \
             echo -e "  ${G}✔ port $port${NC}" || \
             echo -e "  ${Y}⚠ port $port ไม่ listen${NC}"
     done
@@ -968,16 +1097,14 @@ do_status() {
     CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || CC="?"
     [[ "$CC" == "bbr" ]] && echo -e "  ${G}✔ BBR${NC}" || echo -e "  ${Y}⚠ cc=$CC${NC}"
 
-    nginx -T 2>/dev/null | grep -q "fastopen" && \
-        echo -e "  ${G}✔ TFO on Nginx${NC}" || echo -e "  ${Y}⚠ TFO ไม่พบ${NC}"
-
     local XUI_DB="/etc/x-ui/x-ui.db"
     if [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
         local IB_COUNT
-        IB_COUNT=$(sqlite3 "$XUI_DB" "SELECT COUNT(*) FROM inbounds WHERE port=${XRAY_INTERNAL_PORT};" 2>/dev/null) || IB_COUNT=0
+        IB_COUNT=$(sqlite3 "$XUI_DB" \
+            "SELECT COUNT(*) FROM inbounds WHERE port=${XRAY_INTERNAL_PORT};" 2>/dev/null) || IB_COUNT=0
         [[ "$IB_COUNT" -gt 0 ]] && \
             echo -e "  ${G}✔ 3X-UI inbound OK${NC}" || \
-            echo -e "  ${Y}⚠ inbound ไม่พบ → bash $0 inject-inbound${NC}"
+            echo -e "  ${Y}⚠ inbound ไม่พบ → bash ${SCRIPT_PATH} inject-inbound${NC}"
     fi
 
     echo ""
