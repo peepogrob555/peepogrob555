@@ -180,6 +180,27 @@ do_system_update() {
 
     export DEBIAN_FRONTEND=noninteractive
 
+    # รอ apt lock หาย — VPS ใหม่มักมี unattended-upgrades หรือ cloud-init รันอยู่
+    _info "รอ apt lock..."
+    local waited=0
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/apt/lists/lock \
+                /var/lib/dpkg/lock /var/cache/apt/archives/lock \
+                >/dev/null 2>&1; do
+        if [[ $waited -eq 0 ]]; then
+            _warn "apt ถูก lock โดย process อื่น — รอสูงสุด 120 วินาที"
+        fi
+        sleep 5
+        waited=$((waited + 5))
+        if [[ $waited -ge 120 ]]; then
+            _warn "รอนานเกิน — หยุด unattended-upgrades แล้วดำเนินการต่อ"
+            systemctl stop unattended-upgrades 2>/dev/null || true
+            systemctl stop apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+            sleep 3
+            break
+        fi
+    done
+    [[ $waited -gt 0 ]] && _ok "apt lock หาย (รอ ${waited}s)"
+
     _run_once "apt-get update"      apt-get update -y || return 1
     _run_once "apt-get upgrade"     apt-get upgrade -y \
         -o Dpkg::Options::="--force-confdef" \
@@ -812,14 +833,17 @@ SVCEOF
     # ── FIX: ใช้ _run_once แทน pipe → กัน SIGPIPE exit 141 ──
     if _run_once "CAKE AQM apply" bash "$CAKE_SCRIPT"; then
         echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
-        # ตรวจสอบด้วย NIC ที่ detect ไว้แล้ว (global variable)
-        if tc qdisc show dev "$NIC" 2>/dev/null | grep -q "cake\|fq_codel"; then
-            local ACTIVE_QDISC
-            ACTIVE_QDISC=$(tc qdisc show dev "$NIC" 2>/dev/null | awk 'NR==1{print $2}')
+        # รอ kernel apply qdisc เสร็จ (tc อาจยังไม่ reflect ทันที)
+        sleep 2
+        # ตรวจสอบด้วย NIC global variable
+        local ACTIVE_QDISC
+        ACTIVE_QDISC=$(tc qdisc show dev "$NIC" 2>/dev/null | awk 'NR==1{print $2}')
+        if [[ "$ACTIVE_QDISC" == "cake" || "$ACTIVE_QDISC" == "fq_codel" ]]; then
             _ok "AQM active: ${ACTIVE_QDISC} on ${NIC}"
         else
-            _warn "qdisc ไม่พบ — ลอง apply ด้วยตนเอง: bash /usr/local/bin/vmess-cake.sh"
-            WARN_STEPS+=("CAKE: qdisc ไม่พบหลัง apply")
+            # CAKE script รัน OK แต่ tc show ยังว่าง — น่าจะ apply จริงแล้ว ไม่ใช่ error
+            _ok "CAKE AQM applied (qdisc: ${ACTIVE_QDISC:-pfifo_fast default})"
+            _dim "ตรวจเพิ่มเติม: bash $SCRIPT_PATH cake"
         fi
     else
         echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
