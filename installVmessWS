@@ -15,7 +15,10 @@ IFS=$'\n\t'
 
 # ต้องเก็บก่อน $0 กลายเป็น /dev/fd หรือ /proc/... ตอนรันผ่าน pipe
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
-case "$SCRIPT_PATH" in /proc/*|/dev/*) SCRIPT_PATH="vmess-ais-setup.sh" ;; esac
+# ถ้ารันผ่าน pipe (bash <(curl...)) จะได้ /dev/fd/N หรือ /proc/.../fd/N
+case "$SCRIPT_PATH" in
+    /proc/*|/dev/fd/*|/dev/stdin) SCRIPT_PATH="$(pwd)/vmess-ais-setup.sh" ;;
+esac
 
 R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m'
 B='\033[0;34m' C='\033[0;36m' M='\033[0;35m'
@@ -225,52 +228,68 @@ EOF
 do_install_xui() {
     _step "Installing 3X-UI + Xray-core"
 
-    _info "ดาวน์โหลด 3X-UI installer..."
+    # ── ตรวจว่า install แล้วหรือยัง ──────────────────────────
+    if command -v x-ui &>/dev/null && systemctl list-unit-files x-ui.service &>/dev/null; then
+        _ok "3X-UI มีอยู่แล้ว — ข้าม install"
+        return 0
+    fi
 
-    local XUI_SCRIPT
-    XUI_SCRIPT=$(mktemp /tmp/3xui-install.XXXXXX.sh)
-    if ! curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh \
-         -o "$XUI_SCRIPT" 2>>"$LOG"; then
-        _fail "ดาวน์โหลด 3X-UI script ไม่ได้"
-        rm -f "$XUI_SCRIPT"
+    local ARCH
+    ARCH=$(uname -m)
+    [[ "$ARCH" == "x86_64" ]] && ARCH="amd64" || ARCH="arm64"
+
+    # ── ดึง latest version tag จาก GitHub API ──────────────────
+    _info "ตรวจ latest version..."
+    local VER
+    VER=$(curl -s --max-time 10 \
+        https://api.github.com/repos/mhsanaei/3x-ui/releases/latest \
+        | grep '"tag_name"' | cut -d'"' -f4) || VER=""
+    [[ -z "$VER" ]] && VER="latest"
+    _dim "Version: ${VER}"
+
+    local DL_URL="https://github.com/mhsanaei/3x-ui/releases/latest/download/x-ui-linux-${ARCH}.tar.gz"
+    local TMP_DIR
+    TMP_DIR=$(mktemp -d)
+
+    # ── Download ───────────────────────────────────────────────
+    _info "Downloading x-ui-linux-${ARCH}.tar.gz..."
+    echo ""
+    if ! curl -L --progress-bar "$DL_URL" \
+         -o "${TMP_DIR}/x-ui.tar.gz" 2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
+        _fail "ดาวน์โหลดล้มเหลว: ${DL_URL}"
+        rm -rf "$TMP_DIR"
         return 1
     fi
-    chmod +x "$XUI_SCRIPT"
-
-    # รัน installer แบบ interactive — แสดง output ให้เห็น
-    # installer ถาม "Do you want to start x-ui now?" → ส่ง "n" เพราะ
-    # เราจะ start เองใน Step 13 หลัง config ครบ
     echo ""
-    echo -e "${DIM}  ── 3X-UI installer output ────────────────────────────${NC}"
-    if echo "n" | bash "$XUI_SCRIPT" 2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
-        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
-        _ok "3X-UI + Xray-core installed"
-        rm -f "$XUI_SCRIPT"
-    else
-        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
-        rm -f "$XUI_SCRIPT"
-        _warn "3X-UI installer ล้มเหลว — ลอง direct binary download..."
 
-        local ARCH
-        ARCH=$(uname -m)
-        [[ "$ARCH" == "x86_64" ]] && ARCH="amd64" || ARCH="arm64"
+    # ── Extract ────────────────────────────────────────────────
+    _info "Extracting..."
+    if ! tar -xzf "${TMP_DIR}/x-ui.tar.gz" -C "${TMP_DIR}" 2>>"$LOG"; then
+        _fail "Extract ล้มเหลว — ไฟล์อาจ corrupt"
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
 
-        local TMP_DIR
-        TMP_DIR=$(mktemp -d)
-        local DL_URL="https://github.com/mhsanaei/3x-ui/releases/latest/download/x-ui-linux-${ARCH}.tar.gz"
+    [[ -f "${TMP_DIR}/x-ui/x-ui" ]] || {
+        _fail "ไม่พบ x-ui binary หลัง extract"
+        _dim  "Contents: $(ls "${TMP_DIR}/" 2>/dev/null)"
+        rm -rf "$TMP_DIR"
+        return 1
+    }
 
-        echo -e "${DIM}    Downloading: ${DL_URL}${NC}"
-        if curl -L --progress-bar "$DL_URL" -o "${TMP_DIR}/x-ui.tar.gz" 2>&1 | tee -a "$LOG"; then
-            tar -xzf "${TMP_DIR}/x-ui.tar.gz" -C "${TMP_DIR}" 2>>"$LOG" || true
-            if [[ -f "${TMP_DIR}/x-ui/x-ui" ]]; then
-                mkdir -p /usr/local/x-ui
-                cp -r "${TMP_DIR}/x-ui/"* /usr/local/x-ui/
-                ln -sf /usr/local/x-ui/x-ui /usr/bin/x-ui
-                chmod +x /usr/local/x-ui/x-ui
-                chmod +x /usr/local/x-ui/bin/xray-linux-* 2>/dev/null || true
-                cat > /etc/systemd/system/x-ui.service << 'XUISVC'
+    # ── Install files ──────────────────────────────────────────
+    systemctl stop x-ui 2>/dev/null || true
+    mkdir -p /usr/local/x-ui /etc/x-ui
+    cp -r "${TMP_DIR}/x-ui/"* /usr/local/x-ui/
+    ln -sf /usr/local/x-ui/x-ui /usr/bin/x-ui
+    chmod +x /usr/local/x-ui/x-ui
+    find /usr/local/x-ui/bin/ -name "xray-linux-*" -exec chmod +x {} \; 2>/dev/null || true
+    rm -rf "$TMP_DIR"
+
+    # ── Systemd unit ───────────────────────────────────────────
+    cat > /etc/systemd/system/x-ui.service << 'XUISVC'
 [Unit]
-Description=x-ui Service
+Description=3X-UI Panel Service
 After=network.target nss-lookup.target
 
 [Service]
@@ -280,26 +299,17 @@ ExecStart=/usr/local/x-ui/x-ui
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=65535
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 XUISVC
-                systemctl daemon-reload
-                _ok "3X-UI installed via direct binary"
-            else
-                _fail "ไม่พบ x-ui binary หลัง extract"
-                rm -rf "$TMP_DIR"
-                WARN_STEPS+=("3X-UI install ล้มเหลว — ติดตั้งเองด้วย: bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)")
-                return 1
-            fi
-        else
-            _fail "ดาวน์โหลด binary ไม่ได้"
-            rm -rf "$TMP_DIR"
-            WARN_STEPS+=("3X-UI install ล้มเหลว — ติดตั้งเองด้วย: bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)")
-            return 1
-        fi
-        rm -rf "$TMP_DIR"
-    fi
+
+    systemctl daemon-reload
+    _ok "3X-UI ${VER} installed (arch: ${ARCH})"
+    _dim "Binary: /usr/local/x-ui/x-ui"
+    _dim "Service: /etc/systemd/system/x-ui.service"
 }
 
 # ── Step 6: Panel port ───────────────────────────────────────────
@@ -341,11 +351,29 @@ do_tls_cert() {
     # หยุดทุกอย่างที่ใช้ port 80
     systemctl stop nginx 2>/dev/null || true
     systemctl stop x-ui  2>/dev/null || true
-    fuser -k 80/tcp 2>/dev/null || true
+    fuser -k 80/tcp      2>/dev/null || true
     sleep 2
+
+    # ── ตรวจ DNS ก่อนรัน certbot ──────────────────────────────
+    _info "ตรวจ DNS: ${DOMAIN} → ?"
+    local RESOLVED_IP
+    RESOLVED_IP=$(dig +short "$DOMAIN" A 2>/dev/null | tail -1) || \
+    RESOLVED_IP=$(host "$DOMAIN" 2>/dev/null | awk '/has address/{print $NF}' | tail -1) || \
+    RESOLVED_IP=""
+
+    if [[ -z "$RESOLVED_IP" ]]; then
+        _warn "DNS resolve ไม่ได้ — DDNS อาจยังไม่อัพเดต"
+    elif [[ "$RESOLVED_IP" != "$VPS_IP" ]]; then
+        _warn "DNS ชี้ไปที่ ${RESOLVED_IP} แต่ VPS IP คือ ${VPS_IP}"
+        _warn "DDNS ยังไม่อัพเดต — certbot อาจล้มเหลว"
+    else
+        _ok "DNS OK: ${DOMAIN} → ${RESOLVED_IP}"
+    fi
 
     echo ""
     echo -e "${DIM}  ── certbot output ────────────────────────────────────${NC}"
+
+    local CERT_OK=false
     if certbot certonly \
         --standalone \
         --preferred-challenges http \
@@ -354,24 +382,44 @@ do_tls_cert() {
         --email "$CERT_EMAIL" \
         -d "$DOMAIN" \
         2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
-        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
-        _ok "TLS cert issued"
-    else
-        echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
-        _fail "certbot ล้มเหลว"
-        _warn "ตรวจสอบ: domain ชี้มาที่ ${VPS_IP} หรือยัง?"
-        _dim  "dig ${DOMAIN} A"
-        FAILED_STEPS+=("Step ${CUR_STEP}: TLS cert — domain อาจยังไม่ชี้มาที่ VPS")
-        return 1
+        CERT_OK=true
+    fi
+    echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
+
+    local CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+
+    if $CERT_OK && [[ -f "$CERT_PATH" ]]; then
+        _ok "TLS cert issued (Let's Encrypt)"
+        (crontab -l 2>/dev/null; \
+         echo "30 3 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") \
+            | sort -u | crontab -
+        _ok "Auto-renewal cron configured"
+        return 0
     fi
 
-    local cert="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-    [[ -f "$cert" ]] || { _fail "cert file ไม่พบ"; return 1; }
+    # ── Fallback: self-signed cert ────────────────────────────
+    _warn "certbot ล้มเหลว — สร้าง self-signed cert แทน"
+    _warn "Nginx จะ start ได้ แต่ browser จะเตือน 'Not Secure'"
+    _warn "แก้ภายหลัง: certbot certonly --standalone -d ${DOMAIN}"
+    _dim  "สาเหตุที่พบบ่อย: DDNS ยังไม่อัพเดต IP (รอ 1-5 นาที แล้วรัน certbot อีกครั้ง)"
 
-    (crontab -l 2>/dev/null; \
-     echo "30 3 * * * certbot renew --quiet --post-hook 'systemctl reload nginx'") \
-        | sort -u | crontab -
-    _ok "Auto-renewal cron configured"
+    local SS_DIR="/etc/ssl/vmess"
+    mkdir -p "$SS_DIR"
+
+    openssl req -x509 -nodes -newkey rsa:2048 \
+        -keyout "${SS_DIR}/privkey.pem" \
+        -out    "${SS_DIR}/fullchain.pem" \
+        -days   3650 \
+        -subj   "/CN=${DOMAIN}" \
+        >> "$LOG" 2>&1 || { _fail "สร้าง self-signed cert ไม่ได้"; return 1; }
+
+    # สร้าง symlink ในตำแหน่งที่ certbot ใช้ เพื่อให้ Nginx config ไม่ต้องแก้
+    mkdir -p "/etc/letsencrypt/live/${DOMAIN}"
+    ln -sf "${SS_DIR}/fullchain.pem" "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+    ln -sf "${SS_DIR}/privkey.pem"   "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+
+    _ok "Self-signed cert สร้างแล้ว — Nginx จะ start ได้"
+    WARN_STEPS+=("ใช้ self-signed cert — รัน certbot เองหลัง DDNS อัพเดต: certbot certonly --standalone -d ${DOMAIN} && systemctl reload nginx")
 }
 
 # ── Step 8: Nginx config ─────────────────────────────────────────
@@ -1189,6 +1237,22 @@ case "$CMD" in
     jitter)          do_jitter "$@" ;;
     rollback)        do_rollback ;;
     inject-inbound)  do_inject_inbound ;;
+    certbot-renew)
+        # รัน certbot ด้วย cert จริงหลัง DDNS อัพเดตแล้ว
+        [[ -z "${2:-}" ]] && { echo "Usage: bash $0 certbot-renew <domain>"; exit 1; }
+        RENEW_DOMAIN="${2}"
+        echo -e "${BOLD}Re-issue cert สำหรับ ${RENEW_DOMAIN}${NC}"
+        systemctl stop nginx 2>/dev/null || true
+        fuser -k 80/tcp 2>/dev/null || true
+        sleep 1
+        certbot certonly --standalone --preferred-challenges http \
+            --non-interactive --agree-tos \
+            --email "${3:-admin@${RENEW_DOMAIN}}" \
+            -d "$RENEW_DOMAIN" && \
+            systemctl start nginx && \
+            echo -e "${G}  ✔ Cert issued + Nginx restarted${NC}" || \
+            echo -e "${R}  ✘ ล้มเหลว — ตรวจสอบ DNS อีกครั้ง${NC}"
+        ;;
     cake)
         NIC_C=$(ip route get 1.1.1.1 | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1) || true
         tc -s qdisc show dev "$NIC_C"
@@ -1208,8 +1272,9 @@ case "$CMD" in
         echo -e "  ${C}monitor${NC}          live dashboard"
         echo -e "  ${C}status${NC}           ตรวจสอบด่วน"
         echo -e "  ${C}jitter [IP]${NC}      ทดสอบ jitter"
-        echo -e "  ${C}inject-inbound${NC}   re-inject inbound เข้า 3X-UI DB"
-        echo -e "  ${C}cake${NC}             CAKE stats"
+        echo -e "  ${C}inject-inbound${NC}               re-inject inbound เข้า 3X-UI DB"
+        echo -e "  ${C}certbot-renew <domain> [email]${NC} ออก Let's Encrypt cert หลัง DDNS อัพเดต"
+        echo -e "  ${C}cake${NC}                          CAKE stats"
         echo -e "  ${C}bbr${NC}              BBR/TCP stats"
         echo -e "  ${C}rollback${NC}         ยกเลิก tuning"
         echo ""
