@@ -14,9 +14,11 @@ sec() { echo -e "\n${B}${C}╔════════════════�
 [[ $EUID -ne 0 ]] && { echo "Run as root: sudo bash $0"; exit 1; }
 
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+PUBIP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 echo -e "\n${B}${C}  VPS Setup — VMESS WS | AIS LTE 2 Users${N}"
-echo -e "  Interface: ${Y}$ETH${N} | IP: ${Y}$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')${N}\n"
+echo -e "  Interface: ${Y}$ETH${N} | IP: ${Y}$PUBIP${N}\n"
 
+# ─────────────────────────────────────────
 sec "STEP 1 — SWAP 512MB"
 
 if swapon --show | grep -q /swapfile; then
@@ -30,6 +32,7 @@ else
     ok "Swap 512MB created"
 fi
 
+# ─────────────────────────────────────────
 sec "STEP 2 — OPEN PORTS"
 
 PORTS=(80 443 2053 2083 2087 2096 8080 8443 54321)
@@ -60,6 +63,7 @@ else
     ok "iptables saved to /etc/iptables/rules.v4"
 fi
 
+# ─────────────────────────────────────────
 sec "STEP 3 — INSTALL 3x-ui (Official)"
 
 if systemctl is-active --quiet x-ui 2>/dev/null; then
@@ -69,6 +73,7 @@ else
     ok "3x-ui installed"
 fi
 
+# ─────────────────────────────────────────
 sec "STEP 4 — SYSTEM LIMITS"
 
 cat > /etc/security/limits.d/99-xui.conf << 'EOF'
@@ -90,6 +95,7 @@ ok "x-ui service limits set"
 echo 1000000 > /proc/sys/fs/file-max
 ok "fs.file-max=1000000 (live)"
 
+# ─────────────────────────────────────────
 sec "STEP 5 — SYSCTL KERNEL TUNING"
 
 modprobe tcp_bbr 2>/dev/null && ok "tcp_bbr loaded" || inf "tcp_bbr built-in"
@@ -122,8 +128,6 @@ net.ipv4.tcp_limit_output_bytes = 131072
 net.ipv4.tcp_keepalive_time = 20
 net.ipv4.tcp_keepalive_intvl = 5
 net.ipv4.tcp_keepalive_probes = 6
-
-net.ipv4.tcp_min_rtt_wlen = 300
 
 net.core.somaxconn = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
@@ -163,6 +167,7 @@ sysctl --system 2>&1 | grep -E "bbr|fastopen|keepalive|rmem|wmem|somaxconn|autoc
     while IFS= read -r line; do ok "sysctl: $line"; done
 ok "sysctl applied"
 
+# ─────────────────────────────────────────
 sec "STEP 6 — ETHTOOL OFFLOAD"
 
 if ! command -v ethtool &>/dev/null; then
@@ -179,9 +184,8 @@ else
     inf "ethtool not available -- skipped"
 fi
 
-ETHTOOL_PERSIST=/etc/networkd-dispatcher/routable.d/51-ethtool
 mkdir -p /etc/networkd-dispatcher/routable.d/
-cat > "$ETHTOOL_PERSIST" << 'ETEOF'
+cat > /etc/networkd-dispatcher/routable.d/51-ethtool << 'ETEOF'
 #!/bin/bash
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 ethtool -K $ETH gro off 2>/dev/null || true
@@ -189,9 +193,10 @@ ethtool -K $ETH lro off 2>/dev/null || true
 ethtool -K $ETH tso on  2>/dev/null || true
 ethtool -K $ETH gso on  2>/dev/null || true
 ETEOF
-chmod +x "$ETHTOOL_PERSIST"
+chmod +x /etc/networkd-dispatcher/routable.d/51-ethtool
 ok "ethtool persistence written"
 
+# ─────────────────────────────────────────
 sec "STEP 7 — CAKE QDISC (RTT=40ms, 1Gbps)"
 
 ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && \
@@ -202,15 +207,14 @@ modprobe sch_cake 2>/dev/null && ok "sch_cake loaded" || inf "sch_cake unavailab
 tc qdisc del dev "$ETH" root 2>/dev/null || true
 ok "old qdisc cleared"
 
-CAKE_OPTS="bandwidth 1gbit rtt 40ms besteffort no-triple-isolate split-gso nat wash"
-
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev "$ETH" root cake $CAKE_OPTS 2>/dev/null && \
-        ok "CAKE: $CAKE_OPTS" || {
+    # ลอง full opts ก่อน ถ้า kernel ไม่รองรับ flag บางตัวก็ใช้ minimal
+    tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 40ms besteffort split-gso 2>/dev/null && \
+        ok "CAKE applied: 1gbit rtt 40ms besteffort split-gso" || {
         tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 40ms besteffort 2>/dev/null && \
-            ok "CAKE minimal applied" || {
+            ok "CAKE applied: 1gbit rtt 40ms besteffort" || {
             tc qdisc add dev "$ETH" root fq_codel target 5ms interval 40ms 2>/dev/null && \
-                ok "fq_codel fallback" || err "qdisc failed"
+                ok "fq_codel fallback applied" || err "qdisc failed"
         }
     }
 else
@@ -228,7 +232,7 @@ ip link set dev $ETH txqueuelen 4096 2>/dev/null || true
 tc qdisc del dev $ETH root 2>/dev/null || true
 modprobe sch_cake 2>/dev/null
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 40ms besteffort no-triple-isolate split-gso nat wash 2>/dev/null || \
+    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 40ms besteffort split-gso 2>/dev/null || \
     tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 40ms besteffort 2>/dev/null || \
     tc qdisc add dev $ETH root fq_codel target 5ms interval 40ms 2>/dev/null
 else
@@ -238,6 +242,7 @@ BOOTEOF
 chmod +x /etc/networkd-dispatcher/routable.d/50-cake
 ok "CAKE boot persistence written"
 
+# ─────────────────────────────────────────
 sec "STEP 8 — VMESS WS SOCKOPT PATCHER"
 
 PATCHER=/usr/local/bin/xui-ws-patch.py
@@ -271,7 +276,7 @@ def patch(path):
         return 0
     inbounds = cfg.get("inbounds") or []
     if not inbounds:
-        print(f"  [{path}] no inbounds yet")
+        print(f"  [{path}] no inbounds yet — will patch after inbound is added")
         return 0
     changed = 0
     for ib in inbounds:
@@ -292,15 +297,17 @@ def patch(path):
     except OSError as e:
         print(f"  [{path}] write error: {e}")
         return 0
-    print(f"  [{path}] patched {changed} fields, {len(inbounds)} inbound(s)")
+    print(f"  [{path}] patched {changed} fields across {len(inbounds)} inbound(s)")
     return changed
 
+patched = 0
 for p in PATHS:
     if os.path.exists(p):
-        patch(p)
-        sys.exit(0)
+        patched = patch(p)
+        sys.exit(0 if patched >= 0 else 1)
 
-print("  no xray config found — will apply on next x-ui start")
+print("  no xray config found — patcher will run automatically on every x-ui start")
+sys.exit(0)
 PYEOF
 chmod +x "$PATCHER"
 ok "xui-ws-patch.py created"
@@ -310,10 +317,13 @@ cat > /etc/systemd/system/x-ui.service.d/ws-patch.conf << 'UNITEOF'
 [Service]
 ExecStartPost=/bin/bash -c 'for i in $(seq 15); do sleep 2 && python3 /usr/local/bin/xui-ws-patch.py && break; done'
 UNITEOF
-ok "sockopt auto-patcher hooked to x-ui"
+ok "sockopt auto-patcher hooked to x-ui (runs on every start)"
 
-python3 "$PATCHER" && ok "ws-patch applied now" || inf "will apply on next x-ui start"
+# รันทันที — แสดงผลตาม state จริง
+inf "running ws-patch now..."
+python3 "$PATCHER"
 
+# ─────────────────────────────────────────
 sec "STEP 9 — CPU / IRQ TUNING"
 
 ETH_IRQ=$(grep "$ETH" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ' | head -1)
@@ -333,6 +343,7 @@ else
     inf "cpufreq not exposed (host controls — normal for KVM)"
 fi
 
+# ─────────────────────────────────────────
 sec "STEP 10 — RELOAD & RESTART"
 
 systemctl daemon-reload
@@ -346,21 +357,25 @@ else
     systemctl start x-ui 2>/dev/null && ok "x-ui started" || err "x-ui start failed — check: journalctl -u x-ui"
 fi
 
+# ─────────────────────────────────────────
 sec "FINAL — VERIFY"
 
 echo ""
 inf "── Active Ports ──"
 ss -tlnp | grep -E ":(80|443|2053|2083|2087|2096|8080|8443|54321) " | \
-    while IFS= read -r line; do ok "$line"; done
+    while IFS= read -r line; do ok "$line"; done || \
+    inf "no panel ports up yet (normal if installer changed port — check x-ui settings)"
 
 inf "── Kernel ──"
-ok "cc              = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-ok "fastopen        = $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)"
-ok "autocorking     = $(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null)"
-ok "keepalive_time  = $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)s"
-ok "output_bytes    = $(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null)"
-ok "busy_poll       = $(sysctl -n net.core.busy_poll 2>/dev/null)"
-ok "nofile          = soft:$(ulimit -Sn) hard:$(ulimit -Hn)"
+ok "cc             = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+ok "fastopen       = $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)"
+ok "autocorking    = $(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null)"
+ok "keepalive_time = $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)s"
+ok "output_bytes   = $(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null)"
+ok "ecn            = $(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)"
+ok "busy_poll      = $(sysctl -n net.core.busy_poll 2>/dev/null)"
+ok "nofile         = soft:$(ulimit -Sn) hard:$(ulimit -Hn)"
+inf "note: nofile soft will be 65535 after reboot (current session inherits old limit)"
 
 inf "── qdisc ──"
 tc qdisc show dev "$ETH" | while IFS= read -r line; do ok "$line"; done
@@ -368,13 +383,20 @@ tc qdisc show dev "$ETH" | while IFS= read -r line; do ok "$line"; done
 inf "── x-ui ──"
 ok "status: $(systemctl is-active x-ui 2>/dev/null)"
 
+# ดึง panel port จริงจาก x-ui
+PANEL_PORT=$(x-ui settings 2>/dev/null | grep -i "port" | grep -oE '[0-9]{2,5}' | head -1)
+PANEL_PORT=${PANEL_PORT:-54321}
+
 echo ""
 echo -e "${G}${B}╔══════════════════════════════════════════╗${N}"
 echo -e "${G}${B}║  DONE — Setup complete!                  ║${N}"
 echo -e "${G}${B}╚══════════════════════════════════════════╝${N}"
 echo ""
-echo -e "${Y}  ▸ 3x-ui panel  : http://$(curl -s ifconfig.me 2>/dev/null):54321${N}"
-echo -e "${Y}  ▸ inbound setup : VMESS | WS | port 80 | path /ais | Host: th.speedtest.net${N}"
-echo -e "${Y}  ▸ VPS panel: เปิดพอร์ตด้านนั้นด้วยถ้ามี Firewall Rules${N}"
-echo -e "${Y}  ▸ reboot        : sudo reboot${N}"
+echo -e "${Y}  ▸ 3x-ui panel   : https://YOUR_DOMAIN:${PANEL_PORT}/YOUR_PATH${N}"
+echo -e "${Y}                    http://${PUBIP}:${PANEL_PORT}  (fallback)${N}"
+echo -e "${Y}  ▸ inbound setup  : VMESS | WS | port 80 | path /ais | Host: th.speedtest.net${N}"
+echo -e "${Y}  ▸ sockopt patcher: runs auto on every x-ui start${N}"
+echo -e "${Y}  ▸ Firewall Rules : เปิดพอร์ตใน VPS panel ด้วย${N}"
+echo -e "${Y}  ▸ reboot         : sudo reboot${N}"
+echo -e "${Y}  ▸ nofile 65535   : มีผลหลัง reboot${N}"
 echo ""
