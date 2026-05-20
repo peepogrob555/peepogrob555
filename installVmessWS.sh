@@ -351,8 +351,7 @@ server {
 }
 
 server {
-    listen 443 ssl;
-    http2  on;
+    listen 443 ssl http2;
     server_name ${DOMAIN};
 
     ssl_certificate         ${CERT_PATH};
@@ -399,9 +398,14 @@ NGINXEOF
 
     echo ""
     _info "ตรวจ nginx config..."
-    nginx -t
-    echo ""
-    _ok "Nginx config ผ่าน"
+    if nginx -t 2>&1; then
+        echo ""
+        _ok "Nginx config ผ่าน"
+    else
+        echo ""
+        _fail "Nginx config ผิดพลาด — ดู error ด้านบน"
+        return 1
+    fi
 }
 
 # ─── step 9 ───────────────────────────────────────────────────────────────────
