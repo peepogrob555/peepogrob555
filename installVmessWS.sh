@@ -452,5 +452,5 @@ run "nofile (current shell):"
 ok "soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
 
 echo -e "\n${G}${B}══════ DONE ══════${N}"
-echo -e "${Y}  ▸ เปิด port ใน VPS Panel → Firewall Rules ด้วย${N}"
+echo -e "${Y}  ▸ เปิด port ใน ReadyIDC Panel → Firewall Rules ด้วย${N}"
 echo -e "${Y}  ▸ reboot เพื่อให้ limits.conf มีผลกับทุก process${N}"
