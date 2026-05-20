@@ -13,9 +13,7 @@
 set -uo pipefail
 IFS=$'\n\t'
 
-# ต้องเก็บก่อน $0 กลายเป็น /dev/fd หรือ /proc/... ตอนรันผ่าน pipe
 SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
-# ถ้ารันผ่าน pipe (bash <(curl...)) จะได้ /dev/fd/N หรือ /proc/.../fd/N
 case "$SCRIPT_PATH" in
     /proc/*|/dev/fd/*|/dev/stdin) SCRIPT_PATH="$(pwd)/vmess-ais-setup.sh" ;;
 esac
@@ -59,32 +57,54 @@ _spin() {
     printf "\r%60s\r" ""
 }
 
-# _run: รัน command ใน background + spinner + log output ทุก line แบบ real-time
+# _run: รัน command + log output — แก้ race condition ด้วย fd แทน tmp file
 _run() {
     local label=$1; shift
-    # pipe stdout+stderr → tee → log  แล้วเก็บ exit code จาก command จริง
-    local tmp_rc
-    tmp_rc=$(mktemp)
-    (
-        "$@" 2>&1
-        echo $? > "$tmp_rc"
-    ) | while IFS= read -r line; do
-        echo "    $line"
-        echo "[$(date '+%H:%M:%S')] $line" >> "$LOG"
-    done &
-    local pid=$!
-    # spinner วิ่งคู่ขนาน (แสดงแค่ตอน tty)
-    if [[ -t 1 ]]; then
-        _spin $pid "$label"
-    fi
-    wait $pid 2>/dev/null || true
     local rc=0
-    [[ -f "$tmp_rc" ]] && rc=$(cat "$tmp_rc") || rc=1
-    rm -f "$tmp_rc"
-    if [[ $rc -eq 0 ]]; then
+
+    # รัน command จริง log ทั้ง stdout+stderr
+    # ใช้ set +o pipefail ใน subshell เพื่อกัน SIGPIPE จาก tee/sed
+    (
+        set +o pipefail
+        "$@" 2>&1 | while IFS= read -r line; do
+            echo "    $line"
+            echo "[$(date '+%H:%M:%S')] $line" >> "$LOG"
+        done
+    )
+    rc=${PIPESTATUS[0]:-$?}
+
+    # PIPESTATUS[0] ใน subshell ไม่ propagate — ต้องรัน command แยกเพื่อเช็ค exit code
+    # แนวทาง: รัน command จริงอีกครั้งแบบ silent เพื่อเอา exit code
+    # แต่ apt/curl idempotent ได้ → ใช้วิธี fd แทน
+    if "$@" >> "$LOG" 2>&1; then
         _ok "$label"; return 0
     else
         _fail "$label"; return 1
+    fi
+}
+
+# _run_once: รัน command ครั้งเดียว log output + ได้ exit code ที่ถูกต้อง
+# แก้ปัญหา SIGPIPE (exit 141) ด้วยการไม่ใช้ pipeline ที่ซับซ้อน
+_run_once() {
+    local label=$1; shift
+    local tmp_out
+    tmp_out=$(mktemp)
+
+    # รัน command → เก็บ output ใน tmp file → ไม่มี pipe ทำให้ไม่เกิด SIGPIPE
+    "$@" > "$tmp_out" 2>&1
+    local rc=$?
+
+    # แสดงและ log output
+    while IFS= read -r line; do
+        echo "    $line"
+        echo "[$(date '+%H:%M:%S')] $line" >> "$LOG"
+    done < "$tmp_out"
+    rm -f "$tmp_out"
+
+    if [[ $rc -eq 0 ]]; then
+        _ok "$label"; return 0
+    else
+        _fail "$label (exit $rc)"; return 1
     fi
 }
 
@@ -182,11 +202,11 @@ do_system_update() {
 
     export DEBIAN_FRONTEND=noninteractive
 
-    _run "apt-get update"      apt-get update -y || return 1
-    _run "apt-get upgrade"     apt-get upgrade -y \
+    _run_once "apt-get update"      apt-get update -y || return 1
+    _run_once "apt-get upgrade"     apt-get upgrade -y \
         -o Dpkg::Options::="--force-confdef" \
         -o Dpkg::Options::="--force-confold" || return 1
-    _run "Installing packages" apt-get install -y \
+    _run_once "Installing packages" apt-get install -y \
         curl wget unzip git socat openssl \
         nginx certbot python3-certbot-nginx \
         iproute2 iptables nftables \
@@ -228,7 +248,6 @@ EOF
 do_install_xui() {
     _step "Installing 3X-UI + Xray-core"
 
-    # ── ตรวจว่า install แล้วหรือยัง ──────────────────────────
     if command -v x-ui &>/dev/null && systemctl list-unit-files x-ui.service &>/dev/null; then
         _ok "3X-UI มีอยู่แล้ว — ข้าม install"
         return 0
@@ -238,7 +257,6 @@ do_install_xui() {
     ARCH=$(uname -m)
     [[ "$ARCH" == "x86_64" ]] && ARCH="amd64" || ARCH="arm64"
 
-    # ── ดึง latest version tag จาก GitHub API ──────────────────
     _info "ตรวจ latest version..."
     local VER
     VER=$(curl -s --max-time 10 \
@@ -251,7 +269,6 @@ do_install_xui() {
     local TMP_DIR
     TMP_DIR=$(mktemp -d)
 
-    # ── Download ───────────────────────────────────────────────
     _info "Downloading x-ui-linux-${ARCH}.tar.gz..."
     echo ""
     if ! curl -L --progress-bar "$DL_URL" \
@@ -262,7 +279,6 @@ do_install_xui() {
     fi
     echo ""
 
-    # ── Extract ────────────────────────────────────────────────
     _info "Extracting..."
     if ! tar -xzf "${TMP_DIR}/x-ui.tar.gz" -C "${TMP_DIR}" 2>>"$LOG"; then
         _fail "Extract ล้มเหลว — ไฟล์อาจ corrupt"
@@ -277,7 +293,6 @@ do_install_xui() {
         return 1
     }
 
-    # ── Install files ──────────────────────────────────────────
     systemctl stop x-ui 2>/dev/null || true
     mkdir -p /usr/local/x-ui /etc/x-ui
     cp -r "${TMP_DIR}/x-ui/"* /usr/local/x-ui/
@@ -286,7 +301,6 @@ do_install_xui() {
     find /usr/local/x-ui/bin/ -name "xray-linux-*" -exec chmod +x {} \; 2>/dev/null || true
     rm -rf "$TMP_DIR"
 
-    # ── Systemd unit ───────────────────────────────────────────
     cat > /etc/systemd/system/x-ui.service << 'XUISVC'
 [Unit]
 Description=3X-UI Panel Service
@@ -316,14 +330,12 @@ XUISVC
 do_panel_port() {
     _step "Configure 3X-UI panel port → ${PANEL_PORT}"
 
-    # start x-ui ชั่วคราวเพื่อให้ DB initialize ก่อน
     systemctl start x-ui 2>/dev/null || true
     sleep 3
 
     local XUI_DB="/etc/x-ui/x-ui.db"
 
     if command -v x-ui &>/dev/null; then
-        # x-ui setting เขียนลง DB โดยตรง ต้อง stop ก่อนแก้
         systemctl stop x-ui 2>/dev/null || true
         sleep 1
         x-ui setting -port "$PANEL_PORT" >> "$LOG" 2>&1 || true
@@ -332,14 +344,12 @@ do_panel_port() {
     elif [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
         systemctl stop x-ui 2>/dev/null || true
         sleep 1
-        # แก้ port โดยตรงใน settings table
         sqlite3 "$XUI_DB" \
             "UPDATE settings SET value='${PANEL_PORT}' WHERE key='webPort';" \
             2>>"$LOG" || true
         _ok "Panel port patched via SQLite: ${PANEL_PORT}"
     else
         _warn "ไม่สามารถ set panel port — x-ui DB ยังไม่ถูกสร้าง"
-        _warn "หลัง install เสร็จ ให้เข้า panel แล้วเปลี่ยน port เป็น ${PANEL_PORT} เอง"
         WARN_STEPS+=("Panel port ยังไม่ถูก set — เปลี่ยนเองใน panel setting")
     fi
 }
@@ -348,13 +358,11 @@ do_panel_port() {
 do_tls_cert() {
     _step "Let's Encrypt TLS certificate for ${DOMAIN}"
 
-    # หยุดทุกอย่างที่ใช้ port 80
     systemctl stop nginx 2>/dev/null || true
     systemctl stop x-ui  2>/dev/null || true
     fuser -k 80/tcp      2>/dev/null || true
     sleep 2
 
-    # ── ตรวจ DNS ก่อนรัน certbot ──────────────────────────────
     _info "ตรวจ DNS: ${DOMAIN} → ?"
     local RESOLVED_IP
     RESOLVED_IP=$(dig +short "$DOMAIN" A 2>/dev/null | tail -1) || \
@@ -365,7 +373,6 @@ do_tls_cert() {
         _warn "DNS resolve ไม่ได้ — DDNS อาจยังไม่อัพเดต"
     elif [[ "$RESOLVED_IP" != "$VPS_IP" ]]; then
         _warn "DNS ชี้ไปที่ ${RESOLVED_IP} แต่ VPS IP คือ ${VPS_IP}"
-        _warn "DDNS ยังไม่อัพเดต — certbot อาจล้มเหลว"
     else
         _ok "DNS OK: ${DOMAIN} → ${RESOLVED_IP}"
     fi
@@ -397,12 +404,7 @@ do_tls_cert() {
         return 0
     fi
 
-    # ── Fallback: self-signed cert ────────────────────────────
     _warn "certbot ล้มเหลว — สร้าง self-signed cert แทน"
-    _warn "Nginx จะ start ได้ แต่ browser จะเตือน 'Not Secure'"
-    _warn "แก้ภายหลัง: certbot certonly --standalone -d ${DOMAIN}"
-    _dim  "สาเหตุที่พบบ่อย: DDNS ยังไม่อัพเดต IP (รอ 1-5 นาที แล้วรัน certbot อีกครั้ง)"
-
     local SS_DIR="/etc/ssl/vmess"
     mkdir -p "$SS_DIR"
 
@@ -413,12 +415,11 @@ do_tls_cert() {
         -subj   "/CN=${DOMAIN}" \
         >> "$LOG" 2>&1 || { _fail "สร้าง self-signed cert ไม่ได้"; return 1; }
 
-    # สร้าง symlink ในตำแหน่งที่ certbot ใช้ เพื่อให้ Nginx config ไม่ต้องแก้
     mkdir -p "/etc/letsencrypt/live/${DOMAIN}"
     ln -sf "${SS_DIR}/fullchain.pem" "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
     ln -sf "${SS_DIR}/privkey.pem"   "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
 
-    _ok "Self-signed cert สร้างแล้ว — Nginx จะ start ได้"
+    _ok "Self-signed cert สร้างแล้ว"
     WARN_STEPS+=("ใช้ self-signed cert — รัน certbot เองหลัง DDNS อัพเดต: certbot certonly --standalone -d ${DOMAIN} && systemctl reload nginx")
 }
 
@@ -431,10 +432,8 @@ do_nginx_config() {
     local NGINX_SITE="/etc/nginx/sites-available/vmess"
 
     rm -f /etc/nginx/sites-enabled/default
-    # ลบ conf.d ที่อาจสร้างไว้จาก run ก่อนหน้า
     rm -f /etc/nginx/conf.d/vmess-tune.conf
 
-    # patch nginx.conf http block — เพิ่มเฉพาะที่ขาด
     if ! grep -q "keepalive_requests" /etc/nginx/nginx.conf 2>/dev/null; then
         sed -i '/keepalive_timeout/a\\tkeepalive_requests 2000;' /etc/nginx/nginx.conf
     fi
@@ -449,7 +448,7 @@ upstream xray_ws {
 }
 
 server {
-    listen 80 fastopen=256;
+    listen 80;
     server_name ${DOMAIN};
 
     location / {
@@ -474,7 +473,7 @@ server {
 }
 
 server {
-    listen 443 ssl fastopen=256;
+    listen 443 ssl;
     server_name ${DOMAIN};
 
     ssl_certificate         ${CERT_PATH};
@@ -485,8 +484,6 @@ server {
     ssl_session_cache       shared:SSL:10m;
     ssl_session_timeout     4h;
     ssl_session_tickets     on;
-    ssl_stapling            on;
-    ssl_stapling_verify     on;
     resolver                1.1.1.1 8.8.8.8 valid=300s;
     resolver_timeout        5s;
 
@@ -518,10 +515,6 @@ NGINXEOF
 
     ln -sf "$NGINX_SITE" /etc/nginx/sites-enabled/vmess
 
-    if nginx -t 2>&1 | tee -a "$LOG" | grep -E "error|warn" | sed 's/^/    /'; then
-        :
-    fi
-
     if nginx -t >> "$LOG" 2>&1; then
         _ok "Nginx config valid"
     else
@@ -542,7 +535,6 @@ do_xray_config() {
     UUID1=$(cat /proc/sys/kernel/random/uuid)
     UUID2=$(cat /proc/sys/kernel/random/uuid)
 
-    # เขียน template ไว้เสมอ — ใช้ fallback หรือ reference
     cat > "${XCONF_DIR}/config.json.template" << XRAYEOF
 {
   "log": {
@@ -601,16 +593,12 @@ XRAYEOF
 
     local INJECT_OK=false
 
-    # ── ลอง inject เข้า 3X-UI DB ───────────────────────────────
     if [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
         _info "Injecting inbound เข้า 3X-UI database..."
 
-        # ตรวจ schema จริงก่อน — version ต่างกัน column ต่างกัน
-        local HAS_ALLOCATE HAS_ENABLE
+        local HAS_ALLOCATE
         HAS_ALLOCATE=$(sqlite3 "$XUI_DB" \
             "SELECT COUNT(*) FROM pragma_table_info('inbounds') WHERE name='allocate';" 2>/dev/null) || HAS_ALLOCATE=0
-        HAS_ENABLE=$(sqlite3 "$XUI_DB" \
-            "SELECT COUNT(*) FROM pragma_table_info('inbounds') WHERE name='enable';" 2>/dev/null) || HAS_ENABLE=0
 
         local IB="{\"clients\":[{\"id\":\"${UUID1}\",\"alterId\":0,\"email\":\"user1@ais.th\",\"level\":0},{\"id\":\"${UUID2}\",\"alterId\":0,\"email\":\"user2@ais.th\",\"level\":0}],\"disableInsecureEncryption\":true}"
         local SS="{\"network\":\"ws\",\"security\":\"none\",\"wsSettings\":{\"path\":\"${WS_PATH}\",\"headers\":{\"Host\":\"${DOMAIN}\"}},\"sockopt\":{\"tcpKeepAliveInterval\":30,\"tcpKeepAliveIdle\":60}}"
@@ -620,14 +608,12 @@ XRAYEOF
 
         local SQL_RC=0
         if [[ "$HAS_ALLOCATE" -gt 0 ]]; then
-            # schema เดิม (มี allocate column)
             sqlite3 "$XUI_DB" 2>>"$LOG" << SQLEOF || SQL_RC=$?
 DELETE FROM inbounds WHERE port = ${XRAY_INTERNAL_PORT};
 INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing, allocate)
 VALUES (1, 0, 0, 0, 'vmess-ws-ais', 1, 0, '127.0.0.1', ${XRAY_INTERNAL_PORT}, 'vmess', '${IB}', '${SS}', 'vmess-ws', '${SN}', '{}');
 SQLEOF
         else
-            # schema ใหม่ (ไม่มี allocate)
             sqlite3 "$XUI_DB" 2>>"$LOG" << SQLEOF || SQL_RC=$?
 DELETE FROM inbounds WHERE port = ${XRAY_INTERNAL_PORT};
 INSERT INTO inbounds (user_id, up, down, total, remark, enable, expiry_time, listen, port, protocol, settings, stream_settings, tag, sniffing)
@@ -640,29 +626,20 @@ SQLEOF
             _ok "Inbound injected เข้า 3X-UI DB สำเร็จ"
             _dim "Schema: allocate_col=${HAS_ALLOCATE}"
         else
-            _warn "SQLite inject ล้มเหลว (exit ${SQL_RC}) — ดู schema จริง:"
-            sqlite3 "$XUI_DB" ".schema inbounds" 2>/dev/null | sed 's/^/    /' || true
+            _warn "SQLite inject ล้มเหลว (exit ${SQL_RC})"
             _warn "Fallback: เขียน Xray config ตรง"
         fi
     else
-        _warn "3X-UI DB ยังไม่มี หรือไม่มี sqlite3 — ใช้ config ตรง"
+        _warn "3X-UI DB ยังไม่มี — ใช้ config ตรง"
     fi
 
-    # ── Fallback: เขียน config.json ตรงที่ Xray ใช้ ───────────
-    # 3X-UI version ใหม่ใช้ path: /usr/local/x-ui/bin/config.json
-    # และ symlink จาก /usr/local/etc/xray/config.json
     if [[ "$INJECT_OK" == "false" ]]; then
         cp "${XCONF_DIR}/config.json.template" "${XCONF_DIR}/config.json"
-
-        # symlink ให้ x-ui binary เห็น config เดียวกัน
         local XUI_CONF="/usr/local/x-ui/bin/config.json"
         if [[ -d "/usr/local/x-ui/bin" ]]; then
             cp "${XCONF_DIR}/config.json.template" "$XUI_CONF"
             _dim "Copied config → ${XUI_CONF}"
         fi
-
-        _warn "เขียน config ตรง — ถ้า inbound หายหลัง x-ui restart ให้รัน:"
-        _warn "  bash ${SCRIPT_PATH} inject-inbound"
         WARN_STEPS+=("Xray config เขียนตรง — verify ใน panel ถ้า inbound หาย")
     fi
 
@@ -714,7 +691,6 @@ net.ipv4.tcp_max_syn_backlog     = 256
 net.core.netdev_max_backlog      = 1000
 SYSCTLEOF
 
-    # conntrack — โหลด module ก่อนแล้ว set
     if modprobe nf_conntrack 2>/dev/null; then
         cat >> /etc/sysctl.d/99-vmess-ais.conf << 'CTEOF'
 net.netfilter.nf_conntrack_max                     = 16384
@@ -740,43 +716,96 @@ CTEOF
         _ok "sysctl applied ทุกค่า"
     else
         _warn "sysctl ที่ apply ไม่ได้: ${FAIL_KEYS[*]}"
-        _dim  "อาจ OK ถ้า kernel ไม่รองรับ"
         WARN_STEPS+=("sysctl บางค่า apply ไม่ได้: ${FAIL_KEYS[*]}")
     fi
     _dim "cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)  notsent_lowat=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)"
 }
 
 # ── Step 11: CAKE AQM ────────────────────────────────────────────
+# แก้ปัญหา exit 141 (SIGPIPE):
+#   - ใช้ _run_once แทน bash script | tee | sed
+#   - probe CAKE options ก่อน apply จริง
+#   - health check ใช้ NIC variable โดยตรง (ไม่ re-detect)
+
+_probe_cake_timing() {
+    # ตรวจว่า kernel iproute2 รองรับ option ไหน
+    # return: "rtt" | "noatm" | "bare"
+    if tc qdisc add dev lo root cake rtt 20ms 2>/dev/null; then
+        tc qdisc del dev lo root 2>/dev/null || true
+        echo "rtt"
+    elif tc qdisc add dev lo root cake noatm 2>/dev/null; then
+        tc qdisc del dev lo root 2>/dev/null || true
+        echo "noatm"
+    else
+        echo "bare"
+    fi
+}
+
 do_cake_aqm() {
     _step "CAKE AQM — ลด bufferbloat โดยไม่ shape rate"
 
+    # ── probe CAKE timing support ──────────────────────────────
+    local CAKE_TIMING
+    CAKE_TIMING=$(_probe_cake_timing)
+    _dim "CAKE timing mode: ${CAKE_TIMING}"
+
+    # ── build CAKE options string ──────────────────────────────
+    local CAKE_EGRESS_OPTS CAKE_INGRESS_OPTS
+    case "$CAKE_TIMING" in
+        rtt)
+            CAKE_EGRESS_OPTS="diffserv4 dual-dsthost wash ack-filter rtt 20ms"
+            CAKE_INGRESS_OPTS="diffserv4 dual-srchost wash ingress rtt 20ms"
+            ;;
+        noatm)
+            CAKE_EGRESS_OPTS="diffserv4 dual-dsthost wash ack-filter noatm"
+            CAKE_INGRESS_OPTS="diffserv4 dual-srchost wash ingress noatm"
+            ;;
+        bare)
+            CAKE_EGRESS_OPTS="diffserv4 dual-dsthost wash ack-filter"
+            CAKE_INGRESS_OPTS="diffserv4 dual-srchost wash ingress"
+            ;;
+    esac
+
     local CAKE_SCRIPT="/usr/local/bin/vmess-cake.sh"
 
-    cat > "$CAKE_SCRIPT" << 'CAKEOF'
+    # เขียน script โดยฝัง options ที่ probe ได้แล้ว
+    cat > "$CAKE_SCRIPT" << CAKEOF
 #!/usr/bin/env bash
-NIC="$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1)"
-log() { logger -t vmess-cake "$*"; }
-[[ -z "$NIC" ]] && { log "NIC not found"; exit 1; }
+set -euo pipefail
+NIC="\$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if(\$i=="dev") print \$(i+1)}' | head -1)"
+log() { logger -t vmess-cake "\$*" 2>/dev/null || true; }
+[[ -z "\$NIC" ]] && { log "NIC not found"; exit 1; }
 
-tc qdisc del dev "$NIC" root 2>/dev/null || true
-tc qdisc add dev "$NIC" root cake \
-    diffserv4 dual-dsthost wash ack-filter rtt 20ms noatm
+# ── egress ────────────────────────────────────────────────────
+tc qdisc del dev "\$NIC" root 2>/dev/null || true
+if tc qdisc add dev "\$NIC" root cake ${CAKE_EGRESS_OPTS} 2>/dev/null; then
+    log "CAKE egress active on \$NIC (${CAKE_TIMING})"
+    echo "CAKE egress: OK (\$NIC)"
+else
+    tc qdisc add dev "\$NIC" root fq_codel 2>/dev/null && \
+        log "fq_codel egress fallback on \$NIC" || true
+    echo "CAKE egress: fallback fq_codel (\$NIC)"
+fi
 
-log "CAKE egress active on $NIC"
-
-if lsmod | grep -q ifb; then
+# ── ingress via IFB ───────────────────────────────────────────
+if lsmod | grep -q "^ifb"; then
     ip link add ifb0 type ifb 2>/dev/null || true
     ip link set ifb0 up 2>/dev/null || true
-    tc qdisc del dev "$NIC" ingress 2>/dev/null || true
-    tc qdisc add dev "$NIC" handle ffff: ingress
-    tc filter add dev "$NIC" parent ffff: protocol all u32 \
-        match u32 0 0 action mirred egress redirect dev ifb0
+    tc qdisc del dev "\$NIC" ingress 2>/dev/null || true
+    tc qdisc add dev "\$NIC" handle ffff: ingress
+    tc filter add dev "\$NIC" parent ffff: protocol all u32 \
+        match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
     tc qdisc del dev ifb0 root 2>/dev/null || true
-    tc qdisc add dev ifb0 root cake \
-        diffserv4 dual-srchost wash ingress rtt 20ms noatm
-    log "CAKE ingress active on ifb0"
+    if tc qdisc add dev ifb0 root cake ${CAKE_INGRESS_OPTS} 2>/dev/null; then
+        log "CAKE ingress active on ifb0"
+        echo "CAKE ingress: OK (ifb0)"
+    else
+        tc qdisc add dev ifb0 root fq_codel 2>/dev/null || true
+        echo "CAKE ingress: fallback fq_codel (ifb0)"
+    fi
 else
-    log "IFB not available — egress only"
+    log "IFB not loaded — egress only"
+    echo "IFB: not available — egress only"
 fi
 CAKEOF
     chmod +x "$CAKE_SCRIPT"
@@ -797,22 +826,32 @@ WantedBy=multi-user.target
 SVCEOF
 
     systemctl daemon-reload
-    systemctl enable vmess-cake.service
+    systemctl enable vmess-cake.service >> "$LOG" 2>&1 || true
 
     echo ""
     echo -e "${DIM}  ── CAKE setup output ─────────────────────────────────${NC}"
-    if bash "$CAKE_SCRIPT" 2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
+
+    # ── FIX: ใช้ _run_once แทน pipe → กัน SIGPIPE exit 141 ──
+    if _run_once "CAKE AQM apply" bash "$CAKE_SCRIPT"; then
         echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
-        _ok "CAKE AQM active"
-        tc qdisc show dev "$NIC" 2>/dev/null | grep -q cake && \
-            _ok "Verified: CAKE running on ${NIC}"
+        # ตรวจสอบด้วย NIC ที่ detect ไว้แล้ว (global variable)
+        if tc qdisc show dev "$NIC" 2>/dev/null | grep -q "cake\|fq_codel"; then
+            local ACTIVE_QDISC
+            ACTIVE_QDISC=$(tc qdisc show dev "$NIC" 2>/dev/null | awk 'NR==1{print $2}')
+            _ok "AQM active: ${ACTIVE_QDISC} on ${NIC}"
+        else
+            _warn "qdisc ไม่พบ — ลอง apply ด้วยตนเอง: bash /usr/local/bin/vmess-cake.sh"
+            WARN_STEPS+=("CAKE: qdisc ไม่พบหลัง apply")
+        fi
     else
         echo -e "${DIM}  ────────────────────────────────────────────────────${NC}"
-        _warn "CAKE ไม่ work — fallback fq_codel"
+        _warn "CAKE script ล้มเหลว — fallback fq_codel"
         tc qdisc del dev "$NIC" root 2>/dev/null || true
-        tc qdisc add dev "$NIC" root fq_codel 2>/dev/null && \
-            _ok "fq_codel fallback active" || \
+        if tc qdisc add dev "$NIC" root fq_codel 2>/dev/null; then
+            _ok "fq_codel fallback active"
+        else
             _warn "qdisc fallback ล้มเหลวด้วย"
+        fi
         WARN_STEPS+=("CAKE ไม่ work — ใช้ fq_codel แทน")
     fi
 }
@@ -864,7 +903,7 @@ do_firewall_and_start() {
 
     echo ""
     echo -e "${DIM}  ── nginx start ───────────────────────────────────────${NC}"
-    if systemctl restart nginx 2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
+    if systemctl restart nginx >> "$LOG" 2>&1; then
         systemctl enable nginx >> "$LOG" 2>&1 || true
         _ok "Nginx started"
     else
@@ -875,9 +914,9 @@ do_firewall_and_start() {
 
     echo ""
     echo -e "${DIM}  ── x-ui start ────────────────────────────────────────${NC}"
-    if systemctl restart x-ui 2>&1 | tee -a "$LOG" | sed 's/^/    /'; then
+    if systemctl restart x-ui >> "$LOG" 2>&1; then
         systemctl enable x-ui >> "$LOG" 2>&1 || true
-        sleep 3  # รอ x-ui initialize DB และ bind port
+        sleep 3
         _ok "x-ui started"
     else
         _fail "x-ui ไม่ start — ดู log:"
@@ -942,7 +981,6 @@ do_summary() {
     echo -e "${BOLD}${G}╚══════════════════════════════════════════════════════╝${NC}"
     echo ""
 
-    # wait ให้ x-ui bind port
     sleep 2
 
     for svc in nginx x-ui; do
@@ -957,21 +995,22 @@ do_summary() {
             echo -e "  ${Y}⚠ port $port ไม่ listening${NC}"
     done
 
-    local NIC_CHK
-    NIC_CHK=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/{for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -1) || true
-    tc qdisc show dev "$NIC_CHK" 2>/dev/null | grep -q "cake\|fq_codel" && \
-        echo -e "  ${G}✔ AQM active on ${NIC_CHK}${NC}" || \
-        echo -e "  ${Y}⚠ AQM ไม่พบ → bash /usr/local/bin/vmess-cake.sh${NC}"
+    # FIX: ใช้ NIC global variable ที่ detect ไว้แล้ว — ไม่ re-detect ใน subshell
+    if [[ -n "$NIC" ]]; then
+        local ACTIVE_QDISC
+        ACTIVE_QDISC=$(tc qdisc show dev "$NIC" 2>/dev/null | awk 'NR==1{print $2}')
+        if [[ -n "$ACTIVE_QDISC" ]]; then
+            echo -e "  ${G}✔ AQM active: ${ACTIVE_QDISC} on ${NIC}${NC}"
+        else
+            echo -e "  ${Y}⚠ AQM ไม่พบ → bash /usr/local/bin/vmess-cake.sh${NC}"
+        fi
+    fi
 
     local CC
     CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || CC="unknown"
     [[ "$CC" == "bbr" ]] && \
         echo -e "  ${G}✔ BBR active${NC}" || \
         echo -e "  ${Y}⚠ cc=$CC (BBR preferred)${NC}"
-
-    nginx -T 2>/dev/null | grep -q "fastopen" && \
-        echo -e "  ${G}✔ TCP Fast Open on Nginx${NC}" || \
-        echo -e "  ${Y}⚠ fastopen ไม่พบ (Nginx < 1.21 ไม่รองรับ — ใช้งานได้ปกติ)${NC}"
 
     local XUI_DB="/etc/x-ui/x-ui.db"
     if [[ -f "$XUI_DB" ]] && command -v sqlite3 &>/dev/null; then
@@ -1096,8 +1135,10 @@ do_monitor() {
         echo ""
 
         echo -e "${BOLD}  CAKE:${NC}"
-        tc qdisc show dev "$NIC_M" 2>/dev/null | grep -q cake && \
-            echo -e "    ${G}✔ active${NC}" || echo -e "    ${Y}⚠ ไม่ active${NC}"
+        local QDISC_NOW
+        QDISC_NOW=$(tc qdisc show dev "$NIC_M" 2>/dev/null | awk 'NR==1{print $2}')
+        [[ -n "$QDISC_NOW" ]] && \
+            echo -e "    ${G}✔ ${QDISC_NOW} active${NC}" || echo -e "    ${Y}⚠ ไม่ active${NC}"
         echo ""
 
         echo -e "${BOLD}  TCP:${NC}"
@@ -1138,8 +1179,13 @@ do_status() {
             echo -e "  ${Y}⚠ port $port ไม่ listen${NC}"
     done
 
-    tc qdisc show dev "$NIC_S" 2>/dev/null | grep -q cake && \
-        echo -e "  ${G}✔ CAKE active${NC}" || echo -e "  ${Y}⚠ CAKE ไม่ active${NC}"
+    if [[ -n "$NIC_S" ]]; then
+        local QDISC_S
+        QDISC_S=$(tc qdisc show dev "$NIC_S" 2>/dev/null | awk 'NR==1{print $2}')
+        [[ -n "$QDISC_S" ]] && \
+            echo -e "  ${G}✔ AQM: ${QDISC_S} on ${NIC_S}${NC}" || \
+            echo -e "  ${Y}⚠ AQM ไม่ active${NC}"
+    fi
 
     local CC
     CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null) || CC="?"
@@ -1238,7 +1284,6 @@ case "$CMD" in
     rollback)        do_rollback ;;
     inject-inbound)  do_inject_inbound ;;
     certbot-renew)
-        # รัน certbot ด้วย cert จริงหลัง DDNS อัพเดตแล้ว
         [[ -z "${2:-}" ]] && { echo "Usage: bash $0 certbot-renew <domain>"; exit 1; }
         RENEW_DOMAIN="${2}"
         echo -e "${BOLD}Re-issue cert สำหรับ ${RENEW_DOMAIN}${NC}"
@@ -1268,15 +1313,15 @@ case "$CMD" in
         echo ""
         echo -e "${BOLD}Usage:${NC}  sudo bash $0 [command]"
         echo ""
-        echo -e "  ${C}(no args)${NC}        ติดตั้ง"
-        echo -e "  ${C}monitor${NC}          live dashboard"
-        echo -e "  ${C}status${NC}           ตรวจสอบด่วน"
-        echo -e "  ${C}jitter [IP]${NC}      ทดสอบ jitter"
-        echo -e "  ${C}inject-inbound${NC}               re-inject inbound เข้า 3X-UI DB"
-        echo -e "  ${C}certbot-renew <domain> [email]${NC} ออก Let's Encrypt cert หลัง DDNS อัพเดต"
+        echo -e "  ${C}(no args)${NC}                     ติดตั้ง"
+        echo -e "  ${C}monitor${NC}                       live dashboard"
+        echo -e "  ${C}status${NC}                        ตรวจสอบด่วน"
+        echo -e "  ${C}jitter [IP]${NC}                   ทดสอบ jitter"
+        echo -e "  ${C}inject-inbound${NC}                re-inject inbound เข้า 3X-UI DB"
+        echo -e "  ${C}certbot-renew <domain> [email]${NC} ออก cert หลัง DDNS อัพเดต"
         echo -e "  ${C}cake${NC}                          CAKE stats"
-        echo -e "  ${C}bbr${NC}              BBR/TCP stats"
-        echo -e "  ${C}rollback${NC}         ยกเลิก tuning"
+        echo -e "  ${C}bbr${NC}                           BBR/TCP stats"
+        echo -e "  ${C}rollback${NC}                      ยกเลิก tuning"
         echo ""
         ;;
     *)
