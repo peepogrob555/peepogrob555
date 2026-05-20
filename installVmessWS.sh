@@ -57,51 +57,29 @@ _spin() {
     printf "\r%60s\r" ""
 }
 
-# _run: รัน command + log output — แก้ race condition ด้วย fd แทน tmp file
-_run() {
-    local label=$1; shift
-    local rc=0
-
-    # รัน command จริง log ทั้ง stdout+stderr
-    # ใช้ set +o pipefail ใน subshell เพื่อกัน SIGPIPE จาก tee/sed
-    (
-        set +o pipefail
-        "$@" 2>&1 | while IFS= read -r line; do
-            echo "    $line"
-            echo "[$(date '+%H:%M:%S')] $line" >> "$LOG"
-        done
-    )
-    rc=${PIPESTATUS[0]:-$?}
-
-    # PIPESTATUS[0] ใน subshell ไม่ propagate — ต้องรัน command แยกเพื่อเช็ค exit code
-    # แนวทาง: รัน command จริงอีกครั้งแบบ silent เพื่อเอา exit code
-    # แต่ apt/curl idempotent ได้ → ใช้วิธี fd แทน
-    if "$@" >> "$LOG" 2>&1; then
-        _ok "$label"; return 0
-    else
-        _fail "$label"; return 1
-    fi
-}
-
-# _run_once: รัน command ครั้งเดียว log output + ได้ exit code ที่ถูกต้อง
-# แก้ปัญหา SIGPIPE (exit 141) ด้วยการไม่ใช้ pipeline ที่ซับซ้อน
+# _run_once: รัน command ครั้งเดียว ได้ทั้ง output และ exit code ที่ถูกต้อง
+# ไม่ใช้ pipeline → ไม่เกิด SIGPIPE (exit 141)
 _run_once() {
     local label=$1; shift
-    local tmp_out
+    local tmp_out tmp_rc
     tmp_out=$(mktemp)
+    tmp_rc=$(mktemp)
 
-    # รัน command → เก็บ output ใน tmp file → ไม่มี pipe ทำให้ไม่เกิด SIGPIPE
-    "$@" > "$tmp_out" 2>&1
-    local rc=$?
+    # รัน command ใน subshell → output → tmp_out, exit code → tmp_rc
+    # ( ... ) subshell แยก process → ไม่มี pipe → ไม่เกิด SIGPIPE
+    ( "$@" > "$tmp_out" 2>&1; echo $? > "$tmp_rc" )
+
+    local rc
+    rc=$(cat "$tmp_rc" 2>/dev/null || echo 1)
 
     # แสดงและ log output
     while IFS= read -r line; do
         echo "    $line"
         echo "[$(date '+%H:%M:%S')] $line" >> "$LOG"
     done < "$tmp_out"
-    rm -f "$tmp_out"
+    rm -f "$tmp_out" "$tmp_rc"
 
-    if [[ $rc -eq 0 ]]; then
+    if [[ "$rc" -eq 0 ]]; then
         _ok "$label"; return 0
     else
         _fail "$label (exit $rc)"; return 1
