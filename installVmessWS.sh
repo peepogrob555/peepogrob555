@@ -7,12 +7,10 @@ case "$SCRIPT_PATH" in
     /proc/*|/dev/fd/*|/dev/stdin) SCRIPT_PATH="$(pwd)/vmess-ais-optimized.sh" ;;
 esac
 
-# ─── สี ──────────────────────────────────────────────────────────────────────
 R='\033[0;31m' G='\033[0;32m' Y='\033[1;33m'
 B='\033[0;34m' C='\033[0;36m' M='\033[0;35m'
 W='\033[1;37m' DIM='\033[2m' NC='\033[0m' BOLD='\033[1m'
 
-# ─── ค่าคงที่ ────────────────────────────────────────────────────────────────
 XRAY_PORT=10086
 PANEL_PORT=2053
 WS_PATH="/speedtest"
@@ -32,7 +30,6 @@ UUID2=""
 FAILED_STEPS=()
 WARN_STEPS=()
 
-# ─── log / print ──────────────────────────────────────────────────────────────
 _log()  { echo "[$(date '+%H:%M:%S')] $*" >> "$LOG"; }
 _info() { echo -e "${C}  ●  $*${NC}";  _log "INFO: $*"; }
 _ok()   { echo -e "${G}  ✔  $*${NC}";  _log "OK: $*"; }
@@ -78,7 +75,6 @@ _banner() {
     echo ""
 }
 
-# ─── step 1 ───────────────────────────────────────────────────────────────────
 do_detect_nic() {
     _step "ตรวจ network interface + public IP"
 
@@ -100,7 +96,6 @@ do_detect_nic() {
     _ok "Interface: ${BOLD}${NIC}${NC}  |  IP: ${BOLD}${VPS_IP}${NC}"
 }
 
-# ─── step 2 ───────────────────────────────────────────────────────────────────
 do_get_domain() {
     _step "กรอก domain + email สำหรับ TLS"
     echo ""
@@ -121,7 +116,6 @@ do_get_domain() {
     _ok "Domain: ${BOLD}${DOMAIN}${NC}"
 }
 
-# ─── step 3 ───────────────────────────────────────────────────────────────────
 do_system_update() {
     _step "System update + packages"
     export DEBIAN_FRONTEND=noninteractive
@@ -163,7 +157,6 @@ do_system_update() {
     _ok "Packages พร้อม"
 }
 
-# ─── step 4 ───────────────────────────────────────────────────────────────────
 do_kernel_modules() {
     _step "โหลด kernel modules (BBR + CAKE + IFB)"
 
@@ -198,7 +191,6 @@ EOF
     _ok "Modules persisted"
 }
 
-# ─── step 5 ───────────────────────────────────────────────────────────────────
 do_install_xui() {
     _step "ติดตั้ง 3X-UI + Xray-core (official installer)"
 
@@ -223,7 +215,6 @@ do_install_xui() {
     fi
 }
 
-# ─── step 6 ───────────────────────────────────────────────────────────────────
 do_panel_port() {
     _step "ตั้ง panel port → ${PANEL_PORT}"
     systemctl start x-ui 2>/dev/null || true; sleep 3
@@ -247,11 +238,8 @@ do_panel_port() {
     fi
 }
 
-# ─── step 7 ───────────────────────────────────────────────────────────────────
 do_tls_cert() {
     _step "Let's Encrypt TLS สำหรับ ${DOMAIN}"
-    systemctl stop nginx x-ui 2>/dev/null || true
-    fuser -k 80/tcp 2>/dev/null || true; sleep 2
 
     _info "ตรวจ DNS: ${DOMAIN}"
     local RESOLVED_IP
@@ -264,15 +252,30 @@ do_tls_cert() {
         _ok "DNS OK: ${DOMAIN} → ${RESOLVED_IP}"
     fi
 
+    mkdir -p /var/www/html
+    rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-enabled/vmess
+    cat > /etc/nginx/sites-available/vmess-acme << TMPEOF
+server {
+    listen 80;
+    server_name ${DOMAIN};
+    root /var/www/html;
+    location /.well-known/acme-challenge/ { allow all; }
+    location / { return 444; }
+}
+TMPEOF
+    ln -sf /etc/nginx/sites-available/vmess-acme /etc/nginx/sites-enabled/vmess-acme
+    systemctl restart nginx 2>/dev/null || true; sleep 1
+
     echo ""
-    _info "รัน certbot..."
+    _info "รัน certbot (webroot)..."
     echo ""
     local CERT_OK=false
-    certbot certonly --standalone --preferred-challenges http \
+    certbot certonly --webroot -w /var/www/html \
         --non-interactive --agree-tos --email "$CERT_EMAIL" \
         -d "$DOMAIN" && CERT_OK=true
 
-    echo ""
+    rm -f /etc/nginx/sites-enabled/vmess-acme
+
     local CERT_PATH="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
     if $CERT_OK && [[ -f "$CERT_PATH" ]]; then
         _ok "TLS cert ออกแล้ว (Let's Encrypt)"
@@ -296,13 +299,12 @@ do_tls_cert() {
         ln -sf "${SS_DIR}/fullchain.pem" "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
         ln -sf "${SS_DIR}/privkey.pem"   "/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
         _ok "Self-signed cert พร้อม"
-        WARN_STEPS+=("ใช้ self-signed cert — รัน certbot เองหลัง DNS อัพเดต: bash ${SCRIPT_PATH} certbot-renew ${DOMAIN}")
+        WARN_STEPS+=("ใช้ self-signed cert — รัน: bash ${SCRIPT_PATH} certbot-renew ${DOMAIN}")
     else
         _fail "self-signed cert ล้มเหลว"; return 1
     fi
 }
 
-# ─── step 8 ───────────────────────────────────────────────────────────────────
 do_nginx_config() {
     _step "Nginx — WS proxy + TLS config"
 
@@ -310,7 +312,9 @@ do_nginx_config() {
     local KEY_PATH="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
     local NGINX_SITE="/etc/nginx/sites-available/vmess"
 
-    rm -f /etc/nginx/sites-enabled/default
+    rm -f /etc/nginx/sites-enabled/default \
+          /etc/nginx/sites-available/vmess-acme \
+          /etc/nginx/sites-enabled/vmess-acme
 
     grep -q "worker_rlimit_nofile" /etc/nginx/nginx.conf || \
         sed -i '/^worker_processes/a worker_rlimit_nofile 65535;' /etc/nginx/nginx.conf
@@ -408,7 +412,6 @@ NGINXEOF
     fi
 }
 
-# ─── step 9 ───────────────────────────────────────────────────────────────────
 do_xray_config() {
     _step "Xray VMESS WS — dual-policy (gaming + download)"
 
@@ -589,7 +592,6 @@ SQLEOF
     _dim "Download UUID (level 2): ${UUID2}"
 }
 
-# ─── step 10 ──────────────────────────────────────────────────────────────────
 do_sysctl() {
     _step "sysctl — BBR + AIS mobile tuning (ไม่จำกัด throughput)"
 
@@ -668,7 +670,6 @@ CTEOF
     _dim "cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)  notsent_lowat=$(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)"
 }
 
-# ─── step 11 ──────────────────────────────────────────────────────────────────
 do_cake_aqm() {
     _step "CAKE AQM — AIS RTT ${AIS_RTT}, diffserv4, ไม่จำกัด bandwidth"
 
@@ -776,7 +777,6 @@ SVCEOF
     fi
 }
 
-# ─── step 12 ──────────────────────────────────────────────────────────────────
 do_dscp_qos() {
     _step "DSCP QoS — gaming AF41 / download CS1"
 
@@ -853,7 +853,6 @@ QSVCEOF
     fi
 }
 
-# ─── step 13 ──────────────────────────────────────────────────────────────────
 do_limits() {
     _step "System limits — file descriptors"
 
@@ -878,7 +877,6 @@ SDLIMEOF
     _ok "Limits: 65535 fd"
 }
 
-# ─── step 14 ──────────────────────────────────────────────────────────────────
 do_firewall_and_start() {
     _step "Firewall (ufw) + เปิด services"
 
@@ -926,7 +924,6 @@ do_firewall_and_start() {
     fi
 }
 
-# ─── summary ──────────────────────────────────────────────────────────────────
 do_summary() {
     echo ""
     echo -e "${BOLD}${G}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -1052,7 +1049,6 @@ do_summary() {
     echo ""
 }
 
-# ─── monitor ──────────────────────────────────────────────────────────────────
 do_monitor() {
     local NIC_M
     NIC_M=$(ip route get 1.1.1.1 2>/dev/null | \
@@ -1123,7 +1119,6 @@ do_monitor() {
     done
 }
 
-# ─── qos stats ────────────────────────────────────────────────────────────────
 do_qos_stats() {
     local NIC_Q
     NIC_Q=$(ip route get 1.1.1.1 2>/dev/null | \
@@ -1149,7 +1144,6 @@ do_qos_stats() {
     sysctl net.core.default_qdisc          | sed 's/^/    /'
 }
 
-# ─── status ───────────────────────────────────────────────────────────────────
 do_status() {
     echo ""
     echo -e "${BOLD}Quick Status:${NC}"; echo ""
@@ -1185,7 +1179,6 @@ do_status() {
     [[ -f /root/vmess-info.txt ]] && cat /root/vmess-info.txt
 }
 
-# ─── inject-inbound ───────────────────────────────────────────────────────────
 do_inject_inbound() {
     local XUI_DB="/etc/x-ui/x-ui.db"
     local XCONF_DIR="/usr/local/etc/xray"
@@ -1239,7 +1232,6 @@ SQLEOF
     echo -e "${G}  ✔ x-ui restarted${NC}"
 }
 
-# ─── rollback ────────────────────────────────────────────────────────────────
 do_rollback() {
     echo ""; echo -e "${BOLD}${Y}Rollback — ลบ CAKE + DSCP + sysctl${NC}"; echo ""
     echo -ne "  Continue? [y/N]: "; read -r ans
@@ -1272,7 +1264,6 @@ do_rollback() {
     echo ""; echo -e "  ${G}Done.${NC}"
 }
 
-# ─── main install ─────────────────────────────────────────────────────────────
 main_install() {
     [[ $EUID -eq 0 ]] || { echo "รันด้วย root: sudo bash $0"; exit 1; }
     mkdir -p "$(dirname "$LOG")"; touch "$LOG"
@@ -1296,7 +1287,6 @@ main_install() {
     do_summary
 }
 
-# ─── entrypoint ───────────────────────────────────────────────────────────────
 CMD=${1:-install}
 case "$CMD" in
     install|"")     main_install ;;
