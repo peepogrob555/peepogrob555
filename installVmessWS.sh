@@ -102,41 +102,67 @@ sec "SYSCTL KERNEL TUNING"
 
 run "Writing /etc/sysctl.d/99-lte-vmess.conf"
 cat > /etc/sysctl.d/99-lte-vmess.conf << 'EOF'
-# BBR + fq
+# ── Congestion control ──────────────────────────────────────
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-# Buffer — 2 users, 2GB RAM, 400Mbps intl
-net.core.rmem_default = 131072
+# ── TCP Memory / Buffer ─────────────────────────────────────
+# BDP = 400Mbps * 0.040s RTT / 8 = 2MB → max 8MB (4x BDP)
+net.core.rmem_default = 262144
 net.core.rmem_max = 8388608
-net.core.wmem_default = 131072
+net.core.wmem_default = 262144
 net.core.wmem_max = 8388608
-net.ipv4.tcp_rmem = 4096 131072 8388608
-net.ipv4.tcp_wmem = 4096 131072 8388608
+net.ipv4.tcp_rmem = 4096 262144 8388608
+net.ipv4.tcp_wmem = 4096 262144 8388608
+# optmem_max: ancillary buffer (WS, cmsg headers)
+net.core.optmem_max = 65536
+# tcp_mem: min/pressure/max in pages (4KB each)
+# min=64MB  pressure=256MB  max=512MB — ใช้ RAM 2GB ได้คุ้มขึ้น
+net.ipv4.tcp_mem = 16384 65536 131072
+# tcp_adv_win_scale=2 → app ได้ 75% ของ rmem แทน 50%
+net.ipv4.tcp_adv_win_scale = 2
+# moderate_rcvbuf: auto-tune recv buffer ตาม RTT/bandwidth จริง
+net.ipv4.tcp_moderate_rcvbuf = 1
+# window_scaling: รองรับ window > 64KB (จำเป็นที่ 400Mbps)
+net.ipv4.tcp_window_scaling = 1
 
-# RTT=40ms → BDP = 400Mbps * 0.040 = 2MB → buffer ครอบคลุม
-# BDP = 400000000 * 0.040 / 8 = 2,000,000 bytes → 8MB max เพียงพอ
-
-# Latency — zero tolerance
+# ── Latency & Interactive (VMESS WS) ───────────────────────
 net.ipv4.tcp_low_latency = 1
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 10
+# autocorking=0: ไม่รวม packet ไว้ก่อนส่ง → latency ต่ำกว่า (สำคัญ WS)
+net.ipv4.tcp_autocorking = 0
+# slow_start_after_idle=0: ไม่ reset cwnd หลัง idle → reconnect เร็ว
+net.ipv4.tcp_slow_start_after_idle = 0
+# notsent_lowat: epoll EPOLLOUT fire เมื่อ send buffer < 16KB
+# ทำให้ xray write path ไม่ block รอ → jitter ลด
+net.ipv4.tcp_notsent_lowat = 16384
+# mtu_probing=1: probe MTU อัตโนมัติ รับมือ LTE path MTU ที่ไม่แน่นอน
+net.ipv4.tcp_mtu_probing = 1
 
-# Keepalive — LTE NAT timeout ส่วนใหญ่ 30s-60s → ส่ง keepalive ทุก 20s
+# ── ACK ────────────────────────────────────────────────────
+net.ipv4.tcp_delack_min = 0
+
+# ── Keepalive — LTE NAT ────────────────────────────────────
 net.ipv4.tcp_keepalive_time = 20
 net.ipv4.tcp_keepalive_intvl = 5
 net.ipv4.tcp_keepalive_probes = 6
 
-# ACK — ไม่ delay ACK เลย (สำคัญสำหรับ interactive WS)
-net.ipv4.tcp_delack_min = 0
+# ── RTT Estimation ─────────────────────────────────────────
+# tcp_min_rtt_wlen: window ที่ kernel ใช้วัด min RTT → ค่า 300 เหมาะกับ
+# connection ที่มีอายุยาว (VMESS WS persistent)
+net.ipv4.tcp_min_rtt_wlen = 300
 
-# Connection queue
+# ── Connection queue ───────────────────────────────────────
 net.core.somaxconn = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
-net.core.netdev_max_backlog = 8192
+net.core.netdev_max_backlog = 16384
+# netdev_budget: packets per NAPI poll — เพิ่มเพื่อรองรับ burst
+net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 4000
 
-# LTE packet loss recovery
+# ── LTE Packet Loss Recovery ───────────────────────────────
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 net.ipv4.tcp_fack = 1
@@ -144,34 +170,34 @@ net.ipv4.tcp_recovery = 1
 net.ipv4.tcp_retries2 = 6
 net.ipv4.tcp_syn_retries = 3
 net.ipv4.tcp_orphan_retries = 2
+net.ipv4.tcp_max_orphans = 8192
 
-# RTT estimation — ปรับ RTO min ให้ใกล้ RTT จริง (~40ms)
-# Linux default minRTO = 200ms → ทำให้ retransmit ช้า
-# ลดผ่าน tcp_min_rtt_wlen (window สำหรับ measure min RTT)
-net.ipv4.tcp_min_rtt_wlen = 300
+# ── Port Range ─────────────────────────────────────────────
+# ขยาย ephemeral ports สำหรับ outbound connections ของ xray
+net.ipv4.ip_local_port_range = 1024 65535
 
-# Jitter — ลด variance ของ scheduling
+# ── Scheduling Jitter ──────────────────────────────────────
 net.core.busy_poll = 50
 net.core.busy_read = 50
 net.ipv4.tcp_timestamps = 1
 
-# Routing
+# ── Routing ────────────────────────────────────────────────
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
 
-# FD
+# ── File Descriptors ───────────────────────────────────────
 fs.file-max = 1000000
 fs.nr_open = 1000000
 
-# Swap
+# ── VM / Swap ──────────────────────────────────────────────
 vm.swappiness = 10
 vm.dirty_ratio = 15
 vm.dirty_background_ratio = 5
 EOF
 
 run "sysctl --system (applying all sysctl.d)"
-sysctl --system 2>&1 | grep -E "(bbr|fastopen|keepalive|rmem|wmem|somaxconn|busy|rp_filter|forward|swappiness)" | while IFS= read -r line; do
+sysctl --system 2>&1 | grep -E "(bbr|fastopen|keepalive|rmem|wmem|somaxconn|busy|rp_filter|forward|swappiness|autocorking|slow_start|notsent|mtu_prob|adv_win|budget|port_range|orphan|tcp_mem)" | while IFS= read -r line; do
     ok "sysctl: $line"
 done
 
@@ -180,6 +206,11 @@ sec "CAKE QDISC  [RTT=40ms, 400mbit]"
 
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 echo -e "${C}  interface: $ETH${N}"
+
+# txqueuelen — เพิ่ม queue depth สำหรับ 400Mbps link
+# default=1000 → ที่ 400Mbps burst ทำให้ drop, เพิ่มเป็น 10000
+run "ip link set dev $ETH txqueuelen 10000"
+ip link set dev "$ETH" txqueuelen 10000 2>/dev/null && ok "txqueuelen → 10000" || ok "txqueuelen skipped (KVM may ignore)"
 
 run "modprobe sch_cake"
 if modprobe sch_cake 2>/dev/null; then
@@ -192,14 +223,27 @@ run "tc qdisc del dev $ETH root (clean slate)"
 tc qdisc del dev "$ETH" root 2>/dev/null || true
 ok "old qdisc removed"
 
+# CAKE flags สำหรับ 2 users, server-side:
+# besteffort     → ไม่แบ่ง tin (ลด overhead, ดีพอสำหรับ 2 users)
+# no-triple-isolate → ปิด per-host isolation (ไม่จำเป็น มี 2 users เท่านั้น)
+# split-gso      → แบ่ง GSO segments ก่อน queue → jitter ลด (default ON แต่ระบุชัดเจน)
+# nat            → ถ้าทำ NAT ให้ CAKE มองเห็น internal IP ได้ถูกต้อง
+# wash           → ล้าง DSCP markings จาก upstream ก่อน queue
+CAKE_OPTS="bandwidth 400mbit rtt 40ms besteffort no-triple-isolate split-gso nat wash"
+
 if lsmod | grep -q sch_cake; then
-    run "tc qdisc add dev $ETH root cake bandwidth 400mbit rtt 40ms besteffort"
-    if tc qdisc add dev "$ETH" root cake bandwidth 400mbit rtt 40ms besteffort 2>/dev/null; then
-        ok "CAKE set: bandwidth=400mbit rtt=40ms besteffort"
+    run "tc qdisc add dev $ETH root cake $CAKE_OPTS"
+    if tc qdisc add dev "$ETH" root cake $CAKE_OPTS 2>/dev/null; then
+        ok "CAKE set: $CAKE_OPTS"
     else
-        err "CAKE failed"
-        run "tc qdisc add dev $ETH root fq_codel (fallback)"
-        tc qdisc add dev "$ETH" root fq_codel target 5ms interval 40ms && ok "fq_codel applied" || err "fq_codel failed"
+        # ลอง minimal flags ถ้า flag บางตัวไม่รองรับ (kernel เก่า)
+        run "CAKE minimal fallback: bandwidth 400mbit rtt 40ms besteffort"
+        tc qdisc add dev "$ETH" root cake bandwidth 400mbit rtt 40ms besteffort 2>/dev/null && \
+            ok "CAKE minimal set" || {
+            err "CAKE failed entirely"
+            run "tc qdisc add dev $ETH root fq_codel target 5ms interval 40ms"
+            tc qdisc add dev "$ETH" root fq_codel target 5ms interval 40ms && ok "fq_codel applied" || err "fq_codel failed"
+        }
     fi
 else
     run "tc qdisc add dev $ETH root fq_codel target 5ms interval 40ms"
@@ -214,9 +258,11 @@ mkdir -p /etc/networkd-dispatcher/routable.d/
 cat > /etc/networkd-dispatcher/routable.d/50-cake << BOOTEOF
 #!/bin/bash
 ETH=\$(ip -o -4 route show to default | awk '{print \$5}' | head -1)
+ip link set dev \$ETH txqueuelen 10000 2>/dev/null || true
 tc qdisc del dev \$ETH root 2>/dev/null || true
 modprobe sch_cake 2>/dev/null
 if lsmod | grep -q sch_cake; then
+    tc qdisc add dev \$ETH root cake bandwidth 400mbit rtt 40ms besteffort no-triple-isolate split-gso nat wash 2>/dev/null || \
     tc qdisc add dev \$ETH root cake bandwidth 400mbit rtt 40ms besteffort 2>/dev/null
 else
     tc qdisc add dev \$ETH root fq_codel target 5ms interval 40ms 2>/dev/null
@@ -406,5 +452,5 @@ run "nofile (current shell):"
 ok "soft=$(ulimit -Sn) hard=$(ulimit -Hn)"
 
 echo -e "\n${G}${B}══════ DONE ══════${N}"
-echo -e "${Y}  ▸ เปิด port ใน ReadyIDC Panel → Firewall Rules ด้วย${N}"
+echo -e "${Y}  ▸ เปิด port ใน VPS Panel → Firewall Rules ด้วย${N}"
 echo -e "${Y}  ▸ reboot เพื่อให้ limits.conf มีผลกับทุก process${N}"
