@@ -1,6 +1,3 @@
-"bash
-
-cat > /mnt/user-data/outputs/setup-vps-ais.sh << 'ENDOFSCRIPT'
 #!/bin/bash
 set -e
 
@@ -56,11 +53,11 @@ done
 
 if command -v netfilter-persistent &>/dev/null; then
     netfilter-persistent save >/dev/null 2>&1
-    ok "iptables saved (netfilter-persistent)"
+    ok "iptables saved via netfilter-persistent"
 else
     mkdir -p /etc/iptables
     iptables-save > /etc/iptables/rules.v4
-    ok "iptables saved → /etc/iptables/rules.v4"
+    ok "iptables saved to /etc/iptables/rules.v4"
 fi
 
 sec "STEP 3 — INSTALL 3x-ui (Official)"
@@ -131,7 +128,7 @@ net.ipv4.tcp_min_rtt_wlen = 300
 net.core.somaxconn = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
 net.core.netdev_max_backlog = 16384
-net.core.netdev_budget = 600
+net.core.netdev_budget = 300
 net.core.netdev_budget_usecs = 4000
 
 net.core.busy_poll = 0
@@ -139,12 +136,13 @@ net.core.busy_read = 0
 
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
-net.ipv4.tcp_fack = 1
 net.ipv4.tcp_recovery = 1
 net.ipv4.tcp_retries2 = 6
 net.ipv4.tcp_syn_retries = 3
 net.ipv4.tcp_orphan_retries = 2
 net.ipv4.tcp_max_orphans = 8192
+
+net.ipv4.tcp_ecn = 1
 
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_timestamps = 1
@@ -167,71 +165,49 @@ ok "sysctl applied"
 
 sec "STEP 6 — ETHTOOL OFFLOAD"
 
+if ! command -v ethtool &>/dev/null; then
+    apt-get install -y ethtool >/dev/null 2>&1
+fi
+
 if command -v ethtool &>/dev/null; then
-    for feature in tso gso gro lro; do
-        ethtool -K "$ETH" $feature off 2>/dev/null && ok "ethtool: $feature off" || inf "ethtool: $feature skipped"
-    done
+    ethtool -K "$ETH" gro off 2>/dev/null && ok "ethtool: gro off" || inf "ethtool: gro skipped"
+    ethtool -K "$ETH" lro off 2>/dev/null && ok "ethtool: lro off" || inf "ethtool: lro skipped"
+    ethtool -K "$ETH" tso on  2>/dev/null && ok "ethtool: tso on"  || inf "ethtool: tso skipped"
+    ethtool -K "$ETH" gso on  2>/dev/null && ok "ethtool: gso on"  || inf "ethtool: gso skipped"
     ethtool -K "$ETH" tx-checksum-ip-generic on 2>/dev/null && ok "ethtool: tx-checksum on" || true
 else
-    apt-get install -y ethtool >/dev/null 2>&1
-    for feature in tso gso gro lro; do
-        ethtool -K "$ETH" $feature off 2>/dev/null && ok "ethtool: $feature off" || inf "ethtool: $feature skipped"
-    done
+    inf "ethtool not available -- skipped"
 fi
 
 ETHTOOL_PERSIST=/etc/networkd-dispatcher/routable.d/51-ethtool
 mkdir -p /etc/networkd-dispatcher/routable.d/
-cat > "$ETHTOOL_PERSIST" << ETEOF
+cat > "$ETHTOOL_PERSIST" << 'ETEOF'
 #!/bin/bash
-ETH=\$(ip -o -4 route show to default | awk '{print \$5}' | head -1)
-for f in tso gso gro lro; do ethtool -K \$ETH \$f off 2>/dev/null || true; done
+ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+ethtool -K $ETH gro off 2>/dev/null || true
+ethtool -K $ETH lro off 2>/dev/null || true
+ethtool -K $ETH tso on  2>/dev/null || true
+ethtool -K $ETH gso on  2>/dev/null || true
 ETEOF
 chmod +x "$ETHTOOL_PERSIST"
 ok "ethtool persistence written"
 
-sec "STEP 7 — RPS/XPS (1 vCPU)"
+sec "STEP 7 — CAKE QDISC (RTT=40ms, 1Gbps)"
 
-RPS_CPUS="1"
-for rx in /sys/class/net/$ETH/queues/rx-*/rps_cpus; do
-    [[ -f "$rx" ]] && echo "$RPS_CPUS" > "$rx" 2>/dev/null && ok "RPS: $rx = $RPS_CPUS" || true
-done
-for tx in /sys/class/net/$ETH/queues/tx-*/xps_cpus; do
-    [[ -f "$tx" ]] && echo "$RPS_CPUS" > "$tx" 2>/dev/null && ok "XPS: $tx = $RPS_CPUS" || true
-done
-if ! ls /sys/class/net/$ETH/queues/rx-*/rps_cpus 2>/dev/null | head -1 | grep -q rps; then
-    inf "RPS/XPS not exposed (virtio/KVM — normal)"
-fi
-
-RPS_PERSIST=/etc/networkd-dispatcher/routable.d/52-rps
-cat > "$RPS_PERSIST" << RPSEOF
-#!/bin/bash
-ETH=\$(ip -o -4 route show to default | awk '{print \$5}' | head -1)
-for rx in /sys/class/net/\$ETH/queues/rx-*/rps_cpus; do
-    [[ -f "\$rx" ]] && echo "1" > "\$rx" 2>/dev/null || true
-done
-for tx in /sys/class/net/\$ETH/queues/tx-*/xps_cpus; do
-    [[ -f "\$tx" ]] && echo "1" > "\$tx" 2>/dev/null || true
-done
-RPSEOF
-chmod +x "$RPS_PERSIST"
-ok "RPS/XPS persistence written"
-
-sec "STEP 8 — CAKE QDISC (RTT=40ms, 200mbit)"
-
-ip link set dev "$ETH" txqueuelen 10000 2>/dev/null && \
-    ok "txqueuelen → 10000" || inf "txqueuelen skipped"
+ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && \
+    ok "txqueuelen -> 4096" || inf "txqueuelen skipped"
 
 modprobe sch_cake 2>/dev/null && ok "sch_cake loaded" || inf "sch_cake unavailable"
 
 tc qdisc del dev "$ETH" root 2>/dev/null || true
 ok "old qdisc cleared"
 
-CAKE_OPTS="bandwidth 200mbit rtt 40ms besteffort no-triple-isolate split-gso nat wash"
+CAKE_OPTS="bandwidth 1gbit rtt 40ms besteffort no-triple-isolate split-gso nat wash"
 
 if lsmod | grep -q sch_cake; then
     tc qdisc add dev "$ETH" root cake $CAKE_OPTS 2>/dev/null && \
         ok "CAKE: $CAKE_OPTS" || {
-        tc qdisc add dev "$ETH" root cake bandwidth 200mbit rtt 40ms besteffort 2>/dev/null && \
+        tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 40ms besteffort 2>/dev/null && \
             ok "CAKE minimal applied" || {
             tc qdisc add dev "$ETH" root fq_codel target 5ms interval 40ms 2>/dev/null && \
                 ok "fq_codel fallback" || err "qdisc failed"
@@ -245,24 +221,24 @@ fi
 tc qdisc show dev "$ETH" | while IFS= read -r line; do inf "qdisc: $line"; done
 
 mkdir -p /etc/networkd-dispatcher/routable.d/
-cat > /etc/networkd-dispatcher/routable.d/50-cake << BOOTEOF
+cat > /etc/networkd-dispatcher/routable.d/50-cake << 'BOOTEOF'
 #!/bin/bash
-ETH=\$(ip -o -4 route show to default | awk '{print \$5}' | head -1)
-ip link set dev \$ETH txqueuelen 10000 2>/dev/null || true
-tc qdisc del dev \$ETH root 2>/dev/null || true
+ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+ip link set dev $ETH txqueuelen 4096 2>/dev/null || true
+tc qdisc del dev $ETH root 2>/dev/null || true
 modprobe sch_cake 2>/dev/null
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev \$ETH root cake bandwidth 200mbit rtt 40ms besteffort no-triple-isolate split-gso nat wash 2>/dev/null || \
-    tc qdisc add dev \$ETH root cake bandwidth 200mbit rtt 40ms besteffort 2>/dev/null || \
-    tc qdisc add dev \$ETH root fq_codel target 5ms interval 40ms 2>/dev/null
+    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 40ms besteffort no-triple-isolate split-gso nat wash 2>/dev/null || \
+    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 40ms besteffort 2>/dev/null || \
+    tc qdisc add dev $ETH root fq_codel target 5ms interval 40ms 2>/dev/null
 else
-    tc qdisc add dev \$ETH root fq_codel target 5ms interval 40ms 2>/dev/null
+    tc qdisc add dev $ETH root fq_codel target 5ms interval 40ms 2>/dev/null
 fi
 BOOTEOF
 chmod +x /etc/networkd-dispatcher/routable.d/50-cake
 ok "CAKE boot persistence written"
 
-sec "STEP 9 — VMESS WS SOCKOPT PATCHER"
+sec "STEP 8 — VMESS WS SOCKOPT PATCHER"
 
 PATCHER=/usr/local/bin/xui-ws-patch.py
 cat > "$PATCHER" << 'PYEOF'
@@ -284,8 +260,15 @@ SOCKOPT = {
 }
 
 def patch(path):
-    with open(path) as f:
-        cfg = json.load(f)
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        print(f"  [{path}] JSON parse error: {e} — skipping")
+        return 0
+    except OSError as e:
+        print(f"  [{path}] read error: {e} — skipping")
+        return 0
     inbounds = cfg.get("inbounds") or []
     if not inbounds:
         print(f"  [{path}] no inbounds yet")
@@ -303,8 +286,12 @@ def patch(path):
             if so.get(k) != v:
                 so[k] = v
                 changed += 1
-    with open(path, "w") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    try:
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2, ensure_ascii=False)
+    except OSError as e:
+        print(f"  [{path}] write error: {e}")
+        return 0
     print(f"  [{path}] patched {changed} fields, {len(inbounds)} inbound(s)")
     return changed
 
@@ -321,13 +308,13 @@ ok "xui-ws-patch.py created"
 mkdir -p /etc/systemd/system/x-ui.service.d/
 cat > /etc/systemd/system/x-ui.service.d/ws-patch.conf << 'UNITEOF'
 [Service]
-ExecStartPost=/bin/bash -c 'sleep 4 && python3 /usr/local/bin/xui-ws-patch.py'
+ExecStartPost=/bin/bash -c 'for i in $(seq 15); do sleep 2 && python3 /usr/local/bin/xui-ws-patch.py && break; done'
 UNITEOF
 ok "sockopt auto-patcher hooked to x-ui"
 
 python3 "$PATCHER" && ok "ws-patch applied now" || inf "will apply on next x-ui start"
 
-sec "STEP 10 — CPU / IRQ TUNING"
+sec "STEP 9 — CPU / IRQ TUNING"
 
 ETH_IRQ=$(grep "$ETH" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ' | head -1)
 if [[ -n "$ETH_IRQ" ]]; then
@@ -346,7 +333,7 @@ else
     inf "cpufreq not exposed (host controls — normal for KVM)"
 fi
 
-sec "STEP 11 — RELOAD & RESTART"
+sec "STEP 10 — RELOAD & RESTART"
 
 systemctl daemon-reload
 ok "systemd daemon reloaded"
@@ -387,9 +374,7 @@ echo -e "${G}${B}║  DONE — Setup complete!                  ║${N}"
 echo -e "${G}${B}╚══════════════════════════════════════════╝${N}"
 echo ""
 echo -e "${Y}  ▸ 3x-ui panel  : http://$(curl -s ifconfig.me 2>/dev/null):54321${N}"
-echo -e "${Y}  ▸ inbound setup : VMESS | WS | port 80 | path /4G&4G⁺ | Host: th.speedtest.net${N}"
-echo -e "${Y}  ▸ ReadyIDC panel: เปิดพอร์ตด้านนั้นด้วยถ้ามี Firewall Rules${N}"
+echo -e "${Y}  ▸ inbound setup : VMESS | WS | port 80 | path /ais | Host: th.speedtest.net${N}"
+echo -e "${Y}  ▸ VPS panel: เปิดพอร์ตด้านนั้นด้วยถ้ามี Firewall Rules${N}"
 echo -e "${Y}  ▸ reboot        : sudo reboot${N}"
 echo ""
-ENDOFSCRIPT
-echo "done"
