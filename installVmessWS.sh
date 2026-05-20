@@ -259,34 +259,110 @@ if [[ -n "$XRAY_CONFIG" ]]; then
     run "Backing up to ${XRAY_CONFIG}.bak"
     cp "$XRAY_CONFIG" "${XRAY_CONFIG}.bak"
     ok "Backup done"
-    # inject sockopt into inbounds that don't have it
     if command -v python3 &>/dev/null; then
         run "Patching inbounds with sockopt tcpNoDelay=true, keepAlive=true..."
         python3 << PYEOF
 import json, sys
+
 with open("$XRAY_CONFIG") as f:
     cfg = json.load(f)
+
+inbounds = cfg.get("inbounds") or []
+if not inbounds:
+    print("  no inbounds yet (fresh install) — sockopt will be patched after first inbound is added")
+    sys.exit(0)
+
 changed = 0
-for ib in cfg.get("inbounds", []):
-    so = ib.setdefault("streamSettings", {}).setdefault("sockopt", {})
+for ib in inbounds:
+    if not isinstance(ib, dict):
+        continue
+    ss = ib.setdefault("streamSettings", {})
+    if not isinstance(ss, dict):
+        ib["streamSettings"] = {}
+        ss = ib["streamSettings"]
+    so = ss.setdefault("sockopt", {})
     updates = {
         "tcpNoDelay": True,
         "tcpKeepAliveIdle": 20,
         "tcpKeepAliveInterval": 5,
         "mark": 0
     }
-    for k,v in updates.items():
+    for k, v in updates.items():
         if so.get(k) != v:
             so[k] = v
             changed += 1
+
 with open("$XRAY_CONFIG", "w") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
-print(f"  patched {changed} sockopt fields")
+
+print(f"  patched {changed} fields across {len(inbounds)} inbounds")
 PYEOF
-        ok "sockopt patched in xray config"
+        ok "sockopt patch done"
     else
-        err "python3 not found — patch xray config manually"
+        err "python3 not found"
     fi
+
+    # ── install re-patcher service: รัน patch ทุกครั้งที่ x-ui restart ──
+    run "Installing sockopt auto-patcher (runs on every x-ui restart)..."
+    PATCHER=/usr/local/bin/xui-sockopt-patch.py
+    cat > "$PATCHER" << 'PYFILE'
+#!/usr/bin/env python3
+import json, sys, os, time
+
+PATHS = [
+    "/usr/local/x-ui/bin/config.json",
+    "/etc/x-ui/config.json",
+    "/root/x-ui/bin/config.json",
+]
+SOCKOPT = {
+    "tcpNoDelay": True,
+    "tcpKeepAliveIdle": 20,
+    "tcpKeepAliveInterval": 5,
+    "mark": 0,
+}
+
+def patch(path):
+    with open(path) as f:
+        cfg = json.load(f)
+    inbounds = cfg.get("inbounds") or []
+    if not inbounds:
+        return 0
+    changed = 0
+    for ib in inbounds:
+        if not isinstance(ib, dict):
+            continue
+        ss = ib.setdefault("streamSettings", {})
+        if not isinstance(ss, dict):
+            ib["streamSettings"] = {}
+            ss = ib["streamSettings"]
+        so = ss.setdefault("sockopt", {})
+        for k, v in SOCKOPT.items():
+            if so.get(k) != v:
+                so[k] = v
+                changed += 1
+    with open(path, "w") as f:
+        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    return changed
+
+for p in PATHS:
+    if os.path.exists(p):
+        n = patch(p)
+        print(f"patched {n} fields in {p}")
+        sys.exit(0)
+
+print("no xray config found")
+PYFILE
+    chmod +x "$PATCHER"
+
+    # systemd ExecStartPost hook บน x-ui
+    mkdir -p /etc/systemd/system/x-ui.service.d/
+    # append ไปใน override เดิม
+    cat > /etc/systemd/system/x-ui.service.d/sockopt.conf << 'UNITEOF'
+[Service]
+ExecStartPost=/bin/bash -c 'sleep 3 && python3 /usr/local/bin/xui-sockopt-patch.py'
+UNITEOF
+    systemctl daemon-reload
+    ok "auto-patcher installed → จะรันทุกครั้งหลัง x-ui start"
 else
     ok "xray config not found yet (จะ patch อัตโนมัติเมื่อ 3x-ui สร้าง config แล้ว)"
     echo -e "${Y}  ▸ sockopt ที่ต้องเพิ่มใน inbound ทุก entry ใน 3x-ui JSON editor:${N}"
