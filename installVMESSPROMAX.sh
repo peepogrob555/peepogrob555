@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/setup-vmess-beast.sh << 'ENDOFSCRIPT'
 #!/bin/bash
 set -e
 
@@ -407,6 +406,3 @@ echo -e "${Y}  ▸ sockopt patcher: runs auto on every x-ui start${N}"
 echo -e "${Y}  ▸ Firewall Rules : เปิดพอร์ตใน ReadyIDC panel ด้วย${N}"
 echo -e "${Y}  ▸ reboot         : sudo reboot${N}"
 echo -e "${Y}  ▸ nofile 1000000 : มีผลหลัง reboot${N}"
-echo ""
-ENDOFSCRIPT
-bash -n /mnt/user-data/outputs/setup-vmess-beast.sh && echo "syntax OK"
