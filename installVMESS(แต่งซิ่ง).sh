@@ -1,3 +1,4 @@
+cat > /mnt/user-data/outputs/setup-vmess-beast.sh << 'ENDOFSCRIPT'
 #!/bin/bash
 set -e
 
@@ -15,7 +16,7 @@ sec() { echo -e "\n${B}${C}╔════════════════�
 
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 PUBIP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-echo -e "\n${B}${C}  VPS Setup — VMESS WS | AIS LTE | BALANCED${N}"
+echo -e "\n${B}${C}  VPS Setup — VMESS WS | BEAST MODE | 1Gbps + LOW LATENCY${N}"
 echo -e "  Interface: ${Y}$ETH${N} | IP: ${Y}$PUBIP${N}\n"
 
 sec "STEP 1 — SWAP 512MB"
@@ -70,28 +71,33 @@ else
     ok "3x-ui installed"
 fi
 
-sec "STEP 4 — SYSTEM LIMITS"
+sec "STEP 4 — SYSTEM LIMITS (MAX)"
 
 cat > /etc/security/limits.d/99-xui.conf << 'EOF'
-*    soft nofile 65535
-*    hard nofile 65535
-root soft nofile 65535
-root hard nofile 65535
+*    soft nofile 1000000
+*    hard nofile 1000000
+*    soft nproc  1000000
+*    hard nproc  1000000
+root soft nofile 1000000
+root hard nofile 1000000
+root soft nproc  1000000
+root hard nproc  1000000
 EOF
-ok "limits.d: nofile=65535"
+ok "limits.d: nofile=1000000"
 
 mkdir -p /etc/systemd/system/x-ui.service.d/
 cat > /etc/systemd/system/x-ui.service.d/limits.conf << 'EOF'
 [Service]
-LimitNOFILE=65535
-LimitNPROC=65535
+LimitNOFILE=1000000
+LimitNPROC=1000000
+LimitMEMLOCK=infinity
 EOF
 ok "x-ui service limits set"
 
 echo 1000000 > /proc/sys/fs/file-max
 ok "fs.file-max=1000000 (live)"
 
-sec "STEP 5 — SYSCTL KERNEL TUNING (BALANCED)"
+sec "STEP 5 — SYSCTL BEAST MODE (1Gbps + Low Latency)"
 
 modprobe tcp_bbr 2>/dev/null && ok "tcp_bbr loaded" || inf "tcp_bbr built-in"
 
@@ -99,63 +105,72 @@ cat > /etc/sysctl.d/99-ais-vmess.conf << 'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-net.core.rmem_default = 262144
-net.core.rmem_max = 8388608
-net.core.wmem_default = 262144
-net.core.wmem_max = 8388608
-net.ipv4.tcp_rmem = 4096 262144 8388608
-net.ipv4.tcp_wmem = 4096 262144 8388608
+# ── Beast Buffers — 1Gbps × 20ms RTT BDP = 2.5MB, ×8 headroom ──
+net.core.rmem_default = 1048576
+net.core.rmem_max = 134217728
+net.core.wmem_default = 1048576
+net.core.wmem_max = 134217728
+net.ipv4.tcp_rmem = 4096 1048576 134217728
+net.ipv4.tcp_wmem = 4096 1048576 134217728
 net.core.optmem_max = 65536
-net.ipv4.tcp_mem = 16384 65536 131072
-net.ipv4.tcp_adv_win_scale = 2
+net.ipv4.tcp_mem = 65536 1048576 134217728
+net.ipv4.tcp_adv_win_scale = 1
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_window_scaling = 1
 
+# ── Low Latency params ────────────────────────────────────────
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 10
+net.ipv4.tcp_fin_timeout = 5
 net.ipv4.tcp_autocorking = 0
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_limit_output_bytes = 131072
+net.ipv4.tcp_limit_output_bytes = 1048576
 
-net.ipv4.tcp_keepalive_time = 20
-net.ipv4.tcp_keepalive_intvl = 5
-net.ipv4.tcp_keepalive_probes = 6
+# ── Keepalive — จับ stall เร็ว ────────────────────────────────
+net.ipv4.tcp_keepalive_time = 10
+net.ipv4.tcp_keepalive_intvl = 3
+net.ipv4.tcp_keepalive_probes = 4
 
-net.core.somaxconn = 8192
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.netdev_max_backlog = 16384
-net.core.netdev_budget = 300
+# ── Queue — ใหญ่พอสำหรับ 1Gbps burst ─────────────────────────
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
+net.core.netdev_max_backlog = 65535
+net.core.netdev_budget = 600
 net.core.netdev_budget_usecs = 4000
 
+# ── No busy poll (1 core) ──────────────────────────────────────
 net.core.busy_poll = 0
 net.core.busy_read = 0
 
+# ── Recovery ──────────────────────────────────────────────────
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
 net.ipv4.tcp_recovery = 1
-net.ipv4.tcp_retries2 = 6
-net.ipv4.tcp_syn_retries = 3
-net.ipv4.tcp_orphan_retries = 2
-net.ipv4.tcp_max_orphans = 8192
+net.ipv4.tcp_retries2 = 5
+net.ipv4.tcp_syn_retries = 2
+net.ipv4.tcp_orphan_retries = 1
+net.ipv4.tcp_max_orphans = 65535
 
+# ── ECN ───────────────────────────────────────────────────────
 net.ipv4.tcp_ecn = 1
 
+# ── Ports & Forwarding ─────────────────────────────────────────
 net.ipv4.ip_local_port_range = 1024 65535
 net.ipv4.tcp_timestamps = 1
-
 net.ipv4.ip_forward = 1
 net.ipv4.conf.all.rp_filter = 0
 net.ipv4.conf.default.rp_filter = 0
 
+# ── File descriptors ───────────────────────────────────────────
 fs.file-max = 1000000
 fs.nr_open = 1000000
 
-vm.swappiness = 10
-vm.dirty_ratio = 15
-vm.dirty_background_ratio = 5
+# ── VM ────────────────────────────────────────────────────────
+vm.swappiness = 5
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 3
 EOF
 
 sysctl --system 2>&1 | grep -E "bbr|fastopen|keepalive|rmem|wmem|somaxconn|autocorking|slow_start|notsent|mtu_prob|forward|swappiness|output_bytes" | \
@@ -190,10 +205,10 @@ ETEOF
 chmod +x /etc/networkd-dispatcher/routable.d/51-ethtool
 ok "ethtool persistence written"
 
-sec "STEP 7 — CAKE QDISC (RTT=40ms, 1Gbps)"
+sec "STEP 7 — CAKE QDISC (RTT=20ms, 1Gbps, BEAST)"
 
-ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && \
-    ok "txqueuelen -> 4096" || inf "txqueuelen skipped"
+ip link set dev "$ETH" txqueuelen 10000 2>/dev/null && \
+    ok "txqueuelen -> 10000" || inf "txqueuelen skipped"
 
 modprobe sch_cake 2>/dev/null && ok "sch_cake loaded" || inf "sch_cake unavailable"
 
@@ -201,16 +216,16 @@ tc qdisc del dev "$ETH" root 2>/dev/null || true
 ok "old qdisc cleared"
 
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 40ms besteffort split-gso 2>/dev/null && \
-        ok "CAKE applied: 1gbit rtt 40ms besteffort split-gso" || {
-        tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 40ms besteffort 2>/dev/null && \
-            ok "CAKE applied: 1gbit rtt 40ms besteffort" || {
-            tc qdisc add dev "$ETH" root fq_codel target 5ms interval 40ms 2>/dev/null && \
+    tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 20ms besteffort split-gso 2>/dev/null && \
+        ok "CAKE applied: 1gbit rtt 20ms besteffort split-gso" || {
+        tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 20ms besteffort 2>/dev/null && \
+            ok "CAKE applied: 1gbit rtt 20ms besteffort" || {
+            tc qdisc add dev "$ETH" root fq_codel target 2ms interval 20ms 2>/dev/null && \
                 ok "fq_codel fallback applied" || err "qdisc failed"
         }
     }
 else
-    tc qdisc add dev "$ETH" root fq_codel target 5ms interval 40ms 2>/dev/null && \
+    tc qdisc add dev "$ETH" root fq_codel target 2ms interval 20ms 2>/dev/null && \
         ok "fq_codel applied" || err "qdisc failed"
 fi
 
@@ -220,21 +235,21 @@ mkdir -p /etc/networkd-dispatcher/routable.d/
 cat > /etc/networkd-dispatcher/routable.d/50-cake << 'BOOTEOF'
 #!/bin/bash
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
-ip link set dev $ETH txqueuelen 4096 2>/dev/null || true
+ip link set dev $ETH txqueuelen 10000 2>/dev/null || true
 tc qdisc del dev $ETH root 2>/dev/null || true
 modprobe sch_cake 2>/dev/null
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 40ms besteffort split-gso 2>/dev/null || \
-    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 40ms besteffort 2>/dev/null || \
-    tc qdisc add dev $ETH root fq_codel target 5ms interval 40ms 2>/dev/null
+    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 20ms besteffort split-gso 2>/dev/null || \
+    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 20ms besteffort 2>/dev/null || \
+    tc qdisc add dev $ETH root fq_codel target 2ms interval 20ms 2>/dev/null
 else
-    tc qdisc add dev $ETH root fq_codel target 5ms interval 40ms 2>/dev/null
+    tc qdisc add dev $ETH root fq_codel target 2ms interval 20ms 2>/dev/null
 fi
 BOOTEOF
 chmod +x /etc/networkd-dispatcher/routable.d/50-cake
 ok "CAKE boot persistence written"
 
-sec "STEP 8 — VMESS WS SOCKOPT PATCHER"
+sec "STEP 8 — VMESS WS SOCKOPT PATCHER (BEAST)"
 
 PATCHER=/usr/local/bin/xui-ws-patch.py
 cat > "$PATCHER" << 'PYEOF'
@@ -249,10 +264,10 @@ PATHS = [
 
 SOCKOPT = {
     "tcpNoDelay":           True,
-    "tcpKeepAliveIdle":     20,
-    "tcpKeepAliveInterval": 5,
+    "tcpKeepAliveIdle":     10,
+    "tcpKeepAliveInterval": 3,
     "tcpFastOpen":          True,
-    "tcpUserTimeout":       4000,
+    "tcpUserTimeout":       3000,
     "mark":                 0,
 }
 
@@ -359,11 +374,15 @@ ok "cc             = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
 ok "fastopen       = $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)"
 ok "autocorking    = $(sysctl -n net.ipv4.tcp_autocorking 2>/dev/null)"
 ok "keepalive_time = $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)s"
+ok "rmem_max       = $(sysctl -n net.core.rmem_max 2>/dev/null)"
+ok "wmem_max       = $(sysctl -n net.core.wmem_max 2>/dev/null)"
+ok "somaxconn      = $(sysctl -n net.core.somaxconn 2>/dev/null)"
+ok "notsent_lowat  = $(sysctl -n net.ipv4.tcp_notsent_lowat 2>/dev/null)"
 ok "output_bytes   = $(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null)"
 ok "ecn            = $(sysctl -n net.ipv4.tcp_ecn 2>/dev/null)"
 ok "busy_poll      = $(sysctl -n net.core.busy_poll 2>/dev/null)"
 ok "nofile         = soft:$(ulimit -Sn) hard:$(ulimit -Hn)"
-inf "note: nofile soft will be 65535 after reboot"
+inf "note: nofile 1000000 มีผลหลัง reboot"
 
 inf "── qdisc ──"
 tc qdisc show dev "$ETH" | while IFS= read -r line; do ok "$line"; done
@@ -376,5 +395,18 @@ PANEL_PORT=${PANEL_PORT:-54321}
 
 echo ""
 echo -e "${G}${B}╔══════════════════════════════════════════╗${N}"
-echo -e "${G}${B}║  DONE — Balanced Setup complete!         ║${N}"
+echo -e "${G}${B}║  DONE — BEAST MODE complete!             ║${N}"
 echo -e "${G}${B}╚══════════════════════════════════════════╝${N}"
+echo ""
+echo -e "${Y}  ▸ 3x-ui panel   : https://YOUR_DOMAIN:${PANEL_PORT}/YOUR_PATH${N}"
+echo -e "${Y}                    http://${PUBIP}:${PANEL_PORT}  (fallback)${N}"
+echo -e "${Y}  ▸ inbound        : VMESS | WS | port 80 | security: none${N}"
+echo -e "${Y}  ▸ TCP Max Seg    : 1380 (ตั้งใน 3x-ui sockopt)${N}"
+echo -e "${Y}  ▸ MTU VPN        : 1400 (ตั้งใน v2rayNG/V2BOX)${N}"
+echo -e "${Y}  ▸ sockopt patcher: runs auto on every x-ui start${N}"
+echo -e "${Y}  ▸ Firewall Rules : เปิดพอร์ตใน ReadyIDC panel ด้วย${N}"
+echo -e "${Y}  ▸ reboot         : sudo reboot${N}"
+echo -e "${Y}  ▸ nofile 1000000 : มีผลหลัง reboot${N}"
+echo ""
+ENDOFSCRIPT
+bash -n /mnt/user-data/outputs/setup-vmess-beast.sh && echo "syntax OK"
