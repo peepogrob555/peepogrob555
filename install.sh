@@ -194,7 +194,7 @@ ETEOF
 chmod +x /etc/networkd-dispatcher/routable.d/51-ethtool
 ok "ethtool persistence written"
 
-sec "STEP 7 — CAKE QDISC (RTT=35ms, 1Gbps, besteffort)"
+sec "STEP 7 — CAKE QDISC (RTT=35ms, 400Mbps, besteffort)"
 
 ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && \
     ok "txqueuelen -> 4096" || inf "txqueuelen skipped"
@@ -205,10 +205,10 @@ tc qdisc del dev "$ETH" root 2>/dev/null || true
 ok "old qdisc cleared"
 
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 35ms besteffort split-gso 2>/dev/null && \
-        ok "CAKE applied: 1gbit rtt 35ms besteffort split-gso" || {
-        tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 35ms besteffort 2>/dev/null && \
-            ok "CAKE applied: 1gbit rtt 35ms besteffort" || {
+    tc qdisc add dev "$ETH" root cake bandwidth 400mbit rtt 35ms besteffort split-gso 2>/dev/null && \
+        ok "CAKE applied: 400mbit rtt 35ms besteffort split-gso" || {
+        tc qdisc add dev "$ETH" root cake bandwidth 400mbit rtt 35ms besteffort 2>/dev/null && \
+            ok "CAKE applied: 400mbit rtt 35ms besteffort" || {
             tc qdisc add dev "$ETH" root fq_codel target 2ms interval 35ms 2>/dev/null && \
                 ok "fq_codel fallback applied" || err "qdisc failed"
         }
@@ -227,8 +227,8 @@ ip link set dev $ETH txqueuelen 4096 2>/dev/null || true
 tc qdisc del dev $ETH root 2>/dev/null || true
 modprobe sch_cake 2>/dev/null
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 35ms besteffort split-gso 2>/dev/null || \
-    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 35ms besteffort 2>/dev/null || \
+    tc qdisc add dev $ETH root cake bandwidth 400mbit rtt 35ms besteffort split-gso 2>/dev/null || \
+    tc qdisc add dev $ETH root cake bandwidth 400mbit rtt 35ms besteffort 2>/dev/null || \
     tc qdisc add dev $ETH root fq_codel target 2ms interval 35ms 2>/dev/null
 else
     tc qdisc add dev $ETH root fq_codel target 2ms interval 35ms 2>/dev/null
@@ -392,7 +392,7 @@ echo -e "${Y}  ▸ TCP Max Seg      : 1460 (1500 - 40 IP/TCP overhead)${N}"
 echo -e "${Y}  ▸ BDP target       : 400Mbps × 35ms = 1.75MB → buf 8MB${N}"
 echo -e "${Y}  ▸ output_bytes     : 524288 (burst 400Mbps)${N}"
 echo -e "${Y}  ▸ notsent_lowat    : 32768 (queue depth 400Mbps)${N}"
-echo -e "${Y}  ▸ CAKE             : 1gbit rtt 35ms besteffort${N}"
+echo -e "${Y}  ▸ CAKE             : 400mbit rtt 35ms besteffort${N}"
 echo -e "${Y}  ▸ tcpUserTimeout   : 8000ms (35ms RTT + LTE loss)${N}"
 echo -e "${Y}  ▸ sockopt patcher  : runs auto on every x-ui start${N}"
 echo -e "${Y}  ▸ Firewall Rules   : เปิดพอร์ตใน ReadyIDC panel ด้วย${N}"
