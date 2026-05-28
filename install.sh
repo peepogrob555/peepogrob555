@@ -15,9 +15,9 @@ sec() { echo -e "\n${B}${C}╔════════════════�
 
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 PUBIP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-echo -e "\n${B}${C}  VPS Setup — VMESS WS | MULTI-USER | 1Gbps/conn | LOW PING + LOW JITTER${N}"
+echo -e "\n${B}${C}  VPS Setup — VMESS WS | MULTI-USER | 400Mbps/conn | LOW PING + LOW JITTER${N}"
 echo -e "  Interface: ${Y}$ETH${N} | IP: ${Y}$PUBIP${N}\n"
-echo -e "  Target: 1Gbps max/conn | RTT 20ms | MTU VPN 1500 | ping low | jitter low\n"
+echo -e "  Target: 400Mbps/conn | RTT 35ms | MTU VPN 1500 | MSS 1460 | ping low | jitter low\n"
 
 sec "STEP 1 — SWAP 512MB"
 
@@ -96,7 +96,7 @@ ok "x-ui service limits set"
 echo 1000000 > /proc/sys/fs/file-max
 ok "fs.file-max=1000000 (live)"
 
-sec "STEP 5 — SYSCTL (1Gbps/conn × multi-user | RTT 20ms | low ping | low jitter)"
+sec "STEP 5 — SYSCTL (400Mbps/conn | RTT 35ms | MSS 1460 | low ping | low jitter)"
 
 modprobe tcp_bbr 2>/dev/null && ok "tcp_bbr loaded" || inf "tcp_bbr built-in"
 
@@ -104,12 +104,13 @@ cat > /etc/sysctl.d/99-ais-vmess.conf << 'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-net.core.rmem_default = 131072
+# BDP = 400Mbps × 0.035s / 8 = 1.75MB → 4× = 7MB → ceil to 8MB
+net.core.rmem_default = 262144
 net.core.rmem_max = 67108864
-net.core.wmem_default = 131072
+net.core.wmem_default = 262144
 net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 131072 67108864
-net.ipv4.tcp_wmem = 4096 131072 67108864
+net.ipv4.tcp_rmem = 4096 262144 67108864
+net.ipv4.tcp_wmem = 4096 262144 67108864
 net.core.optmem_max = 65536
 net.ipv4.tcp_mem = 65536 1048576 536870912
 net.ipv4.tcp_adv_win_scale = 2
@@ -121,9 +122,9 @@ net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 5
 net.ipv4.tcp_autocorking = 0
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_notsent_lowat = 32768
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_limit_output_bytes = 131072
+net.ipv4.tcp_limit_output_bytes = 524288
 
 net.ipv4.tcp_keepalive_time = 10
 net.ipv4.tcp_keepalive_intvl = 3
@@ -132,7 +133,7 @@ net.ipv4.tcp_keepalive_probes = 4
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.core.netdev_max_backlog = 32768
-net.core.netdev_budget = 300
+net.core.netdev_budget = 400
 net.core.netdev_budget_usecs = 4000
 
 net.core.busy_poll = 0
@@ -193,7 +194,7 @@ ETEOF
 chmod +x /etc/networkd-dispatcher/routable.d/51-ethtool
 ok "ethtool persistence written"
 
-sec "STEP 7 — CAKE QDISC (RTT=25ms, 1Gbps, fair per-flow)"
+sec "STEP 7 — CAKE QDISC (RTT=35ms, 1Gbps, besteffort)"
 
 ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && \
     ok "txqueuelen -> 4096" || inf "txqueuelen skipped"
@@ -204,16 +205,16 @@ tc qdisc del dev "$ETH" root 2>/dev/null || true
 ok "old qdisc cleared"
 
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 25ms besteffort split-gso 2>/dev/null && \
-        ok "CAKE applied: 1gbit rtt 25ms besteffort split-gso" || {
-        tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 25ms besteffort 2>/dev/null && \
-            ok "CAKE applied: 1gbit rtt 25ms besteffort" || {
-            tc qdisc add dev "$ETH" root fq_codel target 2ms interval 25ms 2>/dev/null && \
+    tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 35ms besteffort split-gso 2>/dev/null && \
+        ok "CAKE applied: 1gbit rtt 35ms besteffort split-gso" || {
+        tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 35ms besteffort 2>/dev/null && \
+            ok "CAKE applied: 1gbit rtt 35ms besteffort" || {
+            tc qdisc add dev "$ETH" root fq_codel target 2ms interval 35ms 2>/dev/null && \
                 ok "fq_codel fallback applied" || err "qdisc failed"
         }
     }
 else
-    tc qdisc add dev "$ETH" root fq_codel target 2ms interval 25ms 2>/dev/null && \
+    tc qdisc add dev "$ETH" root fq_codel target 2ms interval 35ms 2>/dev/null && \
         ok "fq_codel applied" || err "qdisc failed"
 fi
 
@@ -226,17 +227,17 @@ ip link set dev $ETH txqueuelen 4096 2>/dev/null || true
 tc qdisc del dev $ETH root 2>/dev/null || true
 modprobe sch_cake 2>/dev/null
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 25ms besteffort split-gso 2>/dev/null || \
-    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 25ms besteffort 2>/dev/null || \
-    tc qdisc add dev $ETH root fq_codel target 2ms interval 25ms 2>/dev/null
+    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 35ms besteffort split-gso 2>/dev/null || \
+    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 35ms besteffort 2>/dev/null || \
+    tc qdisc add dev $ETH root fq_codel target 2ms interval 35ms 2>/dev/null
 else
-    tc qdisc add dev $ETH root fq_codel target 2ms interval 25ms 2>/dev/null
+    tc qdisc add dev $ETH root fq_codel target 2ms interval 35ms 2>/dev/null
 fi
 BOOTEOF
 chmod +x /etc/networkd-dispatcher/routable.d/50-cake
 ok "CAKE boot persistence written"
 
-sec "STEP 8 — VMESS WS SOCKOPT PATCHER (MTU 1500 | None-TLS)"
+sec "STEP 8 — VMESS WS SOCKOPT PATCHER (MTU 1500 | MSS 1460 | None-TLS)"
 
 PATCHER=/usr/local/bin/xui-ws-patch.py
 cat > "$PATCHER" << 'PYEOF'
@@ -253,7 +254,7 @@ SOCKOPT = {
     "tcpKeepAliveIdle":     10,
     "tcpKeepAliveInterval": 3,
     "tcpFastOpen":          True,
-    "tcpUserTimeout":       5000,
+    "tcpUserTimeout":       8000,
     "tcpMaxSeg":            1460,
     "mark":                 0,
 }
@@ -384,17 +385,17 @@ echo -e "${G}${B}╔════════════════════
 echo -e "${G}${B}║  DONE — Multi-User Setup complete!       ║${N}"
 echo -e "${G}${B}╚══════════════════════════════════════════╝${N}"
 echo ""
-echo -e "${Y}  ▸ 3x-ui panel    : https://YOUR_DOMAIN:${PANEL_PORT}/YOUR_PATH${N}"
-echo -e "${Y}                     http://${PUBIP}:${PANEL_PORT}  (fallback)${N}"
-echo -e "${Y}  ▸ inbound         : VMESS | WS | port 80 | security: none${N}"
-echo -e "${Y}  ▸ TCP Max Seg     : 1460 (None-TLS optimized — MTU VPN 1500)${N}"
-echo -e "${Y}  ▸ MTU VPN V2BOX   : 1500 (locked — tcpMaxSeg 1460 compensates)${N}"
-echo -e "${Y}  ▸ max speed/conn  : 1Gbps${N}"
-echo -e "${Y}  ▸ CAKE            : 1gbit fair queue ทุก flow${N}"
-echo -e "${Y}  ▸ RAM kernel buf  : default 128KB/conn, max 64MB/conn${N}"
-echo -e "${Y}  ▸ output_bytes    : 131072 (4×MSS burst สำหรับ 1460 MSS)${N}"
-echo -e "${Y}  ▸ sockopt patcher : runs auto on every x-ui start${N}"
-echo -e "${Y}  ▸ Firewall Rules  : เปิดพอร์ตใน ReadyIDC panel ด้วย${N}"
-echo -e "${Y}  ▸ reboot          : sudo reboot${N}"
-echo -e "${Y}  ▸ nofile 1000000  : มีผลหลัง reboot${N}"
+echo -e "${Y}  ▸ 3x-ui panel     : http://${PUBIP}:${PANEL_PORT}${N}"
+echo -e "${Y}  ▸ inbound          : VMESS | WS | port 80 | security: none${N}"
+echo -e "${Y}  ▸ MTU VPN V2BOX    : 1500 (fixed)${N}"
+echo -e "${Y}  ▸ TCP Max Seg      : 1460 (1500 - 40 IP/TCP overhead)${N}"
+echo -e "${Y}  ▸ BDP target       : 400Mbps × 35ms = 1.75MB → buf 8MB${N}"
+echo -e "${Y}  ▸ output_bytes     : 524288 (burst 400Mbps)${N}"
+echo -e "${Y}  ▸ notsent_lowat    : 32768 (queue depth 400Mbps)${N}"
+echo -e "${Y}  ▸ CAKE             : 1gbit rtt 35ms besteffort${N}"
+echo -e "${Y}  ▸ tcpUserTimeout   : 8000ms (35ms RTT + LTE loss)${N}"
+echo -e "${Y}  ▸ sockopt patcher  : runs auto on every x-ui start${N}"
+echo -e "${Y}  ▸ Firewall Rules   : เปิดพอร์ตใน ReadyIDC panel ด้วย${N}"
+echo -e "${Y}  ▸ reboot           : sudo reboot${N}"
+echo -e "${Y}  ▸ nofile 1000000   : มีผลหลัง reboot${N}"
 echo ""
