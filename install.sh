@@ -1,3 +1,4 @@
+#!/bin/bash
 set -e
 
 R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
@@ -121,8 +122,8 @@ net.ipv4.tcp_fin_timeout = 5
 net.ipv4.tcp_autocorking = 0
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_mtu_probing = 2
-net.ipv4.tcp_limit_output_bytes = 524288
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_limit_output_bytes = 131072
 
 net.ipv4.tcp_keepalive_time = 10
 net.ipv4.tcp_keepalive_intvl = 3
@@ -131,7 +132,7 @@ net.ipv4.tcp_keepalive_probes = 4
 net.core.somaxconn = 65535
 net.ipv4.tcp_max_syn_backlog = 65535
 net.core.netdev_max_backlog = 32768
-net.core.netdev_budget = 400
+net.core.netdev_budget = 300
 net.core.netdev_budget_usecs = 4000
 
 net.core.busy_poll = 0
@@ -192,7 +193,7 @@ ETEOF
 chmod +x /etc/networkd-dispatcher/routable.d/51-ethtool
 ok "ethtool persistence written"
 
-sec "STEP 7 — CAKE QDISC (RTT=20ms, 1Gbps, fair per-flow)"
+sec "STEP 7 — CAKE QDISC (RTT=25ms, 1Gbps, fair per-flow)"
 
 ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && \
     ok "txqueuelen -> 4096" || inf "txqueuelen skipped"
@@ -203,16 +204,16 @@ tc qdisc del dev "$ETH" root 2>/dev/null || true
 ok "old qdisc cleared"
 
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 20ms besteffort split-gso 2>/dev/null && \
-        ok "CAKE applied: 1gbit rtt 20ms besteffort split-gso" || {
-        tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 20ms besteffort 2>/dev/null && \
-            ok "CAKE applied: 1gbit rtt 20ms besteffort" || {
-            tc qdisc add dev "$ETH" root fq_codel target 2ms interval 20ms 2>/dev/null && \
+    tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 25ms besteffort split-gso 2>/dev/null && \
+        ok "CAKE applied: 1gbit rtt 25ms besteffort split-gso" || {
+        tc qdisc add dev "$ETH" root cake bandwidth 1gbit rtt 25ms besteffort 2>/dev/null && \
+            ok "CAKE applied: 1gbit rtt 25ms besteffort" || {
+            tc qdisc add dev "$ETH" root fq_codel target 2ms interval 25ms 2>/dev/null && \
                 ok "fq_codel fallback applied" || err "qdisc failed"
         }
     }
 else
-    tc qdisc add dev "$ETH" root fq_codel target 2ms interval 20ms 2>/dev/null && \
+    tc qdisc add dev "$ETH" root fq_codel target 2ms interval 25ms 2>/dev/null && \
         ok "fq_codel applied" || err "qdisc failed"
 fi
 
@@ -225,11 +226,11 @@ ip link set dev $ETH txqueuelen 4096 2>/dev/null || true
 tc qdisc del dev $ETH root 2>/dev/null || true
 modprobe sch_cake 2>/dev/null
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 20ms besteffort split-gso 2>/dev/null || \
-    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 20ms besteffort 2>/dev/null || \
-    tc qdisc add dev $ETH root fq_codel target 2ms interval 20ms 2>/dev/null
+    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 25ms besteffort split-gso 2>/dev/null || \
+    tc qdisc add dev $ETH root cake bandwidth 1gbit rtt 25ms besteffort 2>/dev/null || \
+    tc qdisc add dev $ETH root fq_codel target 2ms interval 25ms 2>/dev/null
 else
-    tc qdisc add dev $ETH root fq_codel target 2ms interval 20ms 2>/dev/null
+    tc qdisc add dev $ETH root fq_codel target 2ms interval 25ms 2>/dev/null
 fi
 BOOTEOF
 chmod +x /etc/networkd-dispatcher/routable.d/50-cake
@@ -252,7 +253,7 @@ SOCKOPT = {
     "tcpKeepAliveIdle":     10,
     "tcpKeepAliveInterval": 3,
     "tcpFastOpen":          True,
-    "tcpUserTimeout":       3000,
+    "tcpUserTimeout":       5000,
     "tcpMaxSeg":            1460,
     "mark":                 0,
 }
@@ -391,7 +392,7 @@ echo -e "${Y}  ▸ MTU VPN V2BOX   : 1500 (locked — tcpMaxSeg 1460 compensates
 echo -e "${Y}  ▸ max speed/conn  : 1Gbps${N}"
 echo -e "${Y}  ▸ CAKE            : 1gbit fair queue ทุก flow${N}"
 echo -e "${Y}  ▸ RAM kernel buf  : default 128KB/conn, max 64MB/conn${N}"
-echo -e "${Y}  ▸ output_bytes    : 512KB (รองรับ burst 1Gbps)${N}"
+echo -e "${Y}  ▸ output_bytes    : 131072 (4×MSS burst สำหรับ 1460 MSS)${N}"
 echo -e "${Y}  ▸ sockopt patcher : runs auto on every x-ui start${N}"
 echo -e "${Y}  ▸ Firewall Rules  : เปิดพอร์ตใน ReadyIDC panel ด้วย${N}"
 echo -e "${Y}  ▸ reboot          : sudo reboot${N}"
