@@ -16,35 +16,22 @@ sec() { echo -e "\n${B}${C}╔════════════════�
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 PUBIP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 
-# ── detect hardware ──
-NCPU=$(nproc)
-RAM_MB=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-RAM_GB=$(awk "BEGIN{printf \"%.1f\", $RAM_MB/1024}")
-
-echo -e "\n${B}${C}  VPS Setup — VMESS WS | MULTI-USER | 400Mbps/conn | LOW PING + LOW JITTER${N}"
+echo -e "\n${B}${C}  VPS Setup — VMESS WS | 2-USER | 500Mbps | RTT 25ms | 1vCPU 2GB${N}"
 echo -e "  Interface : ${Y}$ETH${N} | IP: ${Y}$PUBIP${N}"
-echo -e "  Hardware  : ${Y}${NCPU} vCPU${N} | ${Y}${RAM_GB}GB RAM${N}"
-echo -e "  Target    : 400Mbps/conn | RTT 35ms | MTU 1500 | MSS 1460\n"
+echo -e "  Hardware  : ${Y}1 vCPU (2.69GHz)${N} | ${Y}2GB RAM${N}"
+echo -e "  Target    : 500Mbps gross → 425Mbps net after 15% VMESS WS overhead | RTT 25ms | MSS 1360 MTU 1400\n"
 
 sec "STEP 1 — SWAP"
 
-SWAP_MB=0
-[[ $RAM_MB -le 1024 ]] && SWAP_MB=1024
-[[ $RAM_MB -gt 1024 && $RAM_MB -le 2048 ]] && SWAP_MB=512
-[[ $RAM_MB -gt 2048 && $RAM_MB -le 4096 ]] && SWAP_MB=256
-[[ $RAM_MB -gt 4096 ]] && SWAP_MB=0
-
 if swapon --show | grep -q /swapfile; then
     ok "Swap already exists"
-elif [[ $SWAP_MB -gt 0 ]]; then
-    fallocate -l "${SWAP_MB}M" /swapfile
+else
+    fallocate -l 512M /swapfile
     chmod 600 /swapfile
     mkswap /swapfile
     swapon /swapfile
     grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    ok "Swap ${SWAP_MB}MB created (RAM=${RAM_MB}MB)"
-else
-    ok "RAM > 4GB — swap not needed"
+    ok "Swap 512MB created"
 fi
 
 sec "STEP 2 — OPEN PORTS"
@@ -81,64 +68,43 @@ fi
 
 sec "STEP 4 — SYSTEM LIMITS"
 
-NOFILE=1000000
-cat > /etc/security/limits.d/99-xui.conf << EOF
-*    soft nofile $NOFILE
-*    hard nofile $NOFILE
-*    soft nproc  $NOFILE
-*    hard nproc  $NOFILE
-root soft nofile $NOFILE
-root hard nofile $NOFILE
-root soft nproc  $NOFILE
-root hard nproc  $NOFILE
+cat > /etc/security/limits.d/99-xui.conf << 'EOF'
+*    soft nofile 1000000
+*    hard nofile 1000000
+*    soft nproc  1000000
+*    hard nproc  1000000
+root soft nofile 1000000
+root hard nofile 1000000
+root soft nproc  1000000
+root hard nproc  1000000
 EOF
-ok "nofile=$NOFILE nproc=$NOFILE"
+ok "nofile=1000000 nproc=1000000"
 
 mkdir -p /etc/systemd/system/x-ui.service.d/
-cat > /etc/systemd/system/x-ui.service.d/limits.conf << EOF
+cat > /etc/systemd/system/x-ui.service.d/limits.conf << 'EOF'
 [Service]
-LimitNOFILE=$NOFILE
-LimitNPROC=$NOFILE
+LimitNOFILE=1000000
+LimitNPROC=1000000
 EOF
-echo $NOFILE > /proc/sys/fs/file-max
+echo 1000000 > /proc/sys/fs/file-max
 ok "x-ui service limits set"
 
-sec "STEP 5 — SYSCTL (auto-tuned for ${NCPU}vCPU ${RAM_GB}GB)"
-
-# BDP = 400Mbps × 35ms / 8 = 1.75MB → 4× = 7MB
-BDP_BYTES=7340032
-RMEM_DEFAULT=262144
-WMEM_DEFAULT=262144
-RMEM_MAX=67108864
-WMEM_MAX=67108864
-
-# scale buffer with RAM
-[[ $RAM_MB -ge 4096 ]] && RMEM_MAX=134217728 && WMEM_MAX=134217728
-[[ $RAM_MB -ge 8192 ]] && RMEM_MAX=268435456 && WMEM_MAX=268435456
-
-# netdev_budget scale with CPU
-NETDEV_BUDGET=400
-[[ $NCPU -ge 2 ]] && NETDEV_BUDGET=600
-[[ $NCPU -ge 4 ]] && NETDEV_BUDGET=900
-
-# somaxconn scale with RAM
-SOMAXCONN=65535
-[[ $RAM_MB -ge 4096 ]] && SOMAXCONN=131072
+sec "STEP 5 — SYSCTL (1vCPU 2GB | BDP=6553600 | RTT=25ms | 500Mbps | MSS=1360)"
 
 modprobe tcp_bbr 2>/dev/null && ok "tcp_bbr loaded" || inf "tcp_bbr built-in"
 
-cat > /etc/sysctl.d/99-ais-vmess.conf << EOF
+cat > /etc/sysctl.d/99-ais-vmess.conf << 'EOF'
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
-net.core.rmem_default = $RMEM_DEFAULT
-net.core.rmem_max = $RMEM_MAX
-net.core.wmem_default = $WMEM_DEFAULT
-net.core.wmem_max = $WMEM_MAX
-net.ipv4.tcp_rmem = 4096 $RMEM_DEFAULT $RMEM_MAX
-net.ipv4.tcp_wmem = 4096 $WMEM_DEFAULT $WMEM_MAX
+net.core.rmem_default = 262144
+net.core.rmem_max = 67108864
+net.core.wmem_default = 262144
+net.core.wmem_max = 67108864
+net.ipv4.tcp_rmem = 4096 262144 67108864
+net.ipv4.tcp_wmem = 4096 262144 67108864
 net.core.optmem_max = 65536
-net.ipv4.tcp_mem = 65536 1048576 536870912
+net.ipv4.tcp_mem = 65536 1048576 268435456
 net.ipv4.tcp_adv_win_scale = 2
 net.ipv4.tcp_moderate_rcvbuf = 1
 net.ipv4.tcp_window_scaling = 1
@@ -150,17 +116,17 @@ net.ipv4.tcp_autocorking = 0
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_notsent_lowat = 32768
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_limit_output_bytes = 524288
+net.ipv4.tcp_limit_output_bytes = 655360
 
-net.ipv4.tcp_keepalive_time = 10
-net.ipv4.tcp_keepalive_intvl = 3
+net.ipv4.tcp_keepalive_time = 8
+net.ipv4.tcp_keepalive_intvl = 2
 net.ipv4.tcp_keepalive_probes = 4
 
-net.core.somaxconn = $SOMAXCONN
-net.ipv4.tcp_max_syn_backlog = $SOMAXCONN
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
 net.core.netdev_max_backlog = 32768
-net.core.netdev_budget = $NETDEV_BUDGET
-net.core.netdev_budget_usecs = 4000
+net.core.netdev_budget = 400
+net.core.netdev_budget_usecs = 3000
 
 net.core.busy_poll = 0
 net.core.busy_read = 0
@@ -187,8 +153,8 @@ kernel.sched_autogroup_enabled = 0
 kernel.nmi_watchdog = 0
 
 vm.transparent_hugepage = madvise
-fs.file-max = $NOFILE
-fs.nr_open = $NOFILE
+fs.file-max = 1000000
+fs.nr_open = 1000000
 vm.swappiness = 5
 vm.dirty_ratio = 10
 vm.dirty_background_ratio = 3
@@ -196,7 +162,7 @@ EOF
 
 sysctl --system 2>&1 | grep -E "bbr|fastopen|keepalive|rmem|wmem|somaxconn|autocorking|slow_start|notsent|mtu_prob|forward|swappiness|output_bytes|sched|hugepage" | \
     while IFS= read -r line; do ok "sysctl: $line"; done
-ok "sysctl applied (${NCPU}vCPU ${RAM_GB}GB profile)"
+ok "sysctl applied"
 
 echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null && \
     ok "hugepage=madvise (live)" || true
@@ -221,6 +187,7 @@ fi
 
 mkdir -p /etc/networkd-dispatcher/routable.d/
 cat > /etc/networkd-dispatcher/routable.d/51-ethtool << 'ETEOF'
+#!/bin/bash
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 ethtool -K $ETH gro off 2>/dev/null || true
 ethtool -K $ETH lro off 2>/dev/null || true
@@ -231,7 +198,7 @@ ETEOF
 chmod +x /etc/networkd-dispatcher/routable.d/51-ethtool
 ok "ethtool persistence written"
 
-sec "STEP 7 — CAKE QDISC (RTT=35ms, 400Mbps)"
+sec "STEP 7 — CAKE QDISC (RTT=25ms, 500Mbps) + PERSISTENCE"
 
 ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && ok "txqueuelen=4096" || inf "txqueuelen skipped"
 modprobe sch_cake 2>/dev/null && ok "sch_cake loaded" || inf "sch_cake unavailable"
@@ -239,35 +206,74 @@ tc qdisc del dev "$ETH" root 2>/dev/null || true
 ok "old qdisc cleared"
 
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev "$ETH" root cake bandwidth 400mbit rtt 35ms besteffort split-gso 2>/dev/null && \
-        ok "CAKE: 400mbit rtt 35ms besteffort split-gso" || {
-        tc qdisc add dev "$ETH" root cake bandwidth 400mbit rtt 35ms besteffort 2>/dev/null && \
-            ok "CAKE: 400mbit rtt 35ms besteffort" || {
-            tc qdisc add dev "$ETH" root fq_codel target 2ms interval 35ms 2>/dev/null && \
-                ok "fq_codel fallback" || err "qdisc failed"
-        }
-    }
+    tc qdisc add dev "$ETH" root cake bandwidth 500mbit rtt 25ms besteffort split-gso 2>/dev/null && \
+        ok "CAKE: 500mbit rtt 25ms besteffort split-gso" || \
+    { tc qdisc add dev "$ETH" root cake bandwidth 500mbit rtt 25ms besteffort 2>/dev/null && \
+        ok "CAKE: 500mbit rtt 25ms besteffort"; } || \
+    { tc qdisc add dev "$ETH" root fq_codel target 1ms interval 25ms 2>/dev/null && \
+        ok "fq_codel fallback"; }
 else
-    tc qdisc add dev "$ETH" root fq_codel target 2ms interval 35ms 2>/dev/null && \
-        ok "fq_codel applied" || err "qdisc failed"
+    tc qdisc add dev "$ETH" root fq_codel target 1ms interval 25ms 2>/dev/null && ok "fq_codel fallback"
 fi
+
 tc qdisc show dev "$ETH" | while IFS= read -r line; do inf "qdisc: $line"; done
 
+mkdir -p /etc/networkd-dispatcher/routable.d/
 cat > /etc/networkd-dispatcher/routable.d/50-cake << 'BOOTEOF'
+#!/bin/bash
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 ip link set dev $ETH txqueuelen 4096 2>/dev/null || true
 tc qdisc del dev $ETH root 2>/dev/null || true
 modprobe sch_cake 2>/dev/null
 if lsmod | grep -q sch_cake; then
-    tc qdisc add dev $ETH root cake bandwidth 400mbit rtt 35ms besteffort split-gso 2>/dev/null || \
-    tc qdisc add dev $ETH root cake bandwidth 400mbit rtt 35ms besteffort 2>/dev/null || \
-    tc qdisc add dev $ETH root fq_codel target 2ms interval 35ms 2>/dev/null
+    tc qdisc add dev $ETH root cake bandwidth 500mbit rtt 25ms besteffort split-gso 2>/dev/null || \
+    tc qdisc add dev $ETH root cake bandwidth 500mbit rtt 25ms besteffort 2>/dev/null || \
+    tc qdisc add dev $ETH root fq_codel target 1ms interval 25ms 2>/dev/null
 else
-    tc qdisc add dev $ETH root fq_codel target 2ms interval 35ms 2>/dev/null
+    tc qdisc add dev $ETH root fq_codel target 1ms interval 25ms 2>/dev/null
 fi
 BOOTEOF
 chmod +x /etc/networkd-dispatcher/routable.d/50-cake
-ok "CAKE boot persistence written"
+ok "CAKE networkd-dispatcher persistence written"
+
+RC_LOCAL=/etc/rc.local
+if [[ ! -f "$RC_LOCAL" ]]; then
+    printf '#!/bin/bash\nexit 0\n' > "$RC_LOCAL"
+    chmod +x "$RC_LOCAL"
+fi
+if ! grep -q "50-cake" "$RC_LOCAL" 2>/dev/null; then
+    sed -i '/^exit 0/i bash /etc/networkd-dispatcher/routable.d/50-cake' "$RC_LOCAL"
+    ok "rc.local fallback written"
+else
+    ok "rc.local already has cake entry"
+fi
+
+cat > /etc/systemd/system/cake-qdisc.service << 'EOF'
+[Unit]
+Description=CAKE qdisc 500mbit rtt 25ms for VMESS WS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/etc/networkd-dispatcher/routable.d/50-cake
+ExecStartPost=/bin/sh -c 'tc qdisc show dev $(ip -o -4 route show to default | awk "{print $5}" | head -1)'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable cake-qdisc.service >/dev/null 2>&1 && ok "cake-qdisc.service enabled"
+
+mkdir -p /etc/network/if-up.d/
+cat > /etc/network/if-up.d/cake << 'IFEOF'
+#!/bin/bash
+[ "$IFACE" = "lo" ] && exit 0
+bash /etc/networkd-dispatcher/routable.d/50-cake
+IFEOF
+chmod +x /etc/network/if-up.d/cake
+ok "if-up.d/cake written"
 
 sec "STEP 8 — VMESS WS SOCKOPT PATCHER"
 
@@ -282,11 +288,11 @@ PATHS = [
 ]
 SOCKOPT = {
     "tcpNoDelay":           True,
-    "tcpKeepAliveIdle":     10,
-    "tcpKeepAliveInterval": 3,
+    "tcpKeepAliveIdle":     8,
+    "tcpKeepAliveInterval": 2,
     "tcpFastOpen":          True,
-    "tcpUserTimeout":       8000,
-    "tcpMaxSeg":            1460,
+    "tcpUserTimeout":       6000,
+    "tcpMaxSeg":            1360,
     "mark":                 0,
 }
 
@@ -335,23 +341,12 @@ ok "xui-ws-patch.py created"
 mkdir -p /etc/systemd/system/x-ui.service.d/
 cat > /etc/systemd/system/x-ui.service.d/ws-patch.conf << 'UNITEOF'
 [Service]
-Environment=GOMAXPROCS=__NCPU__
+Environment=GOMAXPROCS=1
 ExecStartPost=/bin/bash -c 'for i in $(seq 15); do sleep 2 && python3 /usr/local/bin/xui-ws-patch.py && break; done'
-ExecStartPost=/bin/bash -c 'sleep 6 && XP=$(pgrep -x xray | head -1) && [ -n "$XP" ] && taskset -cp __CPUMASK__ $XP && ionice -c 1 -n 0 -p $XP || true'
+ExecStartPost=/bin/bash -c 'sleep 6 && XP=$(pgrep -x xray | head -1) && [ -n "$XP" ] && taskset -cp 0 $XP && ionice -c 1 -n 0 -p $XP || true'
 UNITEOF
 
-# replace placeholders with real values
-if [[ $NCPU -eq 1 ]]; then
-    GOMAXPROCS=1
-    CPUMASK="0"
-else
-    GOMAXPROCS=$NCPU
-    CPUMASK="0-$((NCPU-1))"
-fi
-sed -i "s/__NCPU__/$GOMAXPROCS/g; s/__CPUMASK__/$CPUMASK/g" \
-    /etc/systemd/system/x-ui.service.d/ws-patch.conf
-
-ok "GOMAXPROCS=$GOMAXPROCS | taskset CPU: $CPUMASK"
+ok "GOMAXPROCS=1 | taskset CPU: 0"
 inf "running ws-patch now..."
 python3 "$PATCHER"
 
@@ -359,19 +354,13 @@ sec "STEP 9 — CPU / IRQ TUNING"
 
 ETH_IRQ=$(grep "$ETH" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ' | head -1)
 if [[ -n "$ETH_IRQ" ]]; then
-    if [[ $NCPU -eq 1 ]]; then
-        echo 1 > /proc/irq/$ETH_IRQ/smp_affinity 2>/dev/null && ok "IRQ $ETH_IRQ → CPU0" || inf "IRQ skipped"
-    else
-        echo ff > /proc/irq/$ETH_IRQ/smp_affinity 2>/dev/null && ok "IRQ $ETH_IRQ → all CPUs" || inf "IRQ skipped"
-    fi
+    echo 1 > /proc/irq/$ETH_IRQ/smp_affinity 2>/dev/null && ok "IRQ $ETH_IRQ → CPU0" || inf "IRQ skipped"
 else
     inf "No dedicated NIC IRQ (virtio/KVM — normal)"
 fi
 
 if ls /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | head -1 | grep -q governor; then
-    for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-        echo performance > "$f" 2>/dev/null
-    done
+    echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
     ok "CPU governor: performance"
 else
     inf "cpufreq not exposed (host controls — normal)"
@@ -389,11 +378,10 @@ else
     systemctl start x-ui 2>/dev/null && ok "x-ui started" || err "x-ui failed — journalctl -u x-ui"
 fi
 
-# apply taskset+ionice now
 sleep 2
 XRAY_PID=$(pgrep -x xray 2>/dev/null | head -1)
 if [[ -n "$XRAY_PID" ]]; then
-    taskset -cp "$CPUMASK" "$XRAY_PID" 2>/dev/null && ok "taskset: xray pid=$XRAY_PID → CPU $CPUMASK" || inf "taskset skipped"
+    taskset -cp 0 "$XRAY_PID" 2>/dev/null && ok "taskset: xray pid=$XRAY_PID → CPU0" || inf "taskset skipped"
     ionice -c 1 -n 0 -p "$XRAY_PID" 2>/dev/null && ok "ionice: xray realtime" || inf "ionice skipped"
 else
     inf "xray pid not found yet"
@@ -403,10 +391,10 @@ sec "FINAL — VERIFY"
 
 echo ""
 inf "── Hardware Profile ──"
-ok "vCPU        = $NCPU"
-ok "RAM         = ${RAM_GB}GB (${RAM_MB}MB)"
-ok "GOMAXPROCS  = $GOMAXPROCS"
-ok "taskset CPU = $CPUMASK"
+ok "vCPU        = 1 (2.69GHz)"
+ok "RAM         = 2GB"
+ok "GOMAXPROCS  = 1"
+ok "taskset CPU = 0"
 
 inf "── Active Ports ──"
 ss -tlnp | grep -E ":(80|443|2053|2083|2087|2096|8080|8443|54321) " | \
@@ -428,6 +416,9 @@ inf "note: nofile มีผลเต็มหลัง reboot"
 inf "── qdisc ──"
 tc qdisc show dev "$ETH" | while IFS= read -r line; do ok "$line"; done
 
+inf "── cake-qdisc.service ──"
+ok "enabled: $(systemctl is-enabled cake-qdisc.service 2>/dev/null)"
+
 inf "── x-ui ──"
 ok "status: $(systemctl is-active x-ui 2>/dev/null)"
 
@@ -436,18 +427,21 @@ PANEL_PORT=${PANEL_PORT:-54321}
 
 echo ""
 echo -e "${G}${B}╔══════════════════════════════════════════╗${N}"
-echo -e "${G}${B}║  DONE — Auto-tuned for your hardware!    ║${N}"
+echo -e "${G}${B}║                      DONE                        ║${N}"
 echo -e "${G}${B}╚══════════════════════════════════════════╝${N}"
 echo ""
-echo -e "${Y}  ▸ Hardware      : ${NCPU}vCPU ${RAM_GB}GB RAM${N}"
-echo -e "${Y}  ▸ GOMAXPROCS    : $GOMAXPROCS${N}"
-echo -e "${Y}  ▸ xray CPU mask : $CPUMASK${N}"
+echo -e "${Y}  ▸ Hardware      : 1vCPU 2.69GHz | 2GB RAM${N}"
+echo -e "${Y}  ▸ GOMAXPROCS    : 1${N}"
+echo -e "${Y}  ▸ xray CPU mask : 0${N}"
 echo -e "${Y}  ▸ panel         : http://${PUBIP}:${PANEL_PORT}${N}"
 echo -e "${Y}  ▸ inbound       : VMESS | WS | port 80 | security: none${N}"
-echo -e "${Y}  ▸ MSS/MTU       : 1460 / 1500${N}"
-echo -e "${Y}  ▸ CAKE          : 400mbit rtt 35ms besteffort${N}"
+echo -e "${Y}  ▸ MSS/MTU       : 1360${N}"
+echo -e "${Y}  ▸ CAKE          : 500mbit rtt 25ms besteffort${N}"
+echo -e "${Y}  ▸ BDP           : 6553600 bytes (500Mbps × 25ms / 8 × 4)${N}"
+echo -e "${Y}  ▸ output_bytes  : 655360 (500Mbps/8 × 10ms)${N}"
 echo -e "${Y}  ▸ hugepage      : madvise${N}"
 echo -e "${Y}  ▸ scheduler     : 3ms granularity${N}"
+echo -e "${Y}  ▸ CAKE persist  : systemd + networkd-dispatcher + rc.local + if-up.d${N}"
 echo -e "${Y}  ▸ Firewall      : เปิดพอร์ตใน ReadyIDC panel ด้วย${N}"
 echo -e "${Y}  ▸ reboot        : sudo reboot${N}"
 echo -e "${Y}  ▸ nofile        : มีผลเต็มหลัง reboot${N}"
