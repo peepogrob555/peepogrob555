@@ -4,16 +4,14 @@ GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'
 CYN='\033[0;36m'; BLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
 STATE_DIR="/var/lib/vps-setup"
 STATE_FILE="${STATE_DIR}/steps.done"
-LOG_FILE="${STATE_DIR}/setup.log"
 mkdir -p "$STATE_DIR"
-touch "$STATE_FILE" "$LOG_FILE"
+touch "$STATE_FILE"
 sep()    { echo -e "${DIM}${CYN}────────────────────────────────────────────────${RST}"; }
 hdr()    { echo -e "\n${BLD}${CYN}▶  $1${RST}"; sep; }
 ok()     { echo -e "  ${GRN}✔${RST}  $1"; }
 warn()   { echo -e "  ${YEL}⚠${RST}  $1"; }
 die()    {
-    echo -e "\n${RED}${BLD}✘  FAILED at: $1${RST}"
-    echo -e "   ${DIM}ดู log: ${LOG_FILE}${RST}\n"
+    echo -e "\n${RED}${BLD}✘  FAILED at: $1${RST}\n"
     exit 1
 }
 step_done() { grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
@@ -25,7 +23,7 @@ run_step() {
         return 0
     fi
     echo -e "\n${BLD}  → $name${RST}"
-    if "$@" >> "$LOG_FILE" 2>&1; then
+    if "$@"; then
         mark_done "$name"
         ok "[OK]   $name"
     else
@@ -37,7 +35,7 @@ echo ""
 echo -e "${BLD}${CYN}╔══════════════════════════════════════════════════╗${RST}"
 echo -e "${BLD}${CYN}║   VPS SETUP — VMESS/WS 500Mbps | Ubuntu 22.04  ║${RST}"
 echo -e "${BLD}${CYN}╚══════════════════════════════════════════════════╝${RST}"
-echo -e "  Log: ${LOG_FILE}"
+echo -e "  Log: /var/lib/vps-setup/steps.done"
 echo ""
 hdr "STEP 1 — UPDATE & DEPS"
 _step1() {
@@ -322,5 +320,4 @@ echo -e "  ${BLD}x-ui   :${RST} $(systemctl is-active x-ui)"
 echo -e "  ──────────────────────────────────────────────"
 echo ""
 echo -e "  ${BLD}${YEL}→ reboot แล้วรัน:${RST}  vps-verify"
-echo -e "  ${BLD}${DIM}→ log ดูได้ที่:${RST}    ${LOG_FILE}"
 echo ""
