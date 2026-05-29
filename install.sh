@@ -1,403 +1,171 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'
-B='\033[1m'; N='\033[0m'
+NIC=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
+NIC="${NIC:-eth0}"
 
-ok()  { echo -e "${G}[OK]${N}   $1"; }
-err() { echo -e "${R}[ERR]${N}  $1"; exit 1; }
-inf() { echo -e "${Y}[INFO]${N} $1"; }
-sec() { echo -e "\n${B}${C}╔══════════════════════════════════════════╗${N}"
-        echo -e "${B}${C}║  $1${N}"
-        echo -e "${B}${C}╚══════════════════════════════════════════╝${N}"; }
+echo ">>> [1/6] UPDATE & DEPS"
+apt-get update -y
+apt-get install -y curl ufw ethtool
 
-[[ $EUID -ne 0 ]] && { echo "Run as root: sudo bash $0"; exit 1; }
-
-ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
-PUBIP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
-
-echo -e "\n${B}${C}  VPS Setup — VMESS WS | 2-USER | 500Mbps | RTT 25ms | 1vCPU 2GB${N}"
-echo -e "  Interface : ${Y}$ETH${N} | IP: ${Y}$PUBIP${N}"
-echo -e "  Hardware  : ${Y}1 vCPU (2.69GHz)${N} | ${Y}2GB RAM${N}\n"
-
-sec "STEP 1 — SWAP"
-
-if swapon --show | grep -q /swapfile; then
-    ok "Swap already exists"
-else
-    fallocate -l 512M /swapfile
-    chmod 600 /swapfile
-    mkswap /swapfile
-    swapon /swapfile
-    grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    ok "Swap 512MB created"
-fi
-
-sec "STEP 2 — OPEN PORTS"
-
-PORTS=(80 443 2053 2083 2087 2096 8080 8443 54321)
-if ufw status | grep -q "Status: active"; then
-    for p in "${PORTS[@]}"; do
-        ufw allow "$p"/tcp comment "3xui" >/dev/null 2>&1
-        ok "UFW: $p/tcp"
-    done
-    ufw reload >/dev/null 2>&1 && ok "UFW reloaded"
-else
-    ok "UFW inactive — skipped"
-fi
-for p in "${PORTS[@]}"; do
-    iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || \
-        iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
-    ok "iptables: $p ACCEPT"
+echo ">>> [2/6] FIREWALL"
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+for port in 80 443 2053 2083 2087 2096 8080 8443 54321; do
+    ufw allow "$port"/tcp
 done
-if command -v netfilter-persistent &>/dev/null; then
-    netfilter-persistent save >/dev/null 2>&1 && ok "iptables saved"
-else
-    mkdir -p /etc/iptables && iptables-save > /etc/iptables/rules.v4 && ok "iptables saved"
-fi
+ufw --force enable
+ufw status verbose
 
-sec "STEP 3 — INSTALL 3x-ui"
+echo ">>> [3/6] INSTALL 3X-UI"
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
 
-if systemctl is-active --quiet x-ui 2>/dev/null; then
-    ok "3x-ui already running — skipping install"
-else
-    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
-    ok "3x-ui installed"
-fi
+echo ">>> [4/6] CHANGE PANEL PORT TO 2053"
+x-ui stop
+x-ui setting -port 2053
+x-ui start
 
-sec "STEP 4 — SYSTEM LIMITS"
+echo ">>> [5/6] KERNEL + TCP TUNE"
 
-cat > /etc/security/limits.d/99-xui.conf << 'EOF'
-*    soft nofile 1000000
-*    hard nofile 1000000
-*    soft nproc  1000000
-*    hard nproc  1000000
-root soft nofile 1000000
-root hard nofile 1000000
-root soft nproc  1000000
-root hard nproc  1000000
-EOF
-ok "nofile=1000000 nproc=1000000"
-
-mkdir -p /etc/systemd/system/x-ui.service.d/
-cat > /etc/systemd/system/x-ui.service.d/limits.conf << 'EOF'
-[Service]
-LimitNOFILE=1000000
-LimitNPROC=1000000
-EOF
-echo 1000000 > /proc/sys/fs/file-max
-ok "x-ui service limits set"
-
-sec "STEP 5 — SYSCTL (1vCPU 2GB | BDP=15625000 | RTT=25ms | 500Mbps | MSS=1440)"
-
-# BDP = 500Mbps * 25ms / 8 = 1562500 bytes
-# rmem/wmem max = BDP * 8 (headroom for 2 users + overhead) = 12500000 → round 16MB
-# tcp_limit_output_bytes = BDP * 1 = ~1562500 → 1572864 (1.5MB, allow burst without bloat)
-
-modprobe tcp_bbr 2>/dev/null && ok "tcp_bbr loaded" || inf "tcp_bbr built-in"
-
-cat > /etc/sysctl.d/99-ais-vmess.conf << 'EOF'
-net.core.default_qdisc = fq
+cat > /etc/sysctl.d/99-tune.conf << 'EOF'
 net.ipv4.tcp_congestion_control = bbr
+net.core.default_qdisc = fq
 
-net.core.rmem_default = 262144
 net.core.rmem_max = 16777216
-net.core.wmem_default = 262144
 net.core.wmem_max = 16777216
+net.core.rmem_default = 262144
+net.core.wmem_default = 262144
 net.ipv4.tcp_rmem = 4096 262144 16777216
 net.ipv4.tcp_wmem = 4096 262144 16777216
-net.core.optmem_max = 65536
-net.ipv4.tcp_mem = 65536 1048576 268435456
-net.ipv4.tcp_adv_win_scale = 2
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_window_scaling = 1
 
-net.ipv4.tcp_fastopen = 3
-net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_fin_timeout = 5
-net.ipv4.tcp_autocorking = 0
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 131072
-net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_notsent_lowat = 32768
 net.ipv4.tcp_limit_output_bytes = 1572864
 
-net.ipv4.tcp_keepalive_time = 8
-net.ipv4.tcp_keepalive_intvl = 2
-net.ipv4.tcp_keepalive_probes = 4
+net.core.netdev_max_backlog = 16384
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
 
-net.core.somaxconn = 65535
-net.ipv4.tcp_max_syn_backlog = 65535
-net.core.netdev_max_backlog = 32768
-net.core.netdev_budget = 400
-net.core.netdev_budget_usecs = 3000
-
-net.core.busy_poll = 0
-net.core.busy_read = 0
-
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_base_mss = 1440
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
 net.ipv4.tcp_sack = 1
 net.ipv4.tcp_dsack = 1
-net.ipv4.tcp_recovery = 1
-net.ipv4.tcp_retries2 = 5
-net.ipv4.tcp_syn_retries = 2
-net.ipv4.tcp_orphan_retries = 1
-net.ipv4.tcp_max_orphans = 65535
-net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_tw_reuse = 1
+
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 5
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_syn_retries = 3
+net.ipv4.tcp_synack_retries = 3
 
 net.ipv4.ip_local_port_range = 1024 65535
-net.ipv4.tcp_timestamps = 1
-net.ipv4.ip_forward = 1
-net.ipv4.conf.all.rp_filter = 0
-net.ipv4.conf.default.rp_filter = 0
+net.ipv4.tcp_max_tw_buckets = 65536
+
+net.core.optmem_max = 65536
 
 kernel.sched_min_granularity_ns = 3000000
 kernel.sched_wakeup_granularity_ns = 4000000
-kernel.sched_migration_cost_ns = 5000000
 kernel.sched_autogroup_enabled = 0
-kernel.nmi_watchdog = 0
 
-vm.transparent_hugepage = madvise
-fs.file-max = 1000000
-fs.nr_open = 1000000
+net.ipv4.conf.all.accept_redirects = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+
 vm.swappiness = 5
-vm.dirty_ratio = 10
-vm.dirty_background_ratio = 3
+vm.dirty_ratio = 15
+vm.dirty_background_ratio = 5
 EOF
 
-sysctl --system 2>&1 | grep -E "bbr|fastopen|keepalive|rmem|wmem|somaxconn|autocorking|slow_start|notsent|mtu_prob|forward|swappiness|output_bytes|sched|hugepage" | \
-    while IFS= read -r line; do ok "sysctl: $line"; done
-ok "sysctl applied"
+sysctl -p /etc/sysctl.d/99-tune.conf
 
-echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null && \
-    ok "hugepage=madvise (live)" || true
-echo 0 > /proc/sys/kernel/nmi_watchdog 2>/dev/null && \
-    ok "nmi_watchdog=0 (live)" || true
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
 
-sec "STEP 6 — ETHTOOL OFFLOAD"
-
-if ! command -v ethtool &>/dev/null; then
-    apt-get install -y ethtool >/dev/null 2>&1
-fi
-if command -v ethtool &>/dev/null; then
-    ethtool -K "$ETH" gro off 2>/dev/null && ok "gro off" || inf "gro skipped"
-    ethtool -K "$ETH" lro off 2>/dev/null && ok "lro off" || inf "lro skipped"
-    ethtool -K "$ETH" tso on  2>/dev/null && ok "tso on"  || inf "tso skipped"
-    ethtool -K "$ETH" gso on  2>/dev/null && ok "gso on"  || inf "gso skipped"
-    ethtool -C "$ETH" rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32 2>/dev/null && \
-        ok "coalescing: 50us/32frames" || inf "coalescing skipped"
-else
-    inf "ethtool not available"
-fi
-
-FQ_SCRIPT=/usr/local/bin/setup-fq.sh
-cat > "$FQ_SCRIPT" << 'FQEOF'
-#!/bin/bash
-ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
-ip link set dev $ETH txqueuelen 4096 2>/dev/null || true
-tc qdisc del dev $ETH root 2>/dev/null || true
-tc qdisc add dev $ETH root fq flow_limit 200 quantum 1514 initial_quantum 15140 maxrate 0 2>/dev/null || \
-tc qdisc add dev $ETH root fq 2>/dev/null || true
-# ethtool persistence
-if command -v ethtool &>/dev/null; then
-    ethtool -K $ETH gro off 2>/dev/null || true
-    ethtool -K $ETH lro off 2>/dev/null || true
-    ethtool -K $ETH tso on  2>/dev/null || true
-    ethtool -K $ETH gso on  2>/dev/null || true
-    ethtool -C $ETH rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32 2>/dev/null || true
-fi
-FQEOF
-chmod +x "$FQ_SCRIPT"
-ok "setup-fq.sh created"
-
-sec "STEP 7 — FQ QDISC (no rate limit | quantum=1514 | flow_limit=200)"
-
-ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && ok "txqueuelen=4096" || inf "txqueuelen skipped"
-tc qdisc del dev "$ETH" root 2>/dev/null || true
-tc qdisc add dev "$ETH" root fq flow_limit 200 quantum 1514 initial_quantum 15140 maxrate 0 2>/dev/null && \
-    ok "fq: flow_limit=200 quantum=1514 initial_quantum=15140 maxrate=0 (unlimited)" || \
-{ tc qdisc add dev "$ETH" root fq 2>/dev/null && ok "fq: default params"; }
-
-tc qdisc show dev "$ETH" | while IFS= read -r line; do inf "qdisc: $line"; done
-
-cat > /etc/systemd/system/fq-qdisc.service << 'EOF'
+cat > /etc/systemd/system/thp-disable.service << 'EOF'
 [Unit]
-Description=fq qdisc unlimited for BBR+VMESS WS
-After=network-online.target
-Wants=network-online.target
+Description=Disable Transparent Huge Pages
+DefaultDependencies=no
+After=sysinit.target local-fs.target
 
 [Service]
 Type=oneshot
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
+ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/setup-fq.sh
-ExecStartPost=/bin/sh -c 'tc qdisc show dev $(ip -o -4 route show to default | awk "{print $5}" | head -1)'
 
 [Install]
 WantedBy=multi-user.target
 EOF
+
 systemctl daemon-reload
-systemctl enable fq-qdisc.service >/dev/null 2>&1 && ok "fq-qdisc.service enabled"
+systemctl enable thp-disable.service
 
-sec "STEP 8 — VMESS WS SOCKOPT PATCHER"
+echo ">>> [6/6] NIC + SYSTEM LIMITS + SERVICE TUNE"
 
-PATCHER=/usr/local/bin/xui-ws-patch.py
-cat > "$PATCHER" << 'PYEOF'
-import json, sys, os
+ethtool -G "${NIC}" rx 4096 tx 4096 2>/dev/null || true
+ethtool -K "${NIC}" gro off lro off tso on gso on 2>/dev/null || true
+ethtool -C "${NIC}" rx-usecs 50 2>/dev/null || true
 
-PATHS = [
-    "/usr/local/x-ui/bin/config.json",
-    "/etc/x-ui/config.json",
-    "/root/x-ui/bin/config.json",
-]
-SOCKOPT = {
-    "tcpNoDelay":           True,
-    "tcpKeepAliveIdle":     8,
-    "tcpKeepAliveInterval": 2,
-    "tcpFastOpen":          True,
-    "tcpUserTimeout":       6000,
-    "tcpMaxSeg":            1440,
-    "mark":                 0,
-}
+mkdir -p /etc/networkd-dispatcher/routable.d
+cat > /etc/networkd-dispatcher/routable.d/50-nic-tune.sh << EOF
+#!/usr/bin/env bash
+ethtool -G ${NIC} rx 4096 tx 4096 2>/dev/null || true
+ethtool -K ${NIC} gro off lro off tso on gso on 2>/dev/null || true
+ethtool -C ${NIC} rx-usecs 50 2>/dev/null || true
+EOF
+chmod +x /etc/networkd-dispatcher/routable.d/50-nic-tune.sh
 
-def patch(path):
-    try:
-        with open(path) as f:
-            cfg = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        print(f"  [{path}] error: {e} — skipping")
-        return 0
-    inbounds = cfg.get("inbounds") or []
-    if not inbounds:
-        print(f"  [{path}] no inbounds yet")
-        return 0
-    changed = 0
-    for ib in inbounds:
-        if not isinstance(ib, dict):
-            continue
-        ss = ib.setdefault("streamSettings", {})
-        if not isinstance(ss, dict):
-            ib["streamSettings"] = {}
-            ss = ib["streamSettings"]
-        so = ss.setdefault("sockopt", {})
-        for k, v in SOCKOPT.items():
-            if so.get(k) != v:
-                so[k] = v
-                changed += 1
-    try:
-        with open(path, "w") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
-    except OSError as e:
-        print(f"  [{path}] write error: {e}")
-        return 0
-    print(f"  [{path}] patched {changed} fields / {len(inbounds)} inbound(s)")
-    return changed
+cat > /etc/security/limits.d/99-limits.conf << 'EOF'
+* soft nofile 65535
+* hard nofile 65535
+root soft nofile 65535
+root hard nofile 65535
+EOF
 
-for p in PATHS:
-    if os.path.exists(p):
-        patch(p)
-        sys.exit(0)
-print("  no xray config found — will patch on next x-ui start")
-PYEOF
-chmod +x "$PATCHER"
-ok "xui-ws-patch.py created (MSS=1440)"
+grep -qxF 'session required pam_limits.so' /etc/pam.d/common-session \
+  || echo 'session required pam_limits.so' >> /etc/pam.d/common-session
 
-mkdir -p /etc/systemd/system/x-ui.service.d/
-cat > /etc/systemd/system/x-ui.service.d/ws-patch.conf << 'UNITEOF'
+mkdir -p /etc/systemd/system/x-ui.service.d
+cat > /etc/systemd/system/x-ui.service.d/override.conf << 'EOF'
 [Service]
+LimitNOFILE=65535
+LimitNPROC=65535
+Restart=always
+RestartSec=3
 Environment=GOMAXPROCS=1
-ExecStartPost=/bin/bash -c 'for i in $(seq 15); do sleep 2 && python3 /usr/local/bin/xui-ws-patch.py && break; done'
-ExecStartPost=/bin/bash -c 'sleep 6 && XP=$(pgrep -x xray | head -1) && [ -n "$XP" ] && taskset -cp 0 $XP && ionice -c 1 -n 0 -p $XP || true'
-UNITEOF
+EOF
 
-ok "GOMAXPROCS=1 | taskset CPU: 0"
-inf "running ws-patch now..."
-python3 "$PATCHER"
+cat > /etc/systemd/system/cpu-performance.service << 'EOF'
+[Unit]
+Description=Set CPU governor to performance
+After=multi-user.target
 
-sec "STEP 9 — CPU / IRQ TUNING"
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do echo performance > $f 2>/dev/null || true; done'
+RemainAfterExit=yes
 
-ETH_IRQ=$(grep "$ETH" /proc/interrupts 2>/dev/null | awk -F: '{print $1}' | tr -d ' ' | head -1)
-if [[ -n "$ETH_IRQ" ]]; then
-    echo 1 > /proc/irq/$ETH_IRQ/smp_affinity 2>/dev/null && ok "IRQ $ETH_IRQ → CPU0" || inf "IRQ skipped"
-else
-    inf "No dedicated NIC IRQ (virtio/KVM — normal)"
-fi
+[Install]
+WantedBy=multi-user.target
+EOF
 
-if ls /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | head -1 | grep -q governor; then
-    echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
-    ok "CPU governor: performance"
-else
-    inf "cpufreq not exposed (host controls — normal)"
-fi
-
-sec "STEP 10 — RELOAD & RESTART"
-
-systemctl daemon-reload && ok "daemon reloaded"
-
-if systemctl is-active --quiet x-ui 2>/dev/null; then
-    systemctl restart x-ui
-    sleep 4
-    ok "x-ui restarted"
-else
-    systemctl start x-ui 2>/dev/null && ok "x-ui started" || err "x-ui failed — journalctl -u x-ui"
-fi
-
-sleep 2
-XRAY_PID=$(pgrep -x xray 2>/dev/null | head -1)
-if [[ -n "$XRAY_PID" ]]; then
-    taskset -cp 0 "$XRAY_PID" 2>/dev/null && ok "taskset: xray pid=$XRAY_PID → CPU0" || inf "taskset skipped"
-    ionice -c 1 -n 0 -p "$XRAY_PID" 2>/dev/null && ok "ionice: xray realtime" || inf "ionice skipped"
-else
-    inf "xray pid not found yet"
-fi
-
-sec "FINAL — VERIFY"
+systemctl daemon-reload
+systemctl enable cpu-performance.service
+systemctl start cpu-performance.service
+systemctl restart x-ui
 
 echo ""
-inf "── Active Ports ──"
-ss -tlnp | grep -E ":(80|443|2053|2083|2087|2096|8080|8443|54321) " | \
-    while IFS= read -r line; do ok "$line"; done || \
-    inf "no panel ports yet — check x-ui settings"
-
-inf "── Kernel ──"
-ok "cc            = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
-ok "qdisc         = $(sysctl -n net.core.default_qdisc 2>/dev/null)"
-ok "fastopen      = $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)"
-ok "keepalive     = $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)s"
-ok "rmem_max      = $(sysctl -n net.core.rmem_max 2>/dev/null)"
-ok "wmem_max      = $(sysctl -n net.core.wmem_max 2>/dev/null)"
-ok "output_bytes  = $(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null)"
-ok "somaxconn     = $(sysctl -n net.core.somaxconn 2>/dev/null)"
-ok "nofile        = soft:$(ulimit -Sn) hard:$(ulimit -Hn)"
-
-inf "── qdisc ──"
-tc qdisc show dev "$ETH" | while IFS= read -r line; do ok "$line"; done
-
-inf "── fq-qdisc.service ──"
-ok "enabled: $(systemctl is-enabled fq-qdisc.service 2>/dev/null)"
-
-inf "── x-ui ──"
-ok "status: $(systemctl is-active x-ui 2>/dev/null)"
-
-PANEL_PORT=$(x-ui settings 2>/dev/null | grep -i "port" | grep -oE '[0-9]{2,5}' | head -1)
-PANEL_PORT=${PANEL_PORT:-54321}
-
-echo ""
-echo -e "${G}${B}╔══════════════════════════════════════════╗${N}"
-echo -e "${G}${B}║                   DONE                  ║${N}"
-echo -e "${G}${B}╚══════════════════════════════════════════╝${N}"
-echo ""
-echo -e "${Y}  ▸ Hardware      : 1vCPU 2.69GHz | 2GB RAM${N}"
-echo -e "${Y}  ▸ GOMAXPROCS    : 1${N}"
-echo -e "${Y}  ▸ xray CPU mask : 0${N}"
-echo -e "${Y}  ▸ panel         : http://${PUBIP}:${PANEL_PORT}${N}"
-echo -e "${Y}  ▸ inbound       : VMESS | WS | port 80 | security: none${N}"
-echo -e "${Y}  ▸ MSS           : 1440${N}"
-echo -e "${Y}  ▸ qdisc         : fq (unlimited) + BBR${N}"
-echo -e "${Y}  ▸ BDP           : 1562500 bytes (500Mbps × 25ms / 8)${N}"
-echo -e "${Y}  ▸ rmem/wmem_max : 16MB (BDP × 8, headroom for 2 users)${N}"
-echo -e "${Y}  ▸ output_bytes  : 1572864 (~1×BDP, low bloat)${N}"
-echo -e "${Y}  ▸ hugepage      : madvise${N}"
-echo -e "${Y}  ▸ scheduler     : 3ms granularity${N}"
-echo -e "${Y}  ▸ persist       : fq-qdisc.service (systemd)${N}"
-echo -e "${Y}  ▸ Firewall      : เปิดพอร์ตใน ReadyIDC panel ด้วย${N}"
-echo -e "${Y}  ▸ reboot        : sudo reboot${N}"
-echo -e "${Y}  ▸ nofile        : มีผลเต็มหลัง reboot${N}"
-echo ""
+echo "============================================"
+echo " DONE"
+echo "============================================"
+echo " Panel  : http://$(curl -s ifconfig.me):2053"
+echo " BBR    : $(sysctl -n net.ipv4.tcp_congestion_control)"
+echo " Qdisc  : $(sysctl -n net.core.default_qdisc)"
+echo " THP    : $(cat /sys/kernel/mm/transparent_hugepage/enabled)"
+echo " x-ui   : $(systemctl is-active x-ui)"
+echo "============================================"
