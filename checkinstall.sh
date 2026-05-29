@@ -1,44 +1,132 @@
-cat << 'EOF' > check-spec.sh
-#!/bin/bash
-R='\033[0;31m'; G='\033[0;32m'; Y='\033[1;33m'; C='\033[0;36m'; B='\033[1m'; N='\033[0m'
-clear
-echo -e "${B}${C}=======================================================${N}"
-echo -e "${B}${C}      VPS DETAILED HARDWARE & SYSTEM REPORT            ${N}"
-echo -e "${B}${C}=======================================================${N}"
+#!/usr/bin/env bash
 
-echo -e "\n${B}${Y}[1] OS & KERNEL INFORMATION${N}"
-echo -e "  ▸ OS Version      : ${G}$(lsb_release -d | awk -F: '{print $2}' | sed 's/^[ \t]*//')${N}"
-echo -e "  ▸ Kernel Version  : ${G}$(uname -r)${N}"
-echo -e "  ▸ Architecture    : ${G}$(uname -m)${N}"
-echo -e "  ▸ Uptime          : ${G}$(uptime -p)${N}"
+set +e
 
-echo -e "\n${B}${Y}[2] CPU SPECIFICATION${N}"
-echo -e "  ▸ CPU Model Name  : ${G}$(lscpu | grep "Model name:" | sed 's/Model name:[[:space:]]*//')${N}"
-echo -e "  ▸ Vendor ID       : ${G}$(lscpu | grep "Vendor ID:" | sed 's/Vendor ID:[[:space:]]*//')${N}"
-echo -e "  ▸ Core(s) per soc : ${G}$(lscpu | grep "CPU(s):" | head -1 | sed 's/CPU(s):[[:space:]]*//') คอร์${N}"
-echo -e "  ▸ CPU Max Speed   : ${G}$(lscpu | grep "CPU max MHz:" | sed 's/CPU max MHz:[[:space:]]*//' | awk '{print $1/1000 " GHz"}' || echo "Host Controlled")${N}"
-echo -e "  ▸ Virtualization  : ${G}$(lscpu | grep "Hypervisor vendor:" | sed 's/Hypervisor vendor:[[:space:]]*//' || echo "None (Baremetal)")${N}"
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
 
-echo -e "\n${B}${Y}[3] RAM & MEMORY SPECIFICATION${N}"
-echo -e "  ▸ Total RAM       : ${G}$(free -h | awk '/^Mem:/ {print $2}')${N}"
-echo -e "  ▸ RAM Used/Free   : ${G}ใช้ไป $(free -h | awk '/^Mem:/ {print $3}') / เหลือว่าง $(free -h | awk '/^Mem:/ {print $4}')${N}"
+ok() {
+    echo -e "${GREEN}[OK]${NC} $1"
+}
 
-# เจาะลึกความเร็ว RAM และประเภทรุ่น (รองรับ KVM/物理機)
-if command -v dmidecode &>/dev/null; then
-    RAM_SPEED=$(sudo dmidecode --type memory 2>/dev/null | grep "Speed:" | grep -v "Unknown" | head -1 | sed 's/^[ \t]*Speed:[[:space:]]*//')
-    RAM_TYPE=$(sudo dmidecode --type memory 2>/dev/null | grep "Type:" | grep -v "Unknown" | head -1 | sed 's/^[ \t]*Type:[[:space:]]*//')
-    RAM_MANUF=$(sudo dmidecode --type memory 2>/dev/null | grep "Manufacturer:" | grep -v "Unknown" | head -1 | sed 's/^[ \t]*Manufacturer:[[:space:]]*//')
-    
-    echo -e "  ▸ RAM Type        : ${G}${RAM_TYPE:-Virtual RAM (QEMU/KVM)}${N}"
-    echo -e "  ▸ RAM Speed (Bus) : ${G}${RAM_SPEED:-ไม่เปิดเผยค่า (Host ควบคุมความเร็วเบื้องหลัง)}${N}"
-    echo -e "  ▸ RAM Manufacturer: ${G}${RAM_MANUF:-Virtual Interface}${N}"
+warn() {
+    echo -e "${YELLOW}[WARN]${NC} $1"
+}
+
+fail() {
+    echo -e "${RED}[FAIL]${NC} $1"
+}
+
+echo "========================================="
+echo " VPS HEALTH CHECK"
+echo "========================================="
+echo
+
+# 1. x-ui service
+if systemctl is-active --quiet x-ui; then
+    ok "x-ui service running"
 else
-    echo -e "  ▸ RAM Speed/Type  : ${R}ต้องติดตั้ง dmidecode ก่อน (sudo apt install dmidecode)${N}"
+    fail "x-ui service stopped"
 fi
 
-echo -e "\n${B}${Y}[4] STORAGE (DISK) SPEED & TYPE${N}"
-echo -e "  ▸ Disk Space      : ${G}$(df -h / | awk 'NR==2 {print $2}')${N}"
-echo -e "  ▸ Disk Type Check : ${G}$(lsblk -d -o NAME,ROTA | grep -v "NAME" | awk '{if($2==0) print "SSD / NVMe (ความเร็วสูง)"; else print "HDD (จานหมุน)"}' | head -1)${N}"
-echo -e "${B}${C}=======================================================${N}\n"
-EOF
-chmod +x check-spec.sh && ./check-spec.sh
+# 2. xray process
+if pgrep -x xray >/dev/null; then
+    ok "xray process running"
+else
+    fail "xray process missing"
+fi
+
+# 3. panel port
+if ss -tlnp | grep -q ":2053 "; then
+    ok "Panel port 2053 listening"
+else
+    fail "Panel port 2053 not listening"
+fi
+
+# 4. sysctl file
+if [ -f /etc/sysctl.d/99-tune.conf ]; then
+    ok "99-tune.conf exists"
+else
+    fail "99-tune.conf missing"
+fi
+
+# 5. THP
+if grep -q '\[never\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null; then
+    ok "THP disabled"
+else
+    warn "THP not disabled"
+fi
+
+# 6. BBR
+CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+
+if [ "$CC" = "bbr" ]; then
+    ok "BBR enabled"
+else
+    fail "BBR not enabled ($CC)"
+fi
+
+# 7. qdisc
+QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+
+if [ "$QDISC" = "fq" ]; then
+    ok "fq qdisc enabled"
+else
+    warn "fq qdisc not active ($QDISC)"
+fi
+
+# 8. THP service
+if systemctl is-enabled thp-disable.service >/dev/null 2>&1; then
+    ok "THP service enabled"
+else
+    warn "THP service not enabled"
+fi
+
+# 9. cpu-performance
+if systemctl is-enabled cpu-performance.service >/dev/null 2>&1; then
+    ok "CPU performance service enabled"
+else
+    warn "CPU performance service missing"
+fi
+
+# 10. ulimit
+NOFILE=$(ulimit -n)
+
+if [ "$NOFILE" -ge 65535 ]; then
+    ok "NOFILE limit = $NOFILE"
+else
+    warn "NOFILE limit low ($NOFILE)"
+fi
+
+# 11. memory
+MEM=$(free -m | awk '/Mem:/ {print $7}')
+
+if [ "$MEM" -gt 100 ]; then
+    ok "Available RAM ${MEM}MB"
+else
+    warn "Low RAM ${MEM}MB"
+fi
+
+# 12. disk
+DISK=$(df / | awk 'NR==2 {print $5}' | tr -d '%')
+
+if [ "$DISK" -lt 90 ]; then
+    ok "Disk usage ${DISK}%"
+else
+    warn "Disk usage high ${DISK}%"
+fi
+
+echo
+echo "========================================="
+echo " SUMMARY"
+echo "========================================="
+
+echo "Server : $(hostname)"
+echo "Kernel : $(uname -r)"
+echo "IP     : $(curl -4 -s ifconfig.me)"
+echo "BBR    : $(sysctl -n net.ipv4.tcp_congestion_control)"
+echo "Qdisc  : $(sysctl -n net.core.default_qdisc)"
+echo "Uptime : $(uptime -p)"
+echo "========================================="
