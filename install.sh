@@ -1,25 +1,12 @@
-#!/usr/bin/env bash
-# ============================================================
-#  VPS SETUP — VMESS/WS 500Mbps | 2 users | RTT 25ms
-#  Spec : 1 core @ 2.69GHz | 2GB RAM | eth0 | Ubuntu 22.04
-#  Proto: VMESS WS none-TLS | host: speedtest.net | port: 80
-#  Mode : รันครั้งเดียวจบ | หยุดทันทีถ้า step พัง
-# ============================================================
 set -euo pipefail
 export LANG=C
-
-# ── สี ──────────────────────────────────────────────────────
 GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'
 CYN='\033[0;36m'; BLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
-
-# ── State file ──────────────────────────────────────────────
 STATE_DIR="/var/lib/vps-setup"
 STATE_FILE="${STATE_DIR}/steps.done"
 LOG_FILE="${STATE_DIR}/setup.log"
 mkdir -p "$STATE_DIR"
 touch "$STATE_FILE" "$LOG_FILE"
-
-# ── Helper ──────────────────────────────────────────────────
 sep()    { echo -e "${DIM}${CYN}────────────────────────────────────────────────${RST}"; }
 hdr()    { echo -e "\n${BLD}${CYN}▶  $1${RST}"; sep; }
 ok()     { echo -e "  ${GRN}✔${RST}  $1"; }
@@ -29,10 +16,8 @@ die()    {
     echo -e "   ${DIM}ดู log: ${LOG_FILE}${RST}\n"
     exit 1
 }
-
 step_done() { grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
 mark_done() { echo "$1" >> "$STATE_FILE"; }
-
 run_step() {
     local name="$1"; shift
     if step_done "$name"; then
@@ -47,31 +32,20 @@ run_step() {
         die "$name"
     fi
 }
-
-# ── Root check ──────────────────────────────────────────────
 [ "$(id -u)" -eq 0 ] || { echo "ต้องรันด้วย root"; exit 1; }
-
 echo ""
 echo -e "${BLD}${CYN}╔══════════════════════════════════════════════════╗${RST}"
 echo -e "${BLD}${CYN}║   VPS SETUP — VMESS/WS 500Mbps | Ubuntu 22.04  ║${RST}"
 echo -e "${BLD}${CYN}╚══════════════════════════════════════════════════╝${RST}"
 echo -e "  Log: ${LOG_FILE}"
 echo ""
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 1 — UPDATE & DEPS"
-# ════════════════════════════════════════════════════════════
-
 _step1() {
     apt-get update -y
     apt-get install -y curl ufw ethtool sqlite3
 }
 run_step "step1_deps" _step1
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 2 — FIREWALL (UFW)"
-# ════════════════════════════════════════════════════════════
-
 _step2() {
     ufw --force reset
     ufw default deny incoming
@@ -82,21 +56,13 @@ _step2() {
     ufw --force enable
 }
 run_step "step2_ufw" _step2
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 3 — INSTALL 3X-UI"
-# ════════════════════════════════════════════════════════════
-
 _step3() {
     bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< ""
     systemctl enable x-ui
 }
 run_step "step3_3xui" _step3
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 4 — PANEL PORT → 2053"
-# ════════════════════════════════════════════════════════════
-
 _step4() {
     x-ui stop
     x-ui setting -port 2053
@@ -105,39 +71,22 @@ _step4() {
     systemctl is-active x-ui
 }
 run_step "step4_panel_port" _step4
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 5 — KERNEL TCP TUNE"
-# BDP = 500Mbps/8 × 0.025s = 1,562,500 bytes
-# rmem/wmem max = 16 MB (10× headroom สำหรับ WS framing overhead)
-# notsent_lowat = 16384 (~BDP/100 ลด lag มือถือ)
-# tcp_limit_output_bytes = 1 MB (anti-bufferbloat mobile)
-# ════════════════════════════════════════════════════════════
-
 _step5() {
     cat > /etc/sysctl.d/99-vmess-tune.conf << 'EOF'
-# ── TCP Congestion & Queue ──────────────────────────────────
 net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = fq
-
-# ── Socket Buffers (BDP = 500Mbps × RTT25ms = ~1.5MB) ──────
 net.core.rmem_max = 16777216
 net.core.wmem_max = 16777216
 net.core.rmem_default = 262144
 net.core.wmem_default = 262144
 net.ipv4.tcp_rmem = 4096 262144 16777216
 net.ipv4.tcp_wmem = 4096 262144 16777216
-
-# ── Anti-bufferbloat สำหรับ mobile RTT 25ms ────────────────
 net.ipv4.tcp_notsent_lowat   = 16384
 net.ipv4.tcp_limit_output_bytes = 1048576
-
-# ── Backlog & Connection ────────────────────────────────────
 net.core.netdev_max_backlog  = 16384
 net.core.somaxconn           = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
-
-# ── MTU Probing & Fastopen ──────────────────────────────────
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_base_mss    = 1440
 net.ipv4.tcp_fastopen    = 3
@@ -145,36 +94,24 @@ net.ipv4.tcp_window_scaling = 1
 net.ipv4.tcp_timestamps  = 1
 net.ipv4.tcp_sack        = 1
 net.ipv4.tcp_dsack       = 1
-
-# ── TIME_WAIT & Port Range ──────────────────────────────────
 net.ipv4.tcp_tw_reuse        = 1
 net.ipv4.tcp_max_tw_buckets  = 65536
 net.ipv4.ip_local_port_range = 1024 65535
-
-# ── Keepalive (ป้องกัน WS zombie) ──────────────────────────
 net.ipv4.tcp_keepalive_time   = 60
 net.ipv4.tcp_keepalive_intvl  = 10
 net.ipv4.tcp_keepalive_probes = 5
 net.ipv4.tcp_fin_timeout      = 15
-
-# ── Retry ───────────────────────────────────────────────────
 net.ipv4.tcp_syn_retries    = 3
 net.ipv4.tcp_synack_retries = 3
-
-# ── Memory ──────────────────────────────────────────────────
 vm.swappiness              = 5
 vm.dirty_ratio             = 15
 vm.dirty_background_ratio  = 5
 vm.min_free_kbytes         = 65536
 vm.vfs_cache_pressure      = 50
 net.core.optmem_max        = 65536
-
-# ── Scheduler (single core) ─────────────────────────────────
 kernel.sched_min_granularity_ns  = 3000000
 kernel.sched_wakeup_granularity_ns = 4000000
 kernel.sched_autogroup_enabled   = 0
-
-# ── Security ────────────────────────────────────────────────
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.all.send_redirects   = 0
 net.ipv4.conf.all.rp_filter        = 1
@@ -183,27 +120,20 @@ EOF
     sysctl -p /etc/sysctl.d/99-vmess-tune.conf
 }
 run_step "step5_sysctl" _step5
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 6 — DISABLE TRANSPARENT HUGE PAGES"
-# ════════════════════════════════════════════════════════════
-
 _step6() {
     echo never > /sys/kernel/mm/transparent_hugepage/enabled
     echo never > /sys/kernel/mm/transparent_hugepage/defrag
-
     cat > /etc/systemd/system/thp-disable.service << 'EOF'
 [Unit]
 Description=Disable Transparent Huge Pages
 DefaultDependencies=no
 After=sysinit.target local-fs.target
-
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
 ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -212,18 +142,12 @@ EOF
     systemctl start  thp-disable.service
 }
 run_step "step6_thp" _step6
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 7 — NIC TUNE (eth0)"
-# ════════════════════════════════════════════════════════════
-
 _step7() {
     NIC="eth0"
     ethtool -K "${NIC}" gro off lro off tso on gso on 2>/dev/null || true
     ethtool -C "${NIC}" rx-usecs 50                               2>/dev/null || true
     ip link set "${NIC}" txqueuelen 1000
-
-    # persist ผ่าน networkd-dispatcher
     mkdir -p /etc/networkd-dispatcher/routable.d
     cat > /etc/networkd-dispatcher/routable.d/50-nic-tune.sh << 'NEOF'
 #!/usr/bin/env bash
@@ -235,19 +159,12 @@ NEOF
     chmod +x /etc/networkd-dispatcher/routable.d/50-nic-tune.sh
 }
 run_step "step7_nic" _step7
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 8 — I/O SCHEDULER"
-# ════════════════════════════════════════════════════════════
-
 _step8() {
-    # ตรวจหา block device จริง
     for DEV in sda vda xvda; do
         [ -b "/dev/${DEV}" ] || continue
         echo mq-deadline > /sys/block/${DEV}/queue/scheduler 2>/dev/null || true
     done
-
-    # persist ผ่าน udev
     cat > /etc/udev/rules.d/60-io-scheduler.rules << 'EOF'
 ACTION=="add|change", KERNEL=="sd[a-z]|vd[a-z]|xvd[a-z]", \
   ATTR{queue/rotational}=="0", \
@@ -256,24 +173,18 @@ EOF
     udevadm control --reload-rules
 }
 run_step "step8_io_scheduler" _step8
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 9 — CPU GOVERNOR (performance)"
-# ════════════════════════════════════════════════════════════
-
 _step9() {
     cat > /etc/systemd/system/cpu-performance.service << 'EOF'
 [Unit]
 Description=CPU governor → performance
 After=multi-user.target
-
 [Service]
 Type=oneshot
 ExecStart=/bin/bash -c \
   'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; \
    do echo performance > "$f" 2>/dev/null || true; done'
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -282,11 +193,7 @@ EOF
     systemctl start  cpu-performance.service
 }
 run_step "step9_cpu_gov" _step9
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 10 — SYSTEM LIMITS"
-# ════════════════════════════════════════════════════════════
-
 _step10() {
     cat > /etc/security/limits.d/99-xui.conf << 'EOF'
 *    soft nofile 65535
@@ -294,16 +201,11 @@ _step10() {
 root soft nofile 65535
 root hard nofile 65535
 EOF
-
     grep -qxF 'session required pam_limits.so' /etc/pam.d/common-session \
         || echo 'session required pam_limits.so' >> /etc/pam.d/common-session
 }
 run_step "step10_limits" _step10
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 11 — x-ui SYSTEMD OVERRIDE"
-# ════════════════════════════════════════════════════════════
-
 _step11() {
     mkdir -p /etc/systemd/system/x-ui.service.d
     cat > /etc/systemd/system/x-ui.service.d/override.conf << 'EOF'
@@ -320,32 +222,22 @@ EOF
     systemctl is-active x-ui
 }
 run_step "step11_xui_override" _step11
-
-# ════════════════════════════════════════════════════════════
 hdr "STEP 12 — POST-REBOOT VERIFY SERVICE"
-# สคริปต์ตรวจสอบหลัง reboot ทุกครั้ง
-# ════════════════════════════════════════════════════════════
-
 _step12() {
     cat > /usr/local/bin/vps-verify << 'VEOF'
 #!/usr/bin/env bash
-# VPS Post-boot Verify — VMESS/WS Setup
 export LANG=C
 GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'
 CYN='\033[0;36m'; BLD='\033[1m'; RST='\033[0m'
 PASS=0; FAIL=0; WARN=0
-
 ok()  { echo -e "  ${GRN}✔${RST}  $1"; ((PASS++)); }
 bad() { echo -e "  ${RED}✘${RST}  $1"; ((FAIL++)); }
 wr()  { echo -e "  ${YEL}⚠${RST}  $1"; ((WARN++)); }
-
 echo ""
 echo -e "${BLD}${CYN}╔══════════════════════════════════════════╗${RST}"
 echo -e "${BLD}${CYN}║     VPS POST-BOOT VERIFY                ║${RST}"
 echo -e "${BLD}${CYN}╚══════════════════════════════════════════╝${RST}"
 echo ""
-
-# UFW
 ufw status | grep -q "Status: active"  && ok "UFW active"           || bad "UFW ไม่ active"
 ufw status | grep -q "^80/tcp"         && ok "Port 80 open"         || bad "Port 80 ไม่เปิด"
 ufw status | grep -q "^443/tcp"        && ok "Port 443 open"        || bad "Port 443 ไม่เปิด"
@@ -353,22 +245,14 @@ ufw status | grep -q "^2053/tcp"       && ok "Port 2053 open"       || bad "Port
 ufw status | grep -q "^8080/tcp"       && ok "Port 8080 open"       || bad "Port 8080 ไม่เปิด"
 ufw status | grep -q "^8443/tcp"       && ok "Port 8443 open"       || bad "Port 8443 ไม่เปิด"
 ufw status | grep -q "^54321/tcp"      && ok "Port 54321 open"      || bad "Port 54321 ไม่เปิด"
-
-# x-ui
 systemctl is-active x-ui &>/dev/null   && ok "x-ui running"        || bad "x-ui ไม่ทำงาน"
 systemctl is-enabled x-ui &>/dev/null  && ok "x-ui enabled"        || bad "x-ui ไม่ enabled"
-
-# BBR
 [ "$(sysctl -n net.ipv4.tcp_congestion_control)" = "bbr" ] \
     && ok "BBR active"  || bad "BBR ไม่ active"
 [ "$(sysctl -n net.core.default_qdisc)" = "fq" ] \
     && ok "FQ qdisc"    || bad "FQ ไม่ active"
-
-# THP
 cat /sys/kernel/mm/transparent_hugepage/enabled | grep -q '\[never\]' \
     && ok "THP disabled" || bad "THP ยังเปิดอยู่"
-
-# sysctl ค่าสำคัญ
 [ "$(sysctl -n net.core.rmem_max)" -ge 16777216 ] \
     && ok "rmem_max OK"  || bad "rmem_max ต่ำเกิน"
 [ "$(sysctl -n net.core.wmem_max)" -ge 16777216 ] \
@@ -379,32 +263,22 @@ cat /sys/kernel/mm/transparent_hugepage/enabled | grep -q '\[never\]' \
     && ok "swappiness OK"    || wr "swappiness สูง"
 [ "$(sysctl -n vm.min_free_kbytes)" -ge 65536 ] \
     && ok "min_free_kbytes OK" || wr "min_free_kbytes ต่ำ"
-
-# nofile
 NOFILE=$(ulimit -Hn)
 [ "$NOFILE" -ge 65535 ] && ok "nofile limit OK ($NOFILE)" || bad "nofile ต่ำ ($NOFILE)"
-
-# NIC
 NIC="eth0"
 ip link show "$NIC" &>/dev/null && ok "eth0 up" || bad "eth0 ไม่พบ"
 if command -v ethtool &>/dev/null; then
     ethtool -k "$NIC" 2>/dev/null | grep -q 'generic-receive-offload: off' \
         && ok "GRO off (proxy OK)" || wr "GRO ยัง on"
 fi
-
-# IO Scheduler
 for DEV in sda vda xvda; do
     [ -b "/dev/${DEV}" ] || continue
     SCHED=$(cat /sys/block/${DEV}/queue/scheduler 2>/dev/null)
     echo "$SCHED" | grep -qE '\[mq-deadline\]|\[none\]' \
         && ok "I/O Scheduler OK ($DEV)" || wr "I/O Scheduler ไม่ใช่ mq-deadline ($DEV)"
 done
-
-# Port 80 listening
 ss -tlnp | grep -q ':80 ' \
     && ok "Port 80 listening" || wr "Port 80 ไม่ได้ฟัง (ยังไม่ได้ตั้ง inbound?)"
-
-# Summary
 echo ""
 echo -e "  ──────────────────────────────────────"
 echo -e "  ${GRN}Pass: ${PASS}${RST}  ${YEL}Warn: ${WARN}${RST}  ${RED}Fail: ${FAIL}${RST}"
@@ -414,20 +288,16 @@ echo -e "  ${GRN}Pass: ${PASS}${RST}  ${YEL}Warn: ${WARN}${RST}  ${RED}Fail: ${F
 echo ""
 VEOF
     chmod +x /usr/local/bin/vps-verify
-
-    # systemd service รัน verify หลัง boot
     cat > /etc/systemd/system/vps-verify.service << 'EOF'
 [Unit]
 Description=VPS Post-boot Verify
 After=network-online.target x-ui.service
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/vps-verify
 StandardOutput=journal
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -435,19 +305,13 @@ EOF
     systemctl enable vps-verify.service
 }
 run_step "step12_verify_service" _step12
-
-# ════════════════════════════════════════════════════════════
 hdr "DONE — SUMMARY"
-# ════════════════════════════════════════════════════════════
-
 PUB_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "N/A")
-
 echo ""
 echo -e "${BLD}${GRN}  Steps เสร็จแล้ว:${RST}"
 while IFS= read -r line; do
     echo -e "    ${GRN}✔${RST}  $line"
 done < "$STATE_FILE"
-
 echo ""
 echo -e "  ──────────────────────────────────────────────"
 echo -e "  ${BLD}Panel  :${RST} http://${PUB_IP}:2053"
