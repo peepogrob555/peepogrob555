@@ -18,8 +18,7 @@ PUBIP=$(curl -s ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')
 
 echo -e "\n${B}${C}  VPS Setup — VMESS WS | 2-USER | 500Mbps | RTT 25ms | 1vCPU 2GB${N}"
 echo -e "  Interface : ${Y}$ETH${N} | IP: ${Y}$PUBIP${N}"
-echo -e "  Hardware  : ${Y}1 vCPU (2.69GHz)${N} | ${Y}2GB RAM${N}"
-echo -e "  Target    : 500Mbps gross → 425Mbps net after 15% VMESS WS overhead | RTT 25ms | MSS 1360 MTU 1400\n"
+echo -e "  Hardware  : ${Y}1 vCPU (2.69GHz)${N} | ${Y}2GB RAM${N}\n"
 
 sec "STEP 1 — SWAP"
 
@@ -89,7 +88,11 @@ EOF
 echo 1000000 > /proc/sys/fs/file-max
 ok "x-ui service limits set"
 
-sec "STEP 5 — SYSCTL (1vCPU 2GB | BDP=6553600 | RTT=25ms | 500Mbps | MSS=1360)"
+sec "STEP 5 — SYSCTL (1vCPU 2GB | BDP=15625000 | RTT=25ms | 500Mbps | MSS=1440)"
+
+# BDP = 500Mbps * 25ms / 8 = 1562500 bytes
+# rmem/wmem max = BDP * 8 (headroom for 2 users + overhead) = 12500000 → round 16MB
+# tcp_limit_output_bytes = BDP * 1 = ~1562500 → 1572864 (1.5MB, allow burst without bloat)
 
 modprobe tcp_bbr 2>/dev/null && ok "tcp_bbr loaded" || inf "tcp_bbr built-in"
 
@@ -98,11 +101,11 @@ net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 
 net.core.rmem_default = 262144
-net.core.rmem_max = 67108864
+net.core.rmem_max = 16777216
 net.core.wmem_default = 262144
-net.core.wmem_max = 67108864
-net.ipv4.tcp_rmem = 4096 262144 67108864
-net.ipv4.tcp_wmem = 4096 262144 67108864
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 262144 16777216
+net.ipv4.tcp_wmem = 4096 262144 16777216
 net.core.optmem_max = 65536
 net.ipv4.tcp_mem = 65536 1048576 268435456
 net.ipv4.tcp_adv_win_scale = 2
@@ -114,9 +117,9 @@ net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 5
 net.ipv4.tcp_autocorking = 0
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 32768
+net.ipv4.tcp_notsent_lowat = 131072
 net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_limit_output_bytes = 655360
+net.ipv4.tcp_limit_output_bytes = 1572864
 
 net.ipv4.tcp_keepalive_time = 8
 net.ipv4.tcp_keepalive_intvl = 2
@@ -185,95 +188,53 @@ else
     inf "ethtool not available"
 fi
 
-mkdir -p /etc/networkd-dispatcher/routable.d/
-cat > /etc/networkd-dispatcher/routable.d/51-ethtool << 'ETEOF'
-#!/bin/bash
-ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
-ethtool -K $ETH gro off 2>/dev/null || true
-ethtool -K $ETH lro off 2>/dev/null || true
-ethtool -K $ETH tso on  2>/dev/null || true
-ethtool -K $ETH gso on  2>/dev/null || true
-ethtool -C $ETH rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32 2>/dev/null || true
-ETEOF
-chmod +x /etc/networkd-dispatcher/routable.d/51-ethtool
-ok "ethtool persistence written"
-
-sec "STEP 7 — CAKE QDISC (RTT=25ms, 500Mbps) + PERSISTENCE"
-
-ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && ok "txqueuelen=4096" || inf "txqueuelen skipped"
-modprobe sch_cake 2>/dev/null && ok "sch_cake loaded" || inf "sch_cake unavailable"
-tc qdisc del dev "$ETH" root 2>/dev/null || true
-ok "old qdisc cleared"
-
-if lsmod | grep -q sch_cake; then
-    tc qdisc add dev "$ETH" root cake bandwidth 500mbit rtt 25ms besteffort split-gso 2>/dev/null && \
-        ok "CAKE: 500mbit rtt 25ms besteffort split-gso" || \
-    { tc qdisc add dev "$ETH" root cake bandwidth 500mbit rtt 25ms besteffort 2>/dev/null && \
-        ok "CAKE: 500mbit rtt 25ms besteffort"; } || \
-    { tc qdisc add dev "$ETH" root fq_codel target 1ms interval 25ms 2>/dev/null && \
-        ok "fq_codel fallback"; }
-else
-    tc qdisc add dev "$ETH" root fq_codel target 1ms interval 25ms 2>/dev/null && ok "fq_codel fallback"
-fi
-
-tc qdisc show dev "$ETH" | while IFS= read -r line; do inf "qdisc: $line"; done
-
-mkdir -p /etc/networkd-dispatcher/routable.d/
-cat > /etc/networkd-dispatcher/routable.d/50-cake << 'BOOTEOF'
+FQ_SCRIPT=/usr/local/bin/setup-fq.sh
+cat > "$FQ_SCRIPT" << 'FQEOF'
 #!/bin/bash
 ETH=$(ip -o -4 route show to default | awk '{print $5}' | head -1)
 ip link set dev $ETH txqueuelen 4096 2>/dev/null || true
 tc qdisc del dev $ETH root 2>/dev/null || true
-modprobe sch_cake 2>/dev/null
-if lsmod | grep -q sch_cake; then
-    tc qdisc add dev $ETH root cake bandwidth 500mbit rtt 25ms besteffort split-gso 2>/dev/null || \
-    tc qdisc add dev $ETH root cake bandwidth 500mbit rtt 25ms besteffort 2>/dev/null || \
-    tc qdisc add dev $ETH root fq_codel target 1ms interval 25ms 2>/dev/null
-else
-    tc qdisc add dev $ETH root fq_codel target 1ms interval 25ms 2>/dev/null
+tc qdisc add dev $ETH root fq flow_limit 200 quantum 1514 initial_quantum 15140 maxrate 0 2>/dev/null || \
+tc qdisc add dev $ETH root fq 2>/dev/null || true
+# ethtool persistence
+if command -v ethtool &>/dev/null; then
+    ethtool -K $ETH gro off 2>/dev/null || true
+    ethtool -K $ETH lro off 2>/dev/null || true
+    ethtool -K $ETH tso on  2>/dev/null || true
+    ethtool -K $ETH gso on  2>/dev/null || true
+    ethtool -C $ETH rx-usecs 50 rx-frames 32 tx-usecs 50 tx-frames 32 2>/dev/null || true
 fi
-BOOTEOF
-chmod +x /etc/networkd-dispatcher/routable.d/50-cake
-ok "CAKE networkd-dispatcher persistence written"
+FQEOF
+chmod +x "$FQ_SCRIPT"
+ok "setup-fq.sh created"
 
-RC_LOCAL=/etc/rc.local
-if [[ ! -f "$RC_LOCAL" ]]; then
-    printf '#!/bin/bash\nexit 0\n' > "$RC_LOCAL"
-    chmod +x "$RC_LOCAL"
-fi
-if ! grep -q "50-cake" "$RC_LOCAL" 2>/dev/null; then
-    sed -i '/^exit 0/i bash /etc/networkd-dispatcher/routable.d/50-cake' "$RC_LOCAL"
-    ok "rc.local fallback written"
-else
-    ok "rc.local already has cake entry"
-fi
+sec "STEP 7 — FQ QDISC (no rate limit | quantum=1514 | flow_limit=200)"
 
-cat > /etc/systemd/system/cake-qdisc.service << 'EOF'
+ip link set dev "$ETH" txqueuelen 4096 2>/dev/null && ok "txqueuelen=4096" || inf "txqueuelen skipped"
+tc qdisc del dev "$ETH" root 2>/dev/null || true
+tc qdisc add dev "$ETH" root fq flow_limit 200 quantum 1514 initial_quantum 15140 maxrate 0 2>/dev/null && \
+    ok "fq: flow_limit=200 quantum=1514 initial_quantum=15140 maxrate=0 (unlimited)" || \
+{ tc qdisc add dev "$ETH" root fq 2>/dev/null && ok "fq: default params"; }
+
+tc qdisc show dev "$ETH" | while IFS= read -r line; do inf "qdisc: $line"; done
+
+cat > /etc/systemd/system/fq-qdisc.service << 'EOF'
 [Unit]
-Description=CAKE qdisc 500mbit rtt 25ms for VMESS WS
+Description=fq qdisc unlimited for BBR+VMESS WS
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/etc/networkd-dispatcher/routable.d/50-cake
+ExecStart=/usr/local/bin/setup-fq.sh
 ExecStartPost=/bin/sh -c 'tc qdisc show dev $(ip -o -4 route show to default | awk "{print $5}" | head -1)'
 
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable cake-qdisc.service >/dev/null 2>&1 && ok "cake-qdisc.service enabled"
-
-mkdir -p /etc/network/if-up.d/
-cat > /etc/network/if-up.d/cake << 'IFEOF'
-#!/bin/bash
-[ "$IFACE" = "lo" ] && exit 0
-bash /etc/networkd-dispatcher/routable.d/50-cake
-IFEOF
-chmod +x /etc/network/if-up.d/cake
-ok "if-up.d/cake written"
+systemctl enable fq-qdisc.service >/dev/null 2>&1 && ok "fq-qdisc.service enabled"
 
 sec "STEP 8 — VMESS WS SOCKOPT PATCHER"
 
@@ -292,7 +253,7 @@ SOCKOPT = {
     "tcpKeepAliveInterval": 2,
     "tcpFastOpen":          True,
     "tcpUserTimeout":       6000,
-    "tcpMaxSeg":            1360,
+    "tcpMaxSeg":            1440,
     "mark":                 0,
 }
 
@@ -336,7 +297,7 @@ for p in PATHS:
 print("  no xray config found — will patch on next x-ui start")
 PYEOF
 chmod +x "$PATCHER"
-ok "xui-ws-patch.py created"
+ok "xui-ws-patch.py created (MSS=1440)"
 
 mkdir -p /etc/systemd/system/x-ui.service.d/
 cat > /etc/systemd/system/x-ui.service.d/ws-patch.conf << 'UNITEOF'
@@ -390,12 +351,6 @@ fi
 sec "FINAL — VERIFY"
 
 echo ""
-inf "── Hardware Profile ──"
-ok "vCPU        = 1 (2.69GHz)"
-ok "RAM         = 2GB"
-ok "GOMAXPROCS  = 1"
-ok "taskset CPU = 0"
-
 inf "── Active Ports ──"
 ss -tlnp | grep -E ":(80|443|2053|2083|2087|2096|8080|8443|54321) " | \
     while IFS= read -r line; do ok "$line"; done || \
@@ -403,21 +358,20 @@ ss -tlnp | grep -E ":(80|443|2053|2083|2087|2096|8080|8443|54321) " | \
 
 inf "── Kernel ──"
 ok "cc            = $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+ok "qdisc         = $(sysctl -n net.core.default_qdisc 2>/dev/null)"
 ok "fastopen      = $(sysctl -n net.ipv4.tcp_fastopen 2>/dev/null)"
 ok "keepalive     = $(sysctl -n net.ipv4.tcp_keepalive_time 2>/dev/null)s"
 ok "rmem_max      = $(sysctl -n net.core.rmem_max 2>/dev/null)"
 ok "wmem_max      = $(sysctl -n net.core.wmem_max 2>/dev/null)"
 ok "output_bytes  = $(sysctl -n net.ipv4.tcp_limit_output_bytes 2>/dev/null)"
 ok "somaxconn     = $(sysctl -n net.core.somaxconn 2>/dev/null)"
-ok "netdev_budget = $(sysctl -n net.core.netdev_budget 2>/dev/null)"
 ok "nofile        = soft:$(ulimit -Sn) hard:$(ulimit -Hn)"
-inf "note: nofile มีผลเต็มหลัง reboot"
 
 inf "── qdisc ──"
 tc qdisc show dev "$ETH" | while IFS= read -r line; do ok "$line"; done
 
-inf "── cake-qdisc.service ──"
-ok "enabled: $(systemctl is-enabled cake-qdisc.service 2>/dev/null)"
+inf "── fq-qdisc.service ──"
+ok "enabled: $(systemctl is-enabled fq-qdisc.service 2>/dev/null)"
 
 inf "── x-ui ──"
 ok "status: $(systemctl is-active x-ui 2>/dev/null)"
@@ -427,7 +381,7 @@ PANEL_PORT=${PANEL_PORT:-54321}
 
 echo ""
 echo -e "${G}${B}╔══════════════════════════════════════════╗${N}"
-echo -e "${G}${B}║                      DONE               ║${N}"
+echo -e "${G}${B}║                   DONE                  ║${N}"
 echo -e "${G}${B}╚══════════════════════════════════════════╝${N}"
 echo ""
 echo -e "${Y}  ▸ Hardware      : 1vCPU 2.69GHz | 2GB RAM${N}"
@@ -435,13 +389,14 @@ echo -e "${Y}  ▸ GOMAXPROCS    : 1${N}"
 echo -e "${Y}  ▸ xray CPU mask : 0${N}"
 echo -e "${Y}  ▸ panel         : http://${PUBIP}:${PANEL_PORT}${N}"
 echo -e "${Y}  ▸ inbound       : VMESS | WS | port 80 | security: none${N}"
-echo -e "${Y}  ▸ MSS/MTU       : 1360${N}"
-echo -e "${Y}  ▸ CAKE          : 500mbit rtt 25ms besteffort${N}"
-echo -e "${Y}  ▸ BDP           : 6553600 bytes (500Mbps × 25ms / 8 × 4)${N}"
-echo -e "${Y}  ▸ output_bytes  : 655360 (500Mbps/8 × 10ms)${N}"
+echo -e "${Y}  ▸ MSS           : 1440${N}"
+echo -e "${Y}  ▸ qdisc         : fq (unlimited) + BBR${N}"
+echo -e "${Y}  ▸ BDP           : 1562500 bytes (500Mbps × 25ms / 8)${N}"
+echo -e "${Y}  ▸ rmem/wmem_max : 16MB (BDP × 8, headroom for 2 users)${N}"
+echo -e "${Y}  ▸ output_bytes  : 1572864 (~1×BDP, low bloat)${N}"
 echo -e "${Y}  ▸ hugepage      : madvise${N}"
 echo -e "${Y}  ▸ scheduler     : 3ms granularity${N}"
-echo -e "${Y}  ▸ CAKE persist  : systemd + networkd-dispatcher + rc.local + if-up.d${N}"
+echo -e "${Y}  ▸ persist       : fq-qdisc.service (systemd)${N}"
 echo -e "${Y}  ▸ Firewall      : เปิดพอร์ตใน ReadyIDC panel ด้วย${N}"
 echo -e "${Y}  ▸ reboot        : sudo reboot${N}"
 echo -e "${Y}  ▸ nofile        : มีผลเต็มหลัง reboot${N}"
