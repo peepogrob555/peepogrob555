@@ -56,7 +56,7 @@ _step2() {
 run_step "step2_ufw" _step2
 hdr "STEP 3 — INSTALL 3X-UI"
 _step3() {
-    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) <<< ""
+    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
     systemctl enable x-ui
 }
 run_step "step3_3xui" _step3
@@ -107,15 +107,13 @@ vm.dirty_background_ratio  = 5
 vm.min_free_kbytes         = 65536
 vm.vfs_cache_pressure      = 50
 net.core.optmem_max        = 65536
-kernel.sched_min_granularity_ns  = 3000000
-kernel.sched_wakeup_granularity_ns = 4000000
-kernel.sched_autogroup_enabled   = 0
+kernel.sched_autogroup_enabled = 0
 net.ipv4.conf.all.accept_redirects = 0
 net.ipv4.conf.all.send_redirects   = 0
 net.ipv4.conf.all.rp_filter        = 1
 net.ipv4.icmp_echo_ignore_broadcasts = 1
 EOF
-    sysctl -p /etc/sysctl.d/99-vmess-tune.conf
+    sysctl -p /etc/sysctl.d/99-vmess-tune.conf || sysctl --system
 }
 run_step "step5_sysctl" _step5
 hdr "STEP 6 — DISABLE TRANSPARENT HUGE PAGES"
