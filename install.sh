@@ -48,7 +48,7 @@ _step2() {
     ufw --force reset
     ufw default deny incoming
     ufw default allow outgoing
-    for port in 80 443 2053 2083 2087 2096 8080 8443 54321; do
+    for port in 22 80 443 2053 2083 2087 2096 8080 8443 54321; do
         ufw allow "${port}"/tcp
     done
     ufw --force enable
@@ -236,6 +236,7 @@ echo -e "${BLD}${CYN}╚══════════════════�
 echo ""
 UFW_STATUS=$(ufw status 2>/dev/null)
 if echo "$UFW_STATUS" | grep -q "Status: active"; then ok "UFW active"; else bad "UFW ไม่ active"; fi
+if echo "$UFW_STATUS" | grep -q "^22/tcp";    then ok "Port 22 open (SSH)"; else bad "Port 22 ไม่เปิด (SSH)"; fi
 if echo "$UFW_STATUS" | grep -q "^80/tcp";    then ok "Port 80 open";    else bad "Port 80 ไม่เปิด";    fi
 if echo "$UFW_STATUS" | grep -q "^443/tcp";   then ok "Port 443 open";   else bad "Port 443 ไม่เปิด";   fi
 if echo "$UFW_STATUS" | grep -q "^2053/tcp";  then ok "Port 2053 open";  else bad "Port 2053 ไม่เปิด";  fi
