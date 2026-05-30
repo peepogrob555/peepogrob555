@@ -657,4 +657,3 @@ echo -e "  ───────────────────────
 echo ""
 echo -e "  ${BLD}${YEL}→ reboot แล้วรัน:${RST}  vps-verify"
 echo ""
-ENDOFSCRIPT
