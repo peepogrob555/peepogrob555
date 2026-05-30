@@ -1,4 +1,3 @@
-cat > /mnt/user-data/outputs/install.sh << 'ENDOFSCRIPT'
 #!/usr/bin/env bash
 set -uo pipefail
 export LANG=C
@@ -659,4 +658,3 @@ echo ""
 echo -e "  ${BLD}${YEL}→ reboot แล้วรัน:${RST}  vps-verify"
 echo ""
 ENDOFSCRIPT
-echo "WRITE OK"
