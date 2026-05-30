@@ -1,4 +1,4 @@
-cat > ~/PeepogrobVPN/app/src/main/java/com/peepogrob/vpn/vpn/PeeVpnService.kt << 'EOF'
+cat > ~/PeepogrobVPN/app/src/main/java/com/peepogrob/vpn/vpn/PeeVpnService.kt << 'KOTLIN'
 package com.peepogrob.vpn.vpn
 
 import android.app.*
@@ -33,15 +33,10 @@ class PeeVpnService : VpnService() {
     private val callbackHandler = object : CoreCallbackHandler {
         override fun onEmitStatus(level: Long, msg: String?): Long {
             Log.d(TAG, "v2ray [$level]: $msg")
-            if (msg?.contains("failed") == true || msg?.contains("error") == true) {
-                handler.post { handleReconnect() }
-            }
             return 0
         }
-        override fun shutdown(): Long {
-            handler.post { stopVpn() }
-            return 0
-        }
+        override fun startup(): Long { return 0 }
+        override fun shutdown(): Long { return 0 }
     }
 
     override fun onCreate() {
@@ -73,11 +68,9 @@ class PeeVpnService : VpnService() {
                 .setSession("PeepogrobVPN")
                 .setBlocking(false)
             pfd = builder.establish() ?: run { Log.e(TAG, "establish null"); return }
-
             val configJson = ConfigGenerator.generate(cfg)
             coreController = CoreController(callbackHandler)
             coreController!!.startLoop(configJson)
-
             isRunning = true
             reconnectCount = 0
             startForeground(NOTIF_ID, buildNotification("Connected"))
@@ -138,9 +131,9 @@ class PeeVpnService : VpnService() {
         stopVpn()
     }
 }
-EOF
+KOTLIN
 
-cat > ~/PeepogrobVPN/app/src/main/java/com/peepogrob/vpn/ui/MainActivity.kt << 'EOF'
+cat > ~/PeepogrobVPN/app/src/main/java/com/peepogrob/vpn/ui/MainActivity.kt << 'KOTLIN'
 package com.peepogrob.vpn.ui
 
 import android.content.*
@@ -161,6 +154,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvStatus: TextView
     private lateinit var tvSpeed: TextView
     private lateinit var progressBar: ProgressBar
+
     private var isConnected = false
 
     private val vpnLauncher = registerForActivityResult(
@@ -186,13 +180,18 @@ class MainActivity : AppCompatActivity() {
         btnConnect.setOnClickListener {
             if (isConnected) stopVpn() else requestVpnPermission()
         }
+
         findViewById<ImageButton>(R.id.btnImport).setOnClickListener { importFromClipboard() }
         findViewById<ImageButton>(R.id.btnSettings).setOnClickListener {
             startActivity(Intent(this, SettingsActivity::class.java))
         }
 
-        registerReceiver(statusReceiver, IntentFilter("com.peepogrob.vpn.STATUS"),
-            RECEIVER_NOT_EXPORTED)
+        val filter = IntentFilter("com.peepogrob.vpn.STATUS")
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(statusReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(statusReceiver, filter)
+        }
         updateUI(PeeVpnService.isRunning)
     }
 
@@ -235,19 +234,23 @@ class MainActivity : AppCompatActivity() {
         val text = cm.primaryClip?.getItemAt(0)?.text?.toString() ?: ""
         val cfg = VmessImport.parse(text)
         if (cfg != null) {
-            getSharedPreferences("peevpn", MODE_PRIVATE).edit().apply {
-                putString("address",  cfg.address)
-                putInt   ("port",     cfg.port)
-                putString("uuid",     cfg.uuid)
-                putInt   ("alterId",  cfg.alterId)
-                putString("security", cfg.security)
-                putString("path",     cfg.path)
-                putString("host",     cfg.host)
-                apply()
-            }
+            saveConfig(cfg)
             Toast.makeText(this, "Imported: ${cfg.remarks}", Toast.LENGTH_SHORT).show()
         } else {
             Toast.makeText(this, "No valid vmess:// in clipboard", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun saveConfig(cfg: VmessConfig) {
+        getSharedPreferences("peevpn", MODE_PRIVATE).edit().apply {
+            putString("address",  cfg.address)
+            putInt   ("port",     cfg.port)
+            putString("uuid",     cfg.uuid)
+            putInt   ("alterId",  cfg.alterId)
+            putString("security", cfg.security)
+            putString("path",     cfg.path)
+            putString("host",     cfg.host)
+            apply()
         }
     }
 
@@ -273,6 +276,6 @@ class MainActivity : AppCompatActivity() {
         unregisterReceiver(statusReceiver)
     }
 }
-EOF
+KOTLIN
 
-gradle assembleDebug 2>&1 | grep -E "error:|e:|BUILD" | head -20
+echo "=== FILES OK ===" && gradle assembleDebug 2>&1 | tail -10
