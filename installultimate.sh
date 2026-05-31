@@ -1,11 +1,11 @@
-"#!/usr/bin/env bash
+#!/usr/bin/env bash
 # =============================================================
-#  VPS SETUP UNLIMITED v6.1  ██████████████████████████████
+#  VPS SETUP UNLIMITED v6.1
 #  RTT=0.5ms / BW=500Gbps / ABSOLUTELY NO LIMITS / NO CAPS
-#  BDP = 500Gbps × 0.5ms = 31,250,000 bytes
+#  BDP = 500Gbps x 0.5ms = 31,250,000 bytes
 #  tcp_base_mss = 1440 (HARDCODED / NO AUTO)
-#  NIC: auto-detect จาก default route
-#  MODE: MAXIMUM CHAOS — ทุกอย่างเปิดหมด ไม่มีขีดจำกัด
+#  NIC: auto-detect from default route
+#  MODE: MAXIMUM CHAOS -- everything on, no limits
 #  v6.1 fixes: tc quantum 65536, verify logic, oneshot services
 # =============================================================
 set -uo pipefail
@@ -21,12 +21,12 @@ mkdir -p "$STATE_DIR"
 touch "$STATE_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-sep()  { echo -e "${DIM}${CYN}────────────────────────────────────────────────────────${RST}"; }
-hdr()  { echo -e "\n${BLD}${MGN}▶  $1${RST}"; sep; }
-ok()   { echo -e "  ${GRN}✔${RST}  $1"; }
-warn() { echo -e "  ${YEL}⚠${RST}  $1"; }
-info() { echo -e "  ${CYN}ℹ${RST}  $1"; }
-die()  { echo -e "\n${RED}${BLD}✘  $1${RST}\n  Log: ${LOG_FILE}\n"; exit 1; }
+sep()  { echo -e "${DIM}${CYN}--------------------------------------------------------${RST}"; }
+hdr()  { echo -e "\n${BLD}${MGN}>  $1${RST}"; sep; }
+ok()   { echo -e "  ${GRN}+${RST}  $1"; }
+warn() { echo -e "  ${YEL}!${RST}  $1"; }
+info() { echo -e "  ${CYN}i${RST}  $1"; }
+die()  { echo -e "\n${RED}${BLD}X  $1${RST}\n  Log: ${LOG_FILE}\n"; exit 1; }
 
 step_done()  { grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
 mark_done()  { grep -qxF "$1" "$STATE_FILE" 2>/dev/null || echo "$1" >> "$STATE_FILE"; }
@@ -35,15 +35,15 @@ clear_done() { sed -i "/^$1\$/d" "$STATE_FILE" 2>/dev/null || true; }
 run_step() {
     local name="$1" skip="$2"; shift 2
     if $skip && step_done "$name"; then
-        ok "[SKIP] ${name} — เสร็จแล้ว"; return 0
+        ok "[SKIP] ${name} -- done already"; return 0
     fi
     clear_done "$name"
-    echo -e "\n${BLD}  → ${name}${RST}"
+    echo -e "\n${BLD}  -> ${name}${RST}"
     if (set -euo pipefail; "$@"); then
         mark_done "$name"; ok "[OK]   ${name}"
     else
-        echo -e "\n${RED}${BLD}✘  FAILED: ${name}${RST}"
-        echo -e "  ${YEL}แก้ปัญหาแล้วรันใหม่ได้เลย — Log: ${LOG_FILE}${RST}\n"
+        echo -e "\n${RED}${BLD}X  FAILED: ${name}${RST}"
+        echo -e "  ${YEL}Fix and re-run -- Log: ${LOG_FILE}${RST}\n"
         exit 1
     fi
 }
@@ -55,7 +55,7 @@ retry() {
     local i=1
     while true; do
         "$@" && return 0
-        echo -e "  ${YEL}retry ${i}/${tries} — รอ ${delay}s...${RST}"
+        echo -e "  ${YEL}retry ${i}/${tries} -- waiting ${delay}s...${RST}"
         [ "$i" -ge "$tries" ] && return 1
         sleep "$delay"; i=$((i+1))
     done
@@ -64,24 +64,24 @@ retry() {
 wait_service_active() {
     local svc="$1" timeout="${2:-30}" elapsed=0
     until systemctl is-active "$svc" &>/dev/null; do
-        [ "$elapsed" -ge "$timeout" ] && { echo "  timeout รอ ${svc}"; return 1; }
+        [ "$elapsed" -ge "$timeout" ] && { echo "  timeout waiting for ${svc}"; return 1; }
         sleep 2; elapsed=$((elapsed+2))
     done
 }
 
-[ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root"
+[ "$(id -u)" -eq 0 ] || die "Must run as root"
 
 # =============================================================
-#  CONSTANTS — MAXIMUM CHAOS EDITION
+#  CONSTANTS -- MAXIMUM CHAOS EDITION
 #
 #  RTT  = 0.5ms  = 0.0005s
 #  BW   = 500Gbps = 62,500,000,000 bytes/s
-#  BDP  = 62,500,000,000 × 0.0005 = 31,250,000 bytes
+#  BDP  = 62,500,000,000 x 0.0005 = 31,250,000 bytes
 #
 #  INT_MAX   (signed 32-bit)  = 2,147,483,647
 #  INT64_MAX (signed 64-bit)  = 9,223,372,036,854,775,807
 #
-#  tcp_base_mss = 1440 — HARDCODED, ไม่มีการคำนวณจาก MTU
+#  tcp_base_mss = 1440 -- HARDCODED, no MTU calc
 # =============================================================
 
 RMEM_MAX=2147483647
@@ -91,7 +91,6 @@ WMEM_DEFAULT=31250000
 LIMIT_OUTPUT=2147483647
 BASE_MSS=1440
 
-# ── TC quantum: 65536 (kernel fq ต้องการ power-of-2, แสดงเป็น 64Kb) ──
 TC_QUANTUM=65536
 TC_BUCKETS=131072
 
@@ -124,23 +123,23 @@ MTU="${MTU:-1500}"
 VCPU=$(nproc 2>/dev/null || echo 1)
 
 echo ""
-echo -e "${BLD}${MGN}╔══════════════════════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}${MGN}║   VPS SETUP UNLIMITED v6.1  ████████████████████████████   ║${RST}"
-echo -e "${BLD}${MGN}║   RTT=0.5ms / 500Gbps / ABSOLUTELY NO LIMITS / NO CAPS    ║${RST}"
-echo -e "${BLD}${MGN}║   MODE: MAXIMUM CHAOS — ไม่มีขีดจำกัดใดๆ ทั้งสิ้น          ║${RST}"
-echo -e "${BLD}${MGN}║   NIC: ${NIC}$(printf '%*s' $((55-${#NIC})) '')║${RST}"
-echo -e "${BLD}${MGN}╚══════════════════════════════════════════════════════════════╝${RST}"
+echo -e "${BLD}${MGN}+==============================================================+${RST}"
+echo -e "${BLD}${MGN}|   VPS SETUP UNLIMITED v6.1                                  |${RST}"
+echo -e "${BLD}${MGN}|   RTT=0.5ms / 500Gbps / ABSOLUTELY NO LIMITS / NO CAPS     |${RST}"
+echo -e "${BLD}${MGN}|   MODE: MAXIMUM CHAOS -- no limits whatsoever               |${RST}"
+echo -e "${BLD}${MGN}|   NIC: ${NIC}$(printf '%*s' $((54-${#NIC})) '')|${RST}"
+echo -e "${BLD}${MGN}+==============================================================+${RST}"
 echo ""
 info "NIC           : ${NIC} (MTU ${MTU})"
-info "BASE_MSS      : ${BASE_MSS} bytes ← HARDCODED"
-info "vCPU          : ${VCPU} → GOMAXPROCS=${VCPU}"
+info "BASE_MSS      : ${BASE_MSS} bytes <- HARDCODED"
+info "vCPU          : ${VCPU} -> GOMAXPROCS=${VCPU}"
 info "rmem/wmem MAX : INT_MAX = 2,147,483,647 bytes"
-info "rmem/wmem DEF : BDP = 31,250,000 bytes (500Gbps × 0.5ms)"
+info "rmem/wmem DEF : BDP = 31,250,000 bytes (500Gbps x 0.5ms)"
 info "TC quantum    : ${TC_QUANTUM} (64Kb) / buckets: ${TC_BUCKETS}"
 echo ""
 
 # =============================================================
-hdr "STEP 1 — UPDATE & DEPS"
+hdr "STEP 1 -- UPDATE & DEPS"
 _step1() {
     systemctl stop    unattended-upgrades 2>/dev/null || true
     systemctl disable unattended-upgrades 2>/dev/null || true
@@ -165,7 +164,7 @@ _step1() {
 run_skip "step1_deps" _step1
 
 # =============================================================
-hdr "STEP 2 — FIREWALL (UFW)"
+hdr "STEP 2 -- FIREWALL (UFW)"
 _step2() {
     ufw --force reset
     ufw default deny incoming
@@ -179,7 +178,7 @@ _step2() {
 run_skip "step2_ufw" _step2
 
 # =============================================================
-hdr "STEP 3 — INSTALL 3X-UI"
+hdr "STEP 3 -- INSTALL 3X-UI"
 _step3() {
     local installer
     installer=$(mktemp /tmp/3xui-install.XXXXXX.sh)
@@ -191,37 +190,34 @@ _step3() {
     rm -f "$installer"
     local xui_bin
     xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
-    [ -x "$xui_bin" ] || { echo "x-ui binary ไม่พบหลัง install"; return 1; }
+    [ -x "$xui_bin" ] || { echo "x-ui binary not found after install"; return 1; }
     systemctl enable x-ui 2>/dev/null || true
     systemctl start  x-ui 2>/dev/null || true
-    wait_service_active x-ui 20 || warn "x-ui อาจยังไม่พร้อม"
+    wait_service_active x-ui 20 || warn "x-ui may not be ready yet"
 }
 run_skip "step3_3xui" _step3
 
 # =============================================================
-hdr "STEP 4 — KERNEL TCP TUNE (MAXIMUM CHAOS / NO LIMITS)"
+hdr "STEP 4 -- KERNEL TCP TUNE (MAXIMUM CHAOS / NO LIMITS)"
 _step4() {
     local cc="bbr"
     modprobe tcp_bbr 2>/dev/null || true
     modprobe tcp_bbr2 2>/dev/null && cc="bbr2" || true
     grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
-        || { warn "BBR ไม่รองรับ — fallback cubic"; cc="cubic"; }
+        || { warn "BBR not supported -- fallback cubic"; cc="cubic"; }
 
     local qdisc="fq"
     if ! modinfo sch_fq &>/dev/null 2>&1; then
-        warn "fq ไม่รองรับ — fallback fq_codel"; qdisc="fq_codel"
+        warn "fq not supported -- fallback fq_codel"; qdisc="fq_codel"
     fi
 
-    # ── sysctl keys ที่อาจไม่มีใน kernel เก่า — ตรวจก่อนเขียน ──
     _sysctl_exists() { [ -e "/proc/sys/$(echo "$1" | tr '.' '/')" ]; }
 
     cat > /etc/sysctl.d/99-vps-tune.conf << EOF
-# ╔══════════════════════════════════════════════════════════════╗
-# ║  VPS SETUP UNLIMITED v6.1 — MAXIMUM CHAOS EDITION           ║
-# ║  RTT=0.5ms  BW=500Gbps  BDP=31,250,000 bytes                ║
-# ║  tcp_base_mss=1440 (HARDCODED)                               ║
-# ║  Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
-# ╚══════════════════════════════════════════════════════════════╝
+# VPS SETUP UNLIMITED v6.1 -- MAXIMUM CHAOS EDITION
+# RTT=0.5ms  BW=500Gbps  BDP=31,250,000 bytes
+# tcp_base_mss=1440 (HARDCODED)
+# Generated: $(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 net.ipv4.tcp_congestion_control = ${cc}
 net.core.default_qdisc          = ${qdisc}
@@ -231,7 +227,7 @@ net.core.wmem_max     = ${WMEM_MAX}
 net.core.rmem_default = ${RMEM_DEFAULT}
 net.core.wmem_default = ${WMEM_DEFAULT}
 net.ipv4.tcp_rmem = 4096 ${RMEM_DEFAULT} ${RMEM_MAX}
-net.ipv4.tcp_wmem = 4096 ${WMEM_DEFAULT} ${RMEM_MAX}
+net.ipv4.tcp_wmem = 4096 ${WMEM_DEFAULT} ${WMEM_MAX}
 
 net.ipv4.tcp_moderate_rcvbuf    = 1
 net.ipv4.tcp_adv_win_scale      = -2
@@ -301,7 +297,6 @@ net.ipv4.icmp_echo_ignore_broadcasts = 1
 net.ipv4.tcp_abort_on_overflow       = 0
 EOF
 
-    # ── sysctl keys ที่ขึ้นกับ kernel version — ใส่แยกป้องกัน fail ──
     for kv in \
         "kernel.sched_migration_cost_ns=5000000" \
         "kernel.sched_min_granularity_ns=10000000" \
@@ -309,30 +304,29 @@ EOF
     do
         local key="${kv%%=*}" val="${kv##*=}"
         _sysctl_exists "$key" && echo "${key} = ${val}" >> /etc/sysctl.d/99-vps-tune.conf \
-            || info "skip ${key} (ไม่มีใน kernel นี้)"
+            || info "skip ${key} (not in this kernel)"
     done
 
     sysctl -p /etc/sysctl.d/99-vps-tune.conf 2>&1 | grep -v "^sysctl: cannot stat" || true
     sysctl --system 2>&1 | grep -v "^sysctl: cannot stat" || true
 
-    # ── TC fq — quantum 65536 (kernel แสดงเป็น 64Kb) ────────
     tc qdisc del dev "$NIC" root 2>/dev/null || true
     tc qdisc add dev "$NIC" root handle 1: "${qdisc}" \
         quantum "${TC_QUANTUM}" \
         buckets "${TC_BUCKETS}" \
         2>/dev/null && ok "tc ${qdisc} quantum=${TC_QUANTUM} (64Kb) buckets=${TC_BUCKETS}" \
-        || warn "tc ${qdisc} บน ${NIC} fail"
+        || warn "tc ${qdisc} on ${NIC} failed"
 
     local actual_mss
     actual_mss=$(sysctl -n net.ipv4.tcp_base_mss 2>/dev/null || echo "?")
     [ "$actual_mss" = "$BASE_MSS" ] \
         && ok "tcp_base_mss LOCKED = ${BASE_MSS}" \
-        || warn "tcp_base_mss = ${actual_mss} (คาดว่า ${BASE_MSS})"
+        || warn "tcp_base_mss = ${actual_mss} (expected ${BASE_MSS})"
 }
 run_always "step4_sysctl" _step4
 
 # =============================================================
-hdr "STEP 5 — DISABLE TRANSPARENT HUGE PAGES"
+hdr "STEP 5 -- DISABLE TRANSPARENT HUGE PAGES"
 _step5() {
     echo never > /sys/kernel/mm/transparent_hugepage/enabled || true
     echo never > /sys/kernel/mm/transparent_hugepage/defrag   || true
@@ -355,26 +349,25 @@ EOF
     systemctl daemon-reload
     systemctl enable --now thp-disable.service
     grep -q '\[never\]' /sys/kernel/mm/transparent_hugepage/enabled \
-        || warn "THP อาจยังไม่ disabled"
+        || warn "THP may not be disabled yet"
 }
 run_always "step5_thp" _step5
 
 # =============================================================
-hdr "STEP 6 — NIC TUNE (${NIC}) — MAXIMUM CHAOS"
+hdr "STEP 6 -- NIC TUNE (${NIC}) -- MAXIMUM CHAOS"
 _step6() {
-    ip link show "$NIC" &>/dev/null || { echo "NIC ${NIC} ไม่พบ"; return 1; }
+    ip link show "$NIC" &>/dev/null || { echo "NIC ${NIC} not found"; return 1; }
 
     local qdisc="fq"
     grep -q "default_qdisc = fq_codel" /etc/sysctl.d/99-vps-tune.conf 2>/dev/null \
         && qdisc="fq_codel"
 
     ethtool -K "$NIC" gro off lro off tso on gso on rx-gro-hw off 2>/dev/null \
-        || warn "ethtool offload บางอย่าง fail (ปกติสำหรับ virtual NIC)"
+        || warn "ethtool offload partially failed (normal for virtual NIC)"
 
-    # Pause frame: virtual NIC มักไม่รองรับ — log แต่ไม่ fail
     ethtool -A "$NIC" rx off tx off 2>/dev/null \
-        && info "Pause frames: ปิดแล้ว" \
-        || info "Pause frames: virtual NIC ไม่รองรับ (ปกติ)"
+        && info "Pause frames: disabled" \
+        || info "Pause frames: virtual NIC not supported (normal)"
 
     local rx_max tx_max
     rx_max=$(ethtool -g "$NIC" 2>/dev/null | awk '/^Pre-set maximums/,/^Current/ {
@@ -394,14 +387,13 @@ _step6() {
     tc qdisc add dev "$NIC" root handle 1: "${qdisc}" \
         quantum "${TC_QUANTUM}" \
         buckets "${TC_BUCKETS}" \
-        2>/dev/null || warn "tc ${qdisc} fail"
+        2>/dev/null || warn "tc ${qdisc} failed"
 
-    # verify — kernel แสดง quantum เป็น "64Kb" หรือ "65536"
     local tc_out
     tc_out=$(tc qdisc show dev "$NIC" 2>/dev/null || true)
     echo "$tc_out" | grep -qE "quantum (${TC_QUANTUM}|64Kb)" \
         && ok "tc quantum ${TC_QUANTUM} (64Kb) confirmed" \
-        || warn "tc quantum อาจไม่ match: ${tc_out}"
+        || warn "tc quantum mismatch: ${tc_out}"
 
     mkdir -p /etc/networkd-dispatcher/routable.d
     cat > /etc/networkd-dispatcher/routable.d/50-nic-tune.sh << NEOF
@@ -425,11 +417,9 @@ tc qdisc add dev "\${NIC}" root handle 1: "\${QDISC}" \
 NEOF
     chmod +x /etc/networkd-dispatcher/routable.d/50-nic-tune.sh
 
-    # ── nic-tune: Type=oneshot + RemainAfterExit=yes ─────────
-    # ไม่ใช้ network-online.target เพื่อป้องกัน deadlock บาง distro
     cat > /etc/systemd/system/nic-tune.service << SEOF
 [Unit]
-Description=NIC Tuning for ${NIC} — UNLIMITED v6.1
+Description=NIC Tuning for ${NIC} -- UNLIMITED v6.1
 After=network.target
 Wants=network.target
 
@@ -447,7 +437,7 @@ SEOF
 run_always "step6_nic" _step6
 
 # =============================================================
-hdr "STEP 7 — I/O SCHEDULER"
+hdr "STEP 7 -- I/O SCHEDULER"
 _step7() {
     local found=0
     for DEV in sda sdb vda vdb xvda nvme0n1 nvme1n1; do
@@ -457,17 +447,17 @@ _step7() {
         rotational=$(cat "/sys/block/${DEV}/queue/rotational" 2>/dev/null || echo "0")
         if [ "$rotational" = "0" ]; then
             echo none        > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null || true
-            info "${DEV}: SSD/NVMe → none"
+            info "${DEV}: SSD/NVMe -> none"
         else
             echo mq-deadline > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null || true
-            info "${DEV}: HDD → mq-deadline"
+            info "${DEV}: HDD -> mq-deadline"
         fi
         echo 0    > "/sys/block/${DEV}/queue/add_random"  2>/dev/null || true
         echo 4096 > "/sys/block/${DEV}/queue/nr_requests" 2>/dev/null || true
         echo 1    > "/sys/block/${DEV}/queue/nomerges"    2>/dev/null || true
         echo 2    > "/sys/block/${DEV}/queue/rq_affinity" 2>/dev/null || true
     done
-    [ "$found" -eq 1 ] || warn "ไม่พบ block device"
+    [ "$found" -eq 1 ] || warn "No block device found"
     cat > /etc/udev/rules.d/60-io-scheduler.rules << 'EOF'
 ACTION=="add|change", KERNEL=="sd[a-z]",         ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="none"
 ACTION=="add|change", KERNEL=="sd[a-z]",         ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline"
@@ -481,7 +471,7 @@ EOF
 run_always "step7_io_scheduler" _step7
 
 # =============================================================
-hdr "STEP 8 — CPU GOVERNOR + IRQ AFFINITY"
+hdr "STEP 8 -- CPU GOVERNOR + IRQ AFFINITY"
 _step8() {
     cat > /etc/systemd/system/cpu-performance.service << 'EOF'
 [Unit]
@@ -510,10 +500,10 @@ EOF
 run_always "step8_cpu_gov" _step8
 
 # =============================================================
-hdr "STEP 9 — SYSTEM LIMITS (ABSOLUTELY UNLIMITED)"
+hdr "STEP 9 -- SYSTEM LIMITS (ABSOLUTELY UNLIMITED)"
 _step9() {
     cat > /etc/security/limits.d/99-xui.conf << 'EOF'
-# VPS SETUP UNLIMITED v6.1 — ไม่มีขีดจำกัดใดๆ
+# VPS SETUP UNLIMITED v6.1 -- no limits
 *    soft nofile      unlimited
 *    hard nofile      unlimited
 *    soft nproc       unlimited
@@ -558,9 +548,7 @@ DefaultLimitSIGPENDING=infinity
 DefaultLimitMSGQUEUE=infinity
 DefaultLimitRTPRIO=infinity
 EOF
-    # daemon-reexec ทำให้ systemd อ่าน conf ใหม่ทันที
     systemctl daemon-reexec 2>/dev/null || true
-    # force session ปัจจุบัน
     ulimit -n unlimited 2>/dev/null || true
     ulimit -u unlimited 2>/dev/null || true
     ulimit -l unlimited 2>/dev/null || true
@@ -568,7 +556,7 @@ EOF
 run_always "step9_limits" _step9
 
 # =============================================================
-hdr "STEP 10 — x-ui SYSTEMD OVERRIDE"
+hdr "STEP 10 -- x-ui SYSTEMD OVERRIDE"
 _step10() {
     mkdir -p /etc/systemd/system/x-ui.service.d
     cat > /etc/systemd/system/x-ui.service.d/override.conf << EOF
@@ -593,9 +581,8 @@ Nice=-15
 EOF
     systemctl daemon-reload
     systemctl restart x-ui
-    wait_service_active x-ui 30 || { echo "x-ui ไม่ขึ้นหลัง override"; return 1; }
+    wait_service_active x-ui 30 || { echo "x-ui did not come up after override"; return 1; }
 
-    # verify x-ui nofile — kernel cap ที่ fs.nr_open (2147483584) ถือว่า unlimited-class
     local xui_pid nofile_limit
     xui_pid=$(systemctl show -p MainPID x-ui 2>/dev/null | cut -d= -f2 || echo 0)
     if [ "${xui_pid:-0}" -gt 0 ] && [ -f "/proc/${xui_pid}/limits" ]; then
@@ -610,7 +597,7 @@ EOF
 run_always "step10_xui_override" _step10
 
 # =============================================================
-hdr "STEP 11 — LOCK tcp_base_mss=1440 (ANTI-REVERT SERVICE)"
+hdr "STEP 11 -- LOCK tcp_base_mss=1440 (ANTI-REVERT SERVICE)"
 _step11() {
     cat > /etc/systemd/system/tcp-mss-lock.service << 'EOF'
 [Unit]
@@ -633,12 +620,12 @@ WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
     systemctl enable --now tcp-mss-lock.service
-    ok "tcp_base_mss=1440 LOCKED — ทุก 60s"
+    ok "tcp_base_mss=1440 LOCKED -- every 60s"
 }
 run_always "step11_mss_lock" _step11
 
 # =============================================================
-hdr "STEP 12 — POST-REBOOT VERIFY SERVICE"
+hdr "STEP 12 -- POST-REBOOT VERIFY SERVICE"
 _step12() {
     local _NIC="$NIC" _PANEL_PORT="$PANEL_PORT"
     local _RMEM_MAX="$RMEM_MAX" _RMEM_DEFAULT="$RMEM_DEFAULT"
@@ -649,21 +636,18 @@ _step12() {
 
     cat > /usr/local/bin/vps-verify << 'VEOF_MARKER'
 #!/usr/bin/env bash
-# vps-verify v6.1 — embedded, do not edit manually
+# vps-verify v6.1
 set -uo pipefail
 export LANG=C
 GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'
 CYN='\033[0;36m'; MGN='\033[0;35m'; BLD='\033[1m'; RST='\033[0m'
 PASS=0; FAIL=0; WARN=0
-ok()   { echo -e "  ${GRN}✔${RST}  $1"; ((PASS++)) || true; }
-bad()  { echo -e "  ${RED}✘${RST}  $1"; ((FAIL++)) || true; }
-wr()   { echo -e "  ${YEL}⚠${RST}  $1"; ((WARN++)) || true; }
-info() { echo -e "  ${CYN}ℹ${RST}  $1"; }
-
-# ── load baked-in constants ──────────────────────────────────
+ok()   { echo -e "  ${GRN}+${RST}  $1"; ((PASS++)) || true; }
+bad()  { echo -e "  ${RED}X${RST}  $1"; ((FAIL++)) || true; }
+wr()   { echo -e "  ${YEL}!${RST}  $1"; ((WARN++)) || true; }
+info() { echo -e "  ${CYN}i${RST}  $1"; }
 VEOF_MARKER
 
-    # เขียน constants แยก (หลีกเลี่ยง heredoc ซ้อน)
     cat >> /usr/local/bin/vps-verify << EOF
 NIC="${_NIC}"
 PANEL_PORT="${_PANEL_PORT}"
@@ -681,48 +665,44 @@ EOF
 chk_sysctl() {
     local key="$1" op="$2" val="$3" label="$4"
     local cur; cur=$(sysctl -n "$key" 2>/dev/null || echo "ERR")
-    [ "$cur" = "ERR" ] && { wr "$label — ไม่พบ key"; return; }
+    [ "$cur" = "ERR" ] && { wr "$label -- key not found"; return; }
     case "$op" in
-        eq) [ "$cur" -eq "$val" ] 2>/dev/null && ok "$label ($cur)" || bad "$label ($cur ≠ $val)" ;;
+        eq) [ "$cur" -eq "$val" ] 2>/dev/null && ok "$label ($cur)" || bad "$label ($cur != $val)" ;;
         ge) [ "$cur" -ge "$val" ] 2>/dev/null && ok "$label ($cur)" || bad "$label ($cur < $val)" ;;
     esac
 }
 
 chk_service_enabled() {
-    systemctl is-enabled "$1" &>/dev/null && ok "$1 enabled" || wr "$1 ไม่ enabled"
+    systemctl is-enabled "$1" &>/dev/null && ok "$1 enabled" || wr "$1 not enabled"
 }
 chk_service_active() {
-    # oneshot services (nic-tune, cpu-performance) inactive หลัง boot = ปกติ
-    # ตรวจจาก ExecMainStatus แทน
     local svc="$1" oneshot="${2:-false}"
     if systemctl is-active "$svc" &>/dev/null; then
         ok "$1 active"
     elif $oneshot; then
         local status
         status=$(systemctl show -p ExecMainStatus "$svc" 2>/dev/null | cut -d= -f2 || echo "?")
-        [ "$status" = "0" ] && ok "$1 completed OK (oneshot)" || wr "$1 ไม่ active"
+        [ "$status" = "0" ] && ok "$1 completed OK (oneshot)" || wr "$1 not active"
     else
-        wr "$1 ไม่ active"
+        wr "$1 not active"
     fi
 }
 
 echo ""
-echo -e "${BLD}${MGN}╔══════════════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}${MGN}║   VPS VERIFY v6.1 — MAXIMUM CHAOS / NO LIMITS       ║${RST}"
-echo -e "${BLD}${MGN}║   RTT=0.5ms / 500Gbps / BDP=31,250,000 bytes         ║${RST}"
-echo -e "${BLD}${MGN}╚══════════════════════════════════════════════════════╝${RST}"
+echo -e "${BLD}${MGN}+====================================================+${RST}"
+echo -e "${BLD}${MGN}|   VPS VERIFY v6.1 -- MAXIMUM CHAOS / NO LIMITS    |${RST}"
+echo -e "${BLD}${MGN}|   RTT=0.5ms / 500Gbps / BDP=31,250,000 bytes      |${RST}"
+echo -e "${BLD}${MGN}+====================================================+${RST}"
 echo ""
 
-# ── UFW ──────────────────────────────────────────────────────
 echo -e "${BLD}[ UFW ]${RST}"
 UFW_STATUS=$(ufw status 2>/dev/null || echo "")
-echo "$UFW_STATUS" | grep -q "Status: active" && ok "UFW active" || bad "UFW ไม่ active"
+echo "$UFW_STATUS" | grep -q "Status: active" && ok "UFW active" || bad "UFW not active"
 for p in "${OPEN_PORTS[@]}"; do
-    echo "$UFW_STATUS" | grep -q "^${p}/tcp" && ok "Port ${p}" || bad "Port ${p} ไม่เปิด"
+    echo "$UFW_STATUS" | grep -q "^${p}/tcp" && ok "Port ${p}" || bad "Port ${p} not open"
 done
 echo ""
 
-# ── x-ui ─────────────────────────────────────────────────────
 echo -e "${BLD}[ x-ui ]${RST}"
 chk_service_enabled x-ui
 chk_service_active  x-ui false
@@ -731,7 +711,6 @@ if [ "${XUI_PID:-0}" -gt 0 ] && [ -f "/proc/${XUI_PID}/status" ]; then
     VMRSS=$(awk '/VmRSS/{print int($2/1024)}' "/proc/${XUI_PID}/status" 2>/dev/null || echo "?")
     info "x-ui RAM: ${VMRSS} MB"
     NOFILE_LIMIT=$(awk '/open files/{print $4}' "/proc/${XUI_PID}/limits" 2>/dev/null || echo "?")
-    # ยอมรับ unlimited หรือ ≥ 2G (kernel cap ที่ fs.nr_open)
     if [ "$NOFILE_LIMIT" = "unlimited" ] || [ "${NOFILE_LIMIT:-0}" -ge 2000000000 ] 2>/dev/null; then
         ok "x-ui nofile: ${NOFILE_LIMIT} (unlimited-class)"
     else
@@ -742,43 +721,36 @@ if [ "${XUI_PID:-0}" -gt 0 ] && [ -f "/proc/${XUI_PID}/status" ]; then
     NICE_VAL=$(cat "/proc/${XUI_PID}/stat" 2>/dev/null | awk '{print $19}' || echo "?")
     info "x-ui nice: ${NICE_VAL}"
 fi
-# Panel อาจใช้ HTTPS — ลอง https ก่อน http
 curl -sfk --max-time 5 "https://localhost:${PANEL_PORT}/login" &>/dev/null \
     && ok "Panel HTTPS (:${PANEL_PORT})" \
     || { curl -sf --max-time 5 "http://localhost:${PANEL_PORT}/login" &>/dev/null \
         && ok "Panel HTTP (:${PANEL_PORT})" \
-        || wr "Panel ไม่ตอบ (:${PANEL_PORT}) — ตั้ง inbound หรือรอ x-ui start"; }
+        || wr "Panel not responding (:${PANEL_PORT})"; }
 echo ""
 
-# ── Services ─────────────────────────────────────────────────
 echo -e "${BLD}[ Services ]${RST}"
 chk_service_enabled thp-disable
 chk_service_active  thp-disable false
-
 chk_service_enabled nic-tune
-chk_service_active  nic-tune true          # oneshot
-
+chk_service_active  nic-tune true
 chk_service_enabled cpu-performance
-chk_service_active  cpu-performance true   # oneshot
-
+chk_service_active  cpu-performance true
 chk_service_enabled tcp-mss-lock
-chk_service_active  tcp-mss-lock false     # simple loop — must be active
+chk_service_active  tcp-mss-lock false
 echo ""
 
-# ── TCP / Kernel ──────────────────────────────────────────────
-echo -e "${BLD}[ TCP / Kernel — UNLIMITED v6.1 ]${RST}"
+echo -e "${BLD}[ TCP / Kernel -- UNLIMITED v6.1 ]${RST}"
 CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
-echo "$CC" | grep -qE "^(bbr|bbr2)$" && ok "Congestion: $CC" || wr "Congestion: $CC (คาด bbr/bbr2)"
+echo "$CC" | grep -qE "^(bbr|bbr2)$" && ok "Congestion: $CC" || wr "Congestion: $CC (expected bbr/bbr2)"
 
 QDISC_SYSCTL=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "?")
 echo "$QDISC_SYSCTL" | grep -qE "^(fq|fq_codel)$" && ok "default_qdisc = $QDISC_SYSCTL" || bad "default_qdisc = $QDISC_SYSCTL"
 
 TC_OUT=$(tc qdisc show dev "$NIC" 2>/dev/null || echo "")
-# kernel fq แสดง quantum เป็น "64Kb" (= 65536) หรือตัวเลขตรงๆ
 echo "$TC_OUT" | grep -qE "quantum (${TC_QUANTUM}|64Kb)" \
-    && ok "tc quantum ${TC_QUANTUM} (64Kb) ✓" || bad "tc quantum ไม่ถูก — $(echo "$TC_OUT" | grep quantum || echo 'ไม่พบ')"
+    && ok "tc quantum ${TC_QUANTUM} (64Kb)" || bad "tc quantum mismatch -- $(echo "$TC_OUT" | grep quantum || echo 'not found')"
 echo "$TC_OUT" | grep -q "buckets ${TC_BUCKETS}" \
-    && ok "tc buckets ${TC_BUCKETS} ✓" || wr "tc buckets ไม่ match (คาด ${TC_BUCKETS})"
+    && ok "tc buckets ${TC_BUCKETS}" || wr "tc buckets mismatch (expected ${TC_BUCKETS})"
 
 chk_sysctl net.core.rmem_max            ge "$RMEM_MAX"     "rmem_max (INT_MAX)"
 chk_sysctl net.core.wmem_max            ge "$RMEM_MAX"     "wmem_max (INT_MAX)"
@@ -788,10 +760,10 @@ chk_sysctl net.ipv4.tcp_moderate_rcvbuf eq 1               "moderate_rcvbuf = 1"
 chk_sysctl net.ipv4.tcp_adv_win_scale   eq -2              "adv_win_scale = -2"
 chk_sysctl net.ipv4.tcp_base_mss        eq "$BASE_MSS"     "tcp_base_mss = 1440 (LOCKED)"
 chk_sysctl net.ipv4.tcp_mtu_probing     eq 0               "tcp_mtu_probing = 0 (off)"
-chk_sysctl net.core.somaxconn           ge "$BACKLOG"      "somaxconn ≥ 4M"
-chk_sysctl net.ipv4.tcp_max_syn_backlog ge "$BACKLOG"      "syn_backlog ≥ 4M"
-chk_sysctl net.core.netdev_max_backlog  ge "$BACKLOG"      "netdev_backlog ≥ 4M"
-chk_sysctl net.ipv4.tcp_max_tw_buckets  ge 2000000         "max_tw_buckets ≥ 2M"
+chk_sysctl net.core.somaxconn           ge "$BACKLOG"      "somaxconn >= 4M"
+chk_sysctl net.ipv4.tcp_max_syn_backlog ge "$BACKLOG"      "syn_backlog >= 4M"
+chk_sysctl net.core.netdev_max_backlog  ge "$BACKLOG"      "netdev_backlog >= 4M"
+chk_sysctl net.ipv4.tcp_max_tw_buckets  ge 2000000         "max_tw_buckets >= 2M"
 chk_sysctl net.ipv4.tcp_fastopen        eq 3               "tcp_fastopen = 3"
 chk_sysctl net.ipv4.tcp_fin_timeout     eq 3               "fin_timeout = 3s"
 chk_sysctl net.ipv4.tcp_keepalive_time  eq 10              "keepalive_time = 10s"
@@ -801,29 +773,27 @@ chk_sysctl vm.overcommit_memory         eq 1               "overcommit = 1"
 chk_sysctl vm.overcommit_ratio          ge 200             "overcommit_ratio = 200"
 chk_sysctl vm.min_free_kbytes           eq 4096            "min_free_kbytes = 4096"
 chk_sysctl fs.file-max                  ge 9000000000      "fs.file-max (near INT64_MAX)"
-chk_sysctl fs.aio-max-nr                ge 1048576         "aio-max-nr ≥ 1M"
+chk_sysctl fs.aio-max-nr                ge 1048576         "aio-max-nr >= 1M"
 echo ""
 
-# ── THP / NIC / Disk ─────────────────────────────────────────
 echo -e "${BLD}[ THP / NIC / Disk ]${RST}"
 grep -q '\[never\]' /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null \
-    && ok "THP disabled" || bad "THP ยังเปิดอยู่"
-ip link show "$NIC" &>/dev/null && ok "NIC ${NIC} up" || bad "${NIC} ไม่พบ"
+    && ok "THP disabled" || bad "THP still enabled"
+ip link show "$NIC" &>/dev/null && ok "NIC ${NIC} up" || bad "${NIC} not found"
 TXQLEN=$(cat "/sys/class/net/${NIC}/tx_queue_len" 2>/dev/null || echo 0)
-[ "${TXQLEN}" -ge 10000 ] && ok "txqueuelen ${TXQLEN}" || wr "txqueuelen ต่ำ (${TXQLEN})"
+[ "${TXQLEN}" -ge 10000 ] && ok "txqueuelen ${TXQLEN}" || wr "txqueuelen low (${TXQLEN})"
 ethtool -k "$NIC" 2>/dev/null | grep -q 'generic-receive-offload: off' \
-    && ok "GRO off" || wr "GRO ยัง on"
+    && ok "GRO off" || wr "GRO still on"
 
-# Pause frames: virtual NIC ไม่รองรับ = ปกติ → แค่ info
 PAUSE_OUT=$(ethtool -a "$NIC" 2>/dev/null || true)
 if [ -n "$PAUSE_OUT" ]; then
     PAUSE_RX=$(echo "$PAUSE_OUT" | awk '/RX:/{print $NF; exit}')
     PAUSE_TX=$(echo "$PAUSE_OUT" | awk '/TX:/{print $NF; exit}')
     [ "$PAUSE_RX" = "off" ] && [ "$PAUSE_TX" = "off" ] \
         && ok "Pause frames off (rx+tx)" \
-        || info "Pause frames: rx=${PAUSE_RX:-?} tx=${PAUSE_TX:-?} (virtual NIC — ปกติ)"
+        || info "Pause frames: rx=${PAUSE_RX:-?} tx=${PAUSE_TX:-?} (virtual NIC -- normal)"
 else
-    info "Pause frames: virtual NIC ไม่รองรับ ethtool -a (ปกติ)"
+    info "Pause frames: virtual NIC does not support ethtool -a (normal)"
 fi
 
 for DEV in sda sdb vda vdb xvda nvme0n1 nvme1n1; do
@@ -834,37 +804,33 @@ for DEV in sda sdb vda vdb xvda nvme0n1 nvme1n1; do
 done
 echo ""
 
-# ── Limits ───────────────────────────────────────────────────
 echo -e "${BLD}[ Limits ]${RST}"
 NOFILE=$(ulimit -Hn 2>/dev/null || echo 0)
 if [ "$NOFILE" = "unlimited" ]; then
     ok "nofile: unlimited"
 elif [ "${NOFILE:-0}" -ge 1048576 ] 2>/dev/null; then
-    wr "nofile: ${NOFILE} — reboot เพื่อได้ unlimited เต็ม"
+    wr "nofile: ${NOFILE} -- reboot for full unlimited"
 else
-    bad "nofile: ${NOFILE} (ต้อง unlimited)"
+    bad "nofile: ${NOFILE} (need unlimited)"
 fi
 NPROC=$(ulimit -Hu 2>/dev/null || echo 0)
 [ "$NPROC" = "unlimited" ] && ok "nproc: unlimited" \
-    || wr "nproc: ${NPROC} — reboot เพื่อได้ unlimited"
+    || wr "nproc: ${NPROC} -- reboot for unlimited"
 MEMLOCK=$(ulimit -Hl 2>/dev/null || echo 0)
 [ "$MEMLOCK" = "unlimited" ] && ok "memlock: unlimited" \
-    || wr "memlock: ${MEMLOCK} — reboot เพื่อได้ unlimited"
+    || wr "memlock: ${MEMLOCK} -- reboot for unlimited"
 echo ""
 
-# ── Ports ────────────────────────────────────────────────────
 echo -e "${BLD}[ Ports & Connections ]${RST}"
 ss -tlnp 2>/dev/null | grep -q ":${PANEL_PORT} " \
-    && ok "Port ${PANEL_PORT} listening" || wr "Port ${PANEL_PORT} ไม่ได้ฟัง"
-# Port 80: x-ui ไม่จำเป็นต้อง listen → info
+    && ok "Port ${PANEL_PORT} listening" || wr "Port ${PANEL_PORT} not listening"
 ss -tlnp 2>/dev/null | grep -q ':80 ' \
     && ok "Port 80 listening" \
-    || info "Port 80 ไม่ได้ฟัง (ปกติ — x-ui ใช้ TLS port ${PANEL_PORT})"
+    || info "Port 80 not listening (normal -- x-ui uses TLS port ${PANEL_PORT})"
 WS_CONN=$(ss -tnp 2>/dev/null | grep -c ":${PANEL_PORT}" || echo 0)
 info "Connections on :${PANEL_PORT} = ${WS_CONN}"
 echo ""
 
-# ── System Resources ──────────────────────────────────────────
 echo -e "${BLD}[ System Resources ]${RST}"
 _read_cpu() {
     awk 'NR==1{t=0; for(i=2;i<=NF;i++) t+=$i; printf "%d %d\n", t, $10}' /proc/stat
@@ -874,26 +840,25 @@ sleep 1
 read -r T2 S2 <<< "$(_read_cpu)"
 TDIFF=$(( T2-T1 )); SDIFF=$(( S2-S1 ))
 STEAL=0; [ "$TDIFF" -gt 0 ] && STEAL=$(( SDIFF*100/TDIFF ))
-[ "$STEAL" -le 5 ] && ok "CPU steal ${STEAL}%" || bad "CPU steal สูง ${STEAL}% — oversold VPS"
+[ "$STEAL" -le 5 ] && ok "CPU steal ${STEAL}%" || bad "CPU steal high ${STEAL}% -- oversold VPS"
 FREE_MB=$(( $(awk '/MemAvailable/{print $2}' /proc/meminfo) / 1024 ))
 TOTAL_MB=$(( $(awk '/MemTotal/{print $2}' /proc/meminfo) / 1024 ))
 info "RAM: ${FREE_MB} MB free / ${TOTAL_MB} MB total"
 GW=$(ip route show default 2>/dev/null | awk '/^default/{print $3; exit}')
 if [ -n "${GW:-}" ]; then
     RTT=$(ping -c 3 -q "$GW" 2>/dev/null | awk -F'/' '/^rtt|^round-trip/{printf "%.3f", $5}')
-    info "RTT to gateway: ${RTT:-?} ms  (target ≤ 0.5ms)"
+    info "RTT to gateway: ${RTT:-?} ms  (target <= 0.5ms)"
 fi
 echo ""
 
-# ── Summary ───────────────────────────────────────────────────
-echo -e "  ──────────────────────────────────────────────────────"
+echo -e "  --------------------------------------------------------"
 echo -e "  ${GRN}Pass: ${PASS}${RST}  ${YEL}Warn: ${WARN}${RST}  ${RED}Fail: ${FAIL}${RST}"
 if [ "$FAIL" -eq 0 ] && [ "$WARN" -eq 0 ]; then
-    echo -e "  ${BLD}${GRN}✔ ทุกอย่างพร้อม 100% — MAXIMUM CHAOS UNLOCKED${RST}"
+    echo -e "  ${BLD}${GRN}+ All good 100% -- MAXIMUM CHAOS UNLOCKED${RST}"
 elif [ "$FAIL" -eq 0 ]; then
-    echo -e "  ${BLD}${YEL}✔ ใช้งานได้ มี ${WARN} warning (reboot แก้ได้บางส่วน)${RST}"
+    echo -e "  ${BLD}${YEL}+ OK with ${WARN} warning(s) (reboot may fix some)${RST}"
 else
-    echo -e "  ${BLD}${RED}✘ มี ${FAIL} จุดที่ต้องแก้${RST}"
+    echo -e "  ${BLD}${RED}X ${FAIL} issue(s) need fixing${RST}"
 fi
 PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
        || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
@@ -926,7 +891,7 @@ EOF
 run_always "step12_verify_service" _step12
 
 # =============================================================
-hdr "DONE — SUMMARY"
+hdr "DONE -- SUMMARY"
 PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
       || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
 
@@ -936,31 +901,31 @@ THP_NOW=$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null | grep -o 
 XUI_NOW=$(systemctl is-active x-ui 2>/dev/null || echo "N/A")
 
 echo ""
-echo -e "${BLD}${GRN}  Steps เสร็จแล้ว:${RST}"
+echo -e "${BLD}${GRN}  Steps completed:${RST}"
 while IFS= read -r line; do
-    [ -n "$line" ] && echo -e "    ${GRN}✔${RST}  $line"
+    [ -n "$line" ] && echo -e "    ${GRN}+${RST}  $line"
 done < "$STATE_FILE"
 echo ""
-echo -e "  ══════════════════════════════════════════════════════════"
-echo -e "  ${BLD}${MGN}VPS SETUP UNLIMITED v6.1 — MAXIMUM CHAOS SUMMARY${RST}"
-echo -e "  ══════════════════════════════════════════════════════════"
+echo -e "  =========================================================="
+echo -e "  ${BLD}${MGN}VPS SETUP UNLIMITED v6.1 -- MAXIMUM CHAOS SUMMARY${RST}"
+echo -e "  =========================================================="
 echo -e "  ${BLD}Panel          :${RST} https://${PUB_IP}:${PANEL_PORT}"
 echo -e "  ${BLD}NIC            :${RST} ${NIC} (MTU ${MTU})"
-echo -e "  ──────────────────────────────────────────────────────────"
+echo -e "  ----------------------------------------------------------"
 echo -e "  ${BLD}RTT target     :${RST} 0.5ms"
 echo -e "  ${BLD}BW target      :${RST} 500Gbps"
-echo -e "  ${BLD}BDP            :${RST} 31,250,000 bytes (500Gbps × 0.5ms)"
-echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}tcp_base_mss   :${RST} ${BASE_MSS} bytes ← LOCKED (ไม่มีการคำนวณ)"
-echo -e "  ${BLD}tcp_mtu_probing:${RST} 0 (off — MSS ไม่เปลี่ยน)"
+echo -e "  ${BLD}BDP            :${RST} 31,250,000 bytes (500Gbps x 0.5ms)"
+echo -e "  ----------------------------------------------------------"
+echo -e "  ${BLD}tcp_base_mss   :${RST} ${BASE_MSS} bytes <- LOCKED"
+echo -e "  ${BLD}tcp_mtu_probing:${RST} 0 (off -- MSS fixed)"
 echo -e "  ${BLD}rmem/wmem MAX  :${RST} INT_MAX = 2,147,483,647 bytes"
 echo -e "  ${BLD}rmem/wmem DEF  :${RST} BDP = 31,250,000 bytes"
 echo -e "  ${BLD}adv_win_scale  :${RST} -2 (app window 75% of buffer)"
-echo -e "  ${BLD}moderate_rcvbuf:${RST} 1 (BBR auto-grow ถึง INT_MAX)"
+echo -e "  ${BLD}moderate_rcvbuf:${RST} 1 (BBR auto-grow to INT_MAX)"
 echo -e "  ${BLD}somaxconn      :${RST} 4,194,304"
 echo -e "  ${BLD}tc quantum     :${RST} ${TC_QUANTUM} (64Kb) / buckets ${TC_BUCKETS}"
-echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}nofile/nproc   :${RST} unlimited (มีผลหลัง reboot)"
+echo -e "  ----------------------------------------------------------"
+echo -e "  ${BLD}nofile/nproc   :${RST} unlimited (takes effect after reboot)"
 echo -e "  ${BLD}memlock/stack  :${RST} unlimited"
 echo -e "  ${BLD}sigpending/msg :${RST} unlimited"
 echo -e "  ${BLD}rtprio/nice    :${RST} unlimited / -20"
@@ -968,7 +933,7 @@ echo -e "  ${BLD}GOMAXPROCS     :${RST} ${VCPU}"
 echo -e "  ${BLD}GOGC           :${RST} off (no GC pressure)"
 echo -e "  ${BLD}OOMScore       :${RST} -1000 (never killed)"
 echo -e "  ${BLD}RestartSec     :${RST} 1s (fast recovery)"
-echo -e "  ──────────────────────────────────────────────────────────"
+echo -e "  ----------------------------------------------------------"
 echo -e "  ${BLD}keepalive_time :${RST} ${KEEPALIVE_TIME}s"
 echo -e "  ${BLD}keepalive_intvl:${RST} ${KEEPALIVE_INTVL}s"
 echo -e "  ${BLD}fin_timeout    :${RST} ${FIN_TIMEOUT}s"
@@ -977,14 +942,14 @@ echo -e "  ${BLD}swappiness     :${RST} 0"
 echo -e "  ${BLD}min_free_kb    :${RST} 4096"
 echo -e "  ${BLD}overcommit     :${RST} 1 / ratio 200"
 echo -e "  ${BLD}dirty          :${RST} 95% / 80% bg"
-echo -e "  ${BLD}busy_poll      :${RST} 50µs"
+echo -e "  ${BLD}busy_poll      :${RST} 50us"
 echo -e "  ${BLD}BBR            :${RST} ${CC_NOW}"
 echo -e "  ${BLD}Qdisc          :${RST} ${QDISC_NOW}"
 echo -e "  ${BLD}THP            :${RST} ${THP_NOW}"
 echo -e "  ${BLD}x-ui           :${RST} ${XUI_NOW}"
 echo -e "  ${BLD}Log            :${RST} ${LOG_FILE}"
-echo -e "  ══════════════════════════════════════════════════════════"
+echo -e "  =========================================================="
 echo ""
-echo -e "  ${BLD}${YEL}→ reboot แล้วรัน:${RST}  vps-verify"
-echo -e "  ${BLD}${MGN}→ MAXIMUM CHAOS v6.1 ACTIVE — ไม่มีขีดจำกัดใดๆ${RST}"
+echo -e "  ${BLD}${YEL}-> reboot then run:${RST}  vps-verify"
+echo -e "  ${BLD}${MGN}-> MAXIMUM CHAOS v6.1 ACTIVE -- NO LIMITS${RST}"
 echo ""
