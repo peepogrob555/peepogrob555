@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# AIS กันรั่ว 128kbps (4G & 5G) — VMESS WS None TLS v5.0 ULTRA SUPER MEGA LOW LATENCY
+# AIS กันรั่ว 128kbps (4G & 5G) — VMESS WS None TLS v5.0 (เน้นPing&Jitterต่ำที่สุด)
+# ไม่ได้จำกัดเน็ตให้แรงสูงสุด150Mbpsตรงๆแต่คุมบัฟให้ไม่เกิน150Mbpsเท่านั้นยึดค่าrtt30ms
 # Hardware : 1vCPU @2.69GHz · 2GB RAM · KVM · virtio_net
 # Kernel   : 5.15.0-179-generic
 # Xray     : 26.6.1 / go1.26.3
 # Users    : 2 · RAM per socket ceiling 750MB · Swap 512MB
 # RTT      : ~30ms (AIS 4G/4G+ LTE avg)
 # BDP      : 150Mbps x 30ms / 8 = 562,500 bytes per connection
-# Goal     : ULTRA SUPER MEGA MAXED LOW LATENCY + LOW JITTER — ทุกรายละเอียด
+# Goal     : ULTRA LOW LATENCY + LOW JITTER — ทุกรายละเอียด
 set -uo pipefail
 export LANG=C
 
