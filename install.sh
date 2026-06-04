@@ -1,4 +1,4 @@
-"#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -uo pipefail
 export LANG=C
 
@@ -102,22 +102,23 @@ MTU_PHYSICAL=$(ip link show "$NIC" 2>/dev/null \
   | awk '/mtu/ {for(i=1;i<=NF;i++) if($i=="mtu") print $(i+1)}' | head -1)
 MTU_PHYSICAL="${MTU_PHYSICAL:-1500}"
 VCPU=$(nproc 2>/dev/null || echo 1)
+RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
 
 echo ""
 echo -e "${BLD}${CYN}╔══════════════════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}${CYN}║  AIS กันรั่ว — VMESS WS v6.0 MAX THROUGHPUT ULL          ║${RST}"
-echo -e "${BLD}${CYN}║  1vCPU · 2GB RAM · KVM virtio_net · RTT~35ms             ║${RST}"
-echo -e "${BLD}${CYN}║  FROM IMPOSSIBLE TO POSSIBLE — 10Gbps BEAST MODE         ║${RST}"
+echo -e "${BLD}${CYN}║  Bughost VPN Pole — VMESS WS FULL SETUP v7.0             ║${RST}"
+echo -e "${BLD}${CYN}║  32 Steps · 1vCPU · 2GB · KVM · RTT~35ms · 10Gbps      ║${RST}"
 echo -e "${BLD}${CYN}║  NIC: ${NIC}$(printf '%*s' $((51-${#NIC})) '')║${RST}"
 echo -e "${BLD}${CYN}╚══════════════════════════════════════════════════════════╝${RST}"
 echo ""
-info "rmem/wmem default  : $((RMEM_DEFAULT/1024/1024))MB adaptive"
-info "rmem/wmem max      : 2GB (kernel จัดการเอง)"
-info "notsent_lowat      : $((NOTSENT_LOWAT/1024))KB (128KB queue depth control)"
-info "limit_output       : $((LIMIT_OUTPUT/1024))KB"
+info "RAM total          : ${RAM_MB}MB"
+info "vCPU               : ${VCPU}"
+info "NIC                : ${NIC} MTU ${MTU_PHYSICAL}"
+info "rmem/wmem max      : 2GB"
+info "notsent_lowat      : $((NOTSENT_LOWAT/1024))KB"
 info "busy_poll/read     : ${BUSY_POLL}us"
-info "fq quantum         : ${TC_QUANTUM} bytes (2xMSS burst)"
-info "keepalive          : ${KA_TIME}s / ${KA_INTVL}s x ${KA_PROBES}"
+info "fq quantum         : ${TC_QUANTUM} bytes"
+info "keepalive          : ${KA_TIME}s/${KA_INTVL}s x ${KA_PROBES}"
 echo ""
 
 hdr "STEP 1 — UPDATE & DEPS"
@@ -140,9 +141,11 @@ _step1() {
   DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     curl ufw ethtool sqlite3 irqbalance iproute2 iputils-ping \
-    linux-tools-common linux-tools-generic 2>/dev/null || \
+    linux-tools-common linux-tools-generic nftables libcap2-bin \
+    numactl schedtool 2>/dev/null || \
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    curl ufw ethtool sqlite3 irqbalance iproute2 iputils-ping
+    curl ufw ethtool sqlite3 irqbalance iproute2 iputils-ping \
+    nftables libcap2-bin
 }
 run_skip "step1_deps" _step1
 
@@ -187,132 +190,45 @@ _step4() {
 }
 run_skip "step4_3xui" _step4
 
-hdr "STEP 5 — KERNEL / TCP / VM TUNE"
+hdr "STEP 5 — DISABLE UNUSED SERVICES"
 _step5() {
-  modprobe tcp_bbr 2>/dev/null || true
-  local cc="bbr"
-  grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
-    || { warn "BBR unavailable — fallback cubic"; cc="cubic"; }
-
-  local qdisc="fq"
-  modinfo sch_fq &>/dev/null 2>&1 || { warn "fq unavailable — fallback fq_codel"; qdisc="fq_codel"; }
-
-  local has_notsent=0
-  [ -f /proc/sys/net/ipv4/tcp_notsent_lowat ] && has_notsent=1
-
-  cat > /etc/sysctl.d/99-ais-vmess-tune.conf << EOF
-net.ipv4.tcp_congestion_control       = ${cc}
-net.core.default_qdisc                = ${qdisc}
-net.core.rmem_max                     = ${RMEM_MAX}
-net.core.wmem_max                     = ${WMEM_MAX}
-net.core.rmem_default                 = ${RMEM_DEFAULT}
-net.core.wmem_default                 = ${WMEM_DEFAULT}
-net.ipv4.tcp_rmem                     = 4096 ${RMEM_DEFAULT} ${RMEM_MAX}
-net.ipv4.tcp_wmem                     = 4096 ${WMEM_DEFAULT} ${WMEM_MAX}
-net.ipv4.tcp_moderate_rcvbuf          = 1
-net.ipv4.tcp_adv_win_scale            = 1
-net.ipv4.tcp_mem                      = ${TCP_MEM_PRESSURE} ${TCP_MEM_HARD} ${TCP_MEM_MAX}
-net.ipv4.tcp_limit_output_bytes       = ${LIMIT_OUTPUT}
-net.core.optmem_max                   = 131072
-$([ "$has_notsent" = "1" ] && echo "net.ipv4.tcp_notsent_lowat            = ${NOTSENT_LOWAT}")
-net.core.busy_poll                    = ${BUSY_POLL}
-net.core.busy_read                    = ${BUSY_READ}
-net.core.netdev_budget                = 1200
-net.core.netdev_budget_usecs          = 8000
-net.core.netdev_max_backlog           = ${NETDEV_BACKLOG}
-net.core.somaxconn                    = ${SOMAXCONN}
-net.ipv4.tcp_max_syn_backlog          = ${SYN_BACKLOG}
-net.ipv4.tcp_mtu_probing              = 1
-net.ipv4.tcp_base_mss                 = ${BASE_MSS}
-net.ipv4.tcp_fastopen                 = 3
-net.ipv4.tcp_window_scaling           = 1
-net.ipv4.tcp_timestamps               = 1
-net.ipv4.tcp_sack                     = 1
-net.ipv4.tcp_dsack                    = 1
-net.ipv4.tcp_fack                     = 1
-net.ipv4.tcp_ecn                      = 1
-net.ipv4.tcp_low_latency              = 1
-net.ipv4.tcp_autocorking              = 0
-net.ipv4.tcp_no_delay_ack             = 1
-net.ipv4.tcp_thin_linear_timeouts     = 1
-net.ipv4.tcp_thin_dupack              = 1
-net.ipv4.tcp_early_retrans            = 3
-net.ipv4.tcp_recovery                 = 1
-net.ipv4.tcp_reordering               = 6
-net.ipv4.tcp_frto                     = 2
-net.ipv4.tcp_no_metrics_save          = 1
-net.ipv4.tcp_syncookies               = 1
-net.ipv4.tcp_tw_reuse                 = 1
-net.ipv4.tcp_max_tw_buckets           = ${TW_BUCKETS}
-net.ipv4.ip_local_port_range          = 1024 65535
-net.ipv4.tcp_keepalive_time           = ${KA_TIME}
-net.ipv4.tcp_keepalive_intvl          = ${KA_INTVL}
-net.ipv4.tcp_keepalive_probes         = ${KA_PROBES}
-net.ipv4.tcp_fin_timeout              = ${FIN_TIMEOUT}
-net.ipv4.tcp_syn_retries              = 3
-net.ipv4.tcp_synack_retries           = 3
-net.ipv4.tcp_retries2                 = 8
-net.ipv4.tcp_orphan_retries           = 2
-net.ipv4.tcp_challenge_ack_limit      = 1000
-net.ipv4.tcp_max_orphans              = 32768
-net.ipv4.route.gc_thresh              = 32768
-vm.swappiness                         = 10
-vm.dirty_ratio                        = 10
-vm.dirty_background_ratio             = 3
-vm.dirty_expire_centisecs             = 500
-vm.dirty_writeback_centisecs          = 100
-vm.min_free_kbytes                    = 131072
-vm.vfs_cache_pressure                 = 50
-vm.overcommit_memory                  = 1
-vm.numa_balancing                     = 0
-vm.page_lock_unfairness               = 1
-vm.stat_interval                      = 10
-fs.file-max                           = 2097152
-fs.nr_open                            = 2097152
-fs.pipe-max-size                      = 1048576
-kernel.sched_autogroup_enabled        = 0
-kernel.sched_min_granularity_ns       = 500000
-kernel.sched_wakeup_granularity_ns    = 50000
-kernel.sched_latency_ns               = 4000000
-kernel.sched_migration_cost_ns        = 50000
-kernel.sched_nr_migrate               = 8
-kernel.sched_rt_runtime_us            = -1
-kernel.timer_migration                = 0
-kernel.nmi_watchdog                   = 0
-kernel.watchdog                       = 0
-kernel.pid_max                        = 131072
-kernel.threads-max                    = 262144
-kernel.panic                          = 10
-kernel.panic_on_oops                  = 1
-net.ipv4.conf.all.accept_redirects    = 0
-net.ipv4.conf.all.send_redirects      = 0
-net.ipv4.conf.all.rp_filter           = 1
-net.ipv4.icmp_echo_ignore_broadcasts  = 1
-net.ipv4.tcp_abort_on_overflow        = 0
-net.core.rmem_default                 = ${RMEM_DEFAULT}
-net.core.wmem_default                 = ${WMEM_DEFAULT}
-EOF
-
-  sysctl -p /etc/sysctl.d/99-ais-vmess-tune.conf
-
-  tc qdisc del dev "$NIC" root 2>/dev/null || true
-  tc qdisc add dev "$NIC" root handle 1: "${qdisc}" \
-    quantum "${TC_QUANTUM}" buckets "${TC_BUCKETS}" \
-    limit 10000 2>/dev/null \
-  || tc qdisc add dev "$NIC" root handle 1: "${qdisc}" \
-    quantum "${TC_QUANTUM}" buckets "${TC_BUCKETS}" 2>/dev/null \
-  || warn "tc ${qdisc} failed"
-  tc qdisc show dev "$NIC"
+  local services=(
+    "snapd" "snapd.socket"
+    "snap.amazon-ssm-agent.amazon-ssm-agent"
+    "multipathd" "multipathd.socket"
+    "apport"
+    "apt-daily.timer" "apt-daily-upgrade.timer"
+    "man-db.timer" "motd-news.timer"
+    "fwupd-refresh.timer"
+    "systemd-networkd-wait-online"
+    "iscsid" "open-iscsi"
+    "mdadm" "lvm2-monitor"
+    "bluetooth" "avahi-daemon"
+    "cups" "cups-browsed"
+    "ModemManager" "packagekit"
+    "polkit" "thermald"
+    "upower" "udisks2"
+    "accounts-daemon"
+    "rsyslog" "syslog"
+  )
+  for svc in "${services[@]}"; do
+    if systemctl list-unit-files "${svc}" 2>/dev/null | grep -q "${svc}"; then
+      systemctl stop    "${svc}" 2>/dev/null || true
+      systemctl disable "${svc}" 2>/dev/null || true
+      systemctl mask    "${svc}" 2>/dev/null || true
+    fi
+  done
+  info "unnecessary services disabled + masked"
 }
-run_always "step5_sysctl" _step5
+run_always "step5_disable_svc" _step5
 
 hdr "STEP 6 — TRANSPARENT HUGE PAGES off"
 _step6() {
   echo never > /sys/kernel/mm/transparent_hugepage/enabled || true
   echo never > /sys/kernel/mm/transparent_hugepage/defrag   || true
-  echo 0     > /sys/kernel/mm/transparent_hugepage/khugepaged/defrag 2>/dev/null || true
-  echo 0     > /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs 2>/dev/null || true
-  echo 0     > /sys/kernel/mm/transparent_hugepage/khugepaged/alloc_sleep_millisecs 2>/dev/null || true
+  echo 0     > /sys/kernel/mm/transparent_hugepage/khugepaged/defrag                    2>/dev/null || true
+  echo 0     > /sys/kernel/mm/transparent_hugepage/khugepaged/scan_sleep_millisecs      2>/dev/null || true
+  echo 0     > /sys/kernel/mm/transparent_hugepage/khugepaged/alloc_sleep_millisecs     2>/dev/null || true
   cat > /etc/systemd/system/thp-disable.service << 'EOF'
 [Unit]
 Description=Disable Transparent Huge Pages
@@ -338,20 +254,188 @@ EOF
 }
 run_always "step6_thp" _step6
 
-hdr "STEP 7 — NIC TUNE (${NIC} — virtio_net)"
+hdr "STEP 7 — KERNEL / TCP / VM / CONNTRACK TUNE"
 _step7() {
+  modprobe tcp_bbr 2>/dev/null || true
+  modprobe nf_conntrack 2>/dev/null || true
+
+  local cc="bbr"
+  grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
+    || { warn "BBR unavailable — fallback cubic"; cc="cubic"; }
+
+  local qdisc="fq"
+  modinfo sch_fq &>/dev/null 2>&1 || { warn "fq unavailable — fallback fq_codel"; qdisc="fq_codel"; }
+
+  local has_notsent=0
+  [ -f /proc/sys/net/ipv4/tcp_notsent_lowat ] && has_notsent=1
+
+  cat > /etc/sysctl.d/99-ais-vmess-tune.conf << EOF
+net.ipv4.tcp_congestion_control        = ${cc}
+net.core.default_qdisc                 = ${qdisc}
+net.core.rmem_max                      = ${RMEM_MAX}
+net.core.wmem_max                      = ${WMEM_MAX}
+net.core.rmem_default                  = ${RMEM_DEFAULT}
+net.core.wmem_default                  = ${WMEM_DEFAULT}
+net.ipv4.tcp_rmem                      = 4096 ${RMEM_DEFAULT} ${RMEM_MAX}
+net.ipv4.tcp_wmem                      = 4096 ${WMEM_DEFAULT} ${WMEM_MAX}
+net.ipv4.tcp_moderate_rcvbuf           = 1
+net.ipv4.tcp_adv_win_scale             = 1
+net.ipv4.tcp_mem                       = ${TCP_MEM_PRESSURE} ${TCP_MEM_HARD} ${TCP_MEM_MAX}
+net.ipv4.tcp_limit_output_bytes        = ${LIMIT_OUTPUT}
+net.core.optmem_max                    = 131072
+$([ "$has_notsent" = "1" ] && echo "net.ipv4.tcp_notsent_lowat             = ${NOTSENT_LOWAT}")
+net.core.busy_poll                     = ${BUSY_POLL}
+net.core.busy_read                     = ${BUSY_READ}
+net.core.netdev_budget                 = 1200
+net.core.netdev_budget_usecs           = 8000
+net.core.netdev_max_backlog            = ${NETDEV_BACKLOG}
+net.core.dev_weight                    = 128
+net.core.dev_weight_rx_bias            = 8
+net.core.dev_weight_tx_bias            = 1
+net.core.somaxconn                     = ${SOMAXCONN}
+net.ipv4.tcp_max_syn_backlog           = ${SYN_BACKLOG}
+net.ipv4.tcp_mtu_probing               = 1
+net.ipv4.tcp_base_mss                  = ${BASE_MSS}
+net.ipv4.tcp_fastopen                  = 3
+net.ipv4.tcp_window_scaling            = 1
+net.ipv4.tcp_timestamps                = 1
+net.ipv4.tcp_sack                      = 1
+net.ipv4.tcp_dsack                     = 1
+net.ipv4.tcp_fack                      = 1
+net.ipv4.tcp_ecn                       = 1
+net.ipv4.tcp_low_latency               = 1
+net.ipv4.tcp_autocorking               = 0
+net.ipv4.tcp_no_delay_ack              = 1
+net.ipv4.tcp_thin_linear_timeouts      = 1
+net.ipv4.tcp_thin_dupack               = 1
+net.ipv4.tcp_early_retrans             = 3
+net.ipv4.tcp_recovery                  = 1
+net.ipv4.tcp_reordering                = 6
+net.ipv4.tcp_frto                      = 2
+net.ipv4.tcp_no_metrics_save           = 1
+net.ipv4.tcp_slow_start_after_idle     = 0
+net.ipv4.tcp_workaround_signed_windows = 1
+net.ipv4.tcp_abc                       = 0
+net.ipv4.tcp_syncookies                = 1
+net.ipv4.tcp_tw_reuse                  = 1
+net.ipv4.tcp_max_tw_buckets            = ${TW_BUCKETS}
+net.ipv4.ip_local_port_range           = 1024 65535
+net.ipv4.tcp_keepalive_time            = ${KA_TIME}
+net.ipv4.tcp_keepalive_intvl           = ${KA_INTVL}
+net.ipv4.tcp_keepalive_probes          = ${KA_PROBES}
+net.ipv4.tcp_fin_timeout               = ${FIN_TIMEOUT}
+net.ipv4.tcp_syn_retries               = 3
+net.ipv4.tcp_synack_retries            = 3
+net.ipv4.tcp_retries2                  = 8
+net.ipv4.tcp_orphan_retries            = 2
+net.ipv4.tcp_challenge_ack_limit       = 1000
+net.ipv4.tcp_max_orphans               = 32768
+net.ipv4.tcp_abort_on_overflow         = 0
+net.ipv4.route.gc_thresh               = 32768
+net.ipv4.ip_no_pmtu_disc               = 0
+net.ipv4.ip_forward                    = 1
+net.ipv4.conf.all.forwarding           = 1
+net.ipv4.conf.default.forwarding       = 1
+net.ipv4.conf.all.accept_redirects     = 0
+net.ipv4.conf.all.send_redirects       = 0
+net.ipv4.conf.all.rp_filter            = 1
+net.ipv4.icmp_echo_ignore_broadcasts   = 1
+net.ipv6.conf.all.forwarding           = 1
+net.ipv6.conf.default.forwarding       = 1
+vm.swappiness                          = 10
+vm.dirty_ratio                         = 10
+vm.dirty_background_ratio              = 3
+vm.dirty_expire_centisecs              = 500
+vm.dirty_writeback_centisecs           = 100
+vm.min_free_kbytes                     = 131072
+vm.vfs_cache_pressure                  = 50
+vm.overcommit_memory                   = 1
+vm.numa_balancing                      = 0
+vm.page_lock_unfairness                = 1
+vm.stat_interval                       = 10
+vm.zone_reclaim_mode                   = 0
+vm.watermark_boost_factor              = 0
+vm.watermark_scale_factor              = 200
+vm.compaction_proactiveness            = 0
+fs.file-max                            = 2097152
+fs.nr_open                             = 2097152
+fs.pipe-max-size                       = 1048576
+kernel.sched_autogroup_enabled         = 0
+kernel.sched_min_granularity_ns        = 500000
+kernel.sched_wakeup_granularity_ns     = 50000
+kernel.sched_latency_ns                = 4000000
+kernel.sched_migration_cost_ns         = 50000
+kernel.sched_nr_migrate                = 8
+kernel.sched_rt_runtime_us             = -1
+kernel.timer_migration                 = 0
+kernel.nmi_watchdog                    = 0
+kernel.watchdog                        = 0
+kernel.pid_max                         = 131072
+kernel.threads-max                     = 262144
+kernel.panic                           = 10
+kernel.panic_on_oops                   = 1
+kernel.perf_event_paranoid             = -1
+kernel.kptr_restrict                   = 0
+kernel.dmesg_restrict                  = 0
+EOF
+
+  sysctl -p /etc/sysctl.d/99-ais-vmess-tune.conf
+
+  local ct_max=131072
+  echo "$ct_max" > /proc/sys/net/netfilter/nf_conntrack_max            2>/dev/null || true
+  echo 0         > /proc/sys/net/netfilter/nf_conntrack_checksum        2>/dev/null || true
+  echo 600       > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 2>/dev/null || true
+  echo 20        > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait   2>/dev/null || true
+  echo 10        > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close_wait  2>/dev/null || true
+  echo 10        > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait    2>/dev/null || true
+  echo 5         > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_last_ack    2>/dev/null || true
+  echo 1         > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal          2>/dev/null || true
+
+  cat >> /etc/sysctl.d/99-ais-vmess-tune.conf << EOF
+net.netfilter.nf_conntrack_max                         = ${ct_max}
+net.netfilter.nf_conntrack_checksum                    = 0
+net.netfilter.nf_conntrack_tcp_timeout_established     = 600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait       = 20
+net.netfilter.nf_conntrack_tcp_timeout_close_wait      = 10
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait        = 10
+net.netfilter.nf_conntrack_tcp_timeout_last_ack        = 5
+net.netfilter.nf_conntrack_tcp_be_liberal              = 1
+EOF
+
+  local bucket_size=$(( ct_max / 4 ))
+  echo "$bucket_size" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+  info "conntrack max=${ct_max} hashsize=${bucket_size}"
+
+  cat > /etc/sysctl.d/99-bbr-persistent.conf << 'EOF'
+net.ipv4.tcp_congestion_control        = bbr
+net.core.default_qdisc                 = fq
+EOF
+  sysctl -p /etc/sysctl.d/99-bbr-persistent.conf 2>/dev/null || true
+
+  tc qdisc del dev "$NIC" root 2>/dev/null || true
+  tc qdisc add dev "$NIC" root handle 1: "${qdisc}" \
+    quantum "${TC_QUANTUM}" buckets "${TC_BUCKETS}" \
+    limit 10000 2>/dev/null \
+  || tc qdisc add dev "$NIC" root handle 1: "${qdisc}" \
+    quantum "${TC_QUANTUM}" buckets "${TC_BUCKETS}" 2>/dev/null \
+  || warn "tc ${qdisc} failed"
+  tc qdisc show dev "$NIC"
+}
+run_always "step7_sysctl_conntrack" _step7
+
+hdr "STEP 8 — NIC TUNE (${NIC} — virtio_net)"
+_step8() {
   ip link show "$NIC"
 
   local qdisc="fq"
   grep -q "default_qdisc.*fq_codel" /etc/sysctl.d/99-ais-vmess-tune.conf 2>/dev/null \
     && qdisc="fq_codel"
 
-  ethtool -K "$NIC" gro on lro off tso on gso on 2>/dev/null \
-    || warn "ethtool offload: partial (ok on virtio_net)"
-  ethtool -K "$NIC" rx-gro-hw off 2>/dev/null || true
-  ethtool -K "$NIC" rx-checksum on tx-checksum-ip-generic on 2>/dev/null || true
-  ethtool -K "$NIC" rx-vlan-offload off tx-vlan-offload off 2>/dev/null || true
-  ethtool -A "$NIC" rx off tx off 2>/dev/null || true
+  ethtool -K "$NIC" gro on lro off tso on gso on              2>/dev/null || warn "ethtool offload: partial (ok on virtio_net)"
+  ethtool -K "$NIC" rx-gro-hw off                             2>/dev/null || true
+  ethtool -K "$NIC" rx-checksum on tx-checksum-ip-generic on  2>/dev/null || true
+  ethtool -K "$NIC" rx-vlan-offload off tx-vlan-offload off   2>/dev/null || true
+  ethtool -A "$NIC" rx off tx off                             2>/dev/null || true
 
   local rx_max tx_max
   rx_max=$(ethtool -g "$NIC" 2>/dev/null \
@@ -361,7 +445,6 @@ _step7() {
   rx_max="${rx_max:-1024}"; tx_max="${tx_max:-1024}"
   ethtool -G "$NIC" rx "$rx_max" tx "$tx_max" 2>/dev/null \
     && info "ring buffer rx=${rx_max} tx=${tx_max}" || true
-
   ethtool -C "$NIC" rx-usecs 50 tx-usecs 50 adaptive-rx on adaptive-tx on 2>/dev/null \
     || ethtool -C "$NIC" rx-usecs 50 tx-usecs 50 2>/dev/null || true
 
@@ -376,9 +459,8 @@ _step7() {
     quantum "${TC_QUANTUM}" buckets "${TC_BUCKETS}" 2>/dev/null \
   || warn "tc ${qdisc} on ${NIC} failed"
 
-  local cpu_count
+  local cpu_count rps_mask
   cpu_count=$(nproc 2>/dev/null || echo 1)
-  local rps_mask
   rps_mask=$(printf '%x' $(( (1 << cpu_count) - 1 )))
   echo "${rps_mask}" > /sys/class/net/"${NIC}"/queues/rx-0/rps_cpus 2>/dev/null || true
 
@@ -395,6 +477,10 @@ _step7() {
     info "NIC IRQ ${irq_num} pinned to CPU0"
   fi
 
+  for i in $(seq 0 $((cpu_count - 1))); do
+    echo $((cpu_count)) > /sys/bus/workqueue/devices/writeback/cpumask 2>/dev/null || true
+  done
+
   mkdir -p /etc/networkd-dispatcher/routable.d
   cat > /etc/networkd-dispatcher/routable.d/50-nic-tune.sh << NEOF
 #!/usr/bin/env bash
@@ -405,15 +491,16 @@ RX_MAX="${rx_max}"
 TX_MAX="${tx_max}"
 TC_QUANTUM="${TC_QUANTUM}"
 TC_BUCKETS="${TC_BUCKETS}"
+EFFECTIVE_MTU="${EFFECTIVE_MTU}"
 ip link show "\${NIC}" &>/dev/null || exit 0
-ethtool -K "\${NIC}" gro on lro off tso on gso on 2>/dev/null || true
-ethtool -K "\${NIC}" rx-gro-hw off 2>/dev/null || true
-ethtool -K "\${NIC}" rx-vlan-offload off tx-vlan-offload off 2>/dev/null || true
-ethtool -A "\${NIC}" rx off tx off 2>/dev/null || true
-ethtool -G "\${NIC}" rx "\${RX_MAX}" tx "\${TX_MAX}" 2>/dev/null || true
+ethtool -K "\${NIC}" gro on lro off tso on gso on              2>/dev/null || true
+ethtool -K "\${NIC}" rx-gro-hw off                             2>/dev/null || true
+ethtool -K "\${NIC}" rx-vlan-offload off tx-vlan-offload off   2>/dev/null || true
+ethtool -A "\${NIC}" rx off tx off                             2>/dev/null || true
+ethtool -G "\${NIC}" rx "\${RX_MAX}" tx "\${TX_MAX}"          2>/dev/null || true
 ethtool -C "\${NIC}" rx-usecs 50 tx-usecs 50 adaptive-rx on adaptive-tx on 2>/dev/null || \
-ethtool -C "\${NIC}" rx-usecs 50 tx-usecs 50 2>/dev/null || true
-ip link set "\${NIC}" mtu "${EFFECTIVE_MTU}" 2>/dev/null || true
+ethtool -C "\${NIC}" rx-usecs 50 tx-usecs 50                   2>/dev/null || true
+ip link set "\${NIC}" mtu "\${EFFECTIVE_MTU}"                  2>/dev/null || true
 ip link set "\${NIC}" txqueuelen 10000
 tc qdisc del dev "\${NIC}" root 2>/dev/null || true
 tc qdisc add dev "\${NIC}" root handle 1: "\${QDISC}" \
@@ -450,10 +537,10 @@ SEOF
   systemctl enable nic-tune.service
   info "nic-tune.service enabled"
 }
-run_always "step7_nic" _step7
+run_always "step8_nic" _step8
 
-hdr "STEP 8 — I/O SCHEDULER"
-_step8() {
+hdr "STEP 9 — I/O SCHEDULER"
+_step9() {
   local found=0
   for DEV in sda sdb vda vdb xvda nvme0n1 nvme1n1; do
     [ -b "/dev/${DEV}" ] || continue
@@ -461,10 +548,10 @@ _step8() {
     local rot
     rot=$(cat "/sys/block/${DEV}/queue/rotational" 2>/dev/null || echo "0")
     if [ "$rot" = "0" ]; then
-      echo none        > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null || true
+      echo none        > "/sys/block/${DEV}/queue/scheduler"   2>/dev/null || true
       info "${DEV}: SSD/NVMe -> none"
     else
-      echo mq-deadline > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null || true
+      echo mq-deadline > "/sys/block/${DEV}/queue/scheduler"   2>/dev/null || true
       info "${DEV}: HDD -> mq-deadline"
     fi
     echo 0   > "/sys/block/${DEV}/queue/add_random"    2>/dev/null || true
@@ -484,10 +571,10 @@ ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/scheduler}="none"
 EOF
   udevadm control --reload-rules
 }
-run_always "step8_io" _step8
+run_always "step9_io" _step9
 
-hdr "STEP 9 — CPU GOVERNOR performance + C-STATE"
-_step9() {
+hdr "STEP 10 — CPU GOVERNOR performance + C-STATE"
+_step10() {
   cat > /etc/systemd/system/cpu-performance.service << 'EOF'
 [Unit]
 Description=CPU Governor performance + C-state latency
@@ -514,10 +601,10 @@ EOF
   cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null \
     || info "cpufreq not available (VM passthrough)"
 }
-run_always "step9_cpu" _step9
+run_always "step10_cpu" _step10
 
-hdr "STEP 10 — SYSTEM LIMITS"
-_step10() {
+hdr "STEP 11 — SYSTEM LIMITS"
+_step11() {
   cat > /etc/security/limits.d/99-xui.conf << 'EOF'
 *    soft nofile   2097152
 *    hard nofile   2097152
@@ -541,13 +628,112 @@ EOF
   done
   cat /etc/security/limits.d/99-xui.conf
 }
-run_always "step10_limits" _step10
+run_always "step11_limits" _step11
 
-hdr "STEP 11 — x-ui SYSTEMD OVERRIDE"
-_step11() {
+hdr "STEP 12 — IRQBALANCE"
+_step12() {
+  if command -v irqbalance &>/dev/null; then
+    cat > /etc/default/irqbalance << 'EOF'
+ENABLED=1
+ONESHOT=0
+OPTIONS="--powerthresh=0 --deepestcache=1"
+EOF
+    systemctl enable --now irqbalance 2>/dev/null || true
+    systemctl status irqbalance --no-pager
+  else
+    warn "irqbalance not installed"
+  fi
+}
+run_always "step12_irq" _step12
+
+hdr "STEP 13 — SYSTEMD JOURNALD + TMPFS"
+_step13() {
+  mkdir -p /etc/systemd/journald.conf.d
+  cat > /etc/systemd/journald.conf.d/99-performance.conf << 'EOF'
+[Journal]
+Storage=volatile
+Compress=no
+SystemMaxUse=64M
+RuntimeMaxUse=64M
+RateLimitIntervalSec=0
+RateLimitBurst=0
+Seal=no
+ReadKMsg=no
+EOF
+  systemctl restart systemd-journald
+
+  if ! grep -q "tmpfs /tmp" /etc/fstab 2>/dev/null; then
+    echo "tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,size=256m 0 0" >> /etc/fstab
+    mount -o remount /tmp 2>/dev/null || true
+  fi
+
+  cat > /etc/systemd/system/clear-tmp.service << 'EOF'
+[Unit]
+Description=Clear /tmp on boot
+DefaultDependencies=no
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'find /tmp -mindepth 1 -delete 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=sysinit.target
+EOF
+  systemctl daemon-reload
+  systemctl enable clear-tmp.service
+  info "journald volatile + tmpfs /tmp 256MB"
+}
+run_always "step13_journald_tmpfs" _step13
+
+hdr "STEP 14 — DNS RESOLVER OPTIMIZE"
+_step14() {
+  mkdir -p /etc/systemd/resolved.conf.d
+  cat > /etc/systemd/resolved.conf.d/99-fast.conf << 'EOF'
+[Resolve]
+DNS=1.1.1.1 8.8.8.8 1.0.0.1 8.8.4.4
+FallbackDNS=9.9.9.9 149.112.112.112
+DNSSEC=no
+DNSOverTLS=no
+Cache=yes
+CacheFromLocalhost=yes
+DNSStubListener=yes
+ReadEtcHosts=yes
+EOF
+  systemctl enable --now systemd-resolved 2>/dev/null || true
+  systemctl restart systemd-resolved 2>/dev/null || true
+  ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+  info "DNS: 1.1.1.1 + 8.8.8.8 cache+stub active"
+}
+run_always "step14_dns" _step14
+
+hdr "STEP 15 — x-ui SYSTEMD OVERRIDE"
+_step15() {
   local xui_bin
   xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
   [ -x "$xui_bin" ] || { warn "x-ui binary not found — skipping override"; return 0; }
+
+  local xui_pid rss_mb gogc_val gomemlimit_val
+  xui_pid=$(pgrep -x x-ui 2>/dev/null | head -1 || echo "")
+  rss_mb=70
+  [ -n "$xui_pid" ] && rss_mb=$(awk '/^VmRSS/ {print int($2/1024)}' /proc/"$xui_pid"/status 2>/dev/null || echo 70)
+
+  local ram_avail_mb
+  ram_avail_mb=$(free -m | awk '/^Mem:/ {print $7}')
+  gomemlimit_val=$(( ram_avail_mb - rss_mb - 100 ))
+  [ "$gomemlimit_val" -lt 400 ] && gomemlimit_val=400
+
+  if [ "$rss_mb" -lt 100 ]; then
+    gogc_val=150
+  elif [ "$rss_mb" -lt 200 ]; then
+    gogc_val=100
+  else
+    gogc_val=50
+  fi
+
+  info "GOGC=${gogc_val} GOMEMLIMIT=${gomemlimit_val}MiB (RSS=${rss_mb}MB)"
+
   mkdir -p /etc/systemd/system/x-ui.service.d
   cat > /etc/systemd/system/x-ui.service.d/override.conf << EOF
 [Service]
@@ -560,9 +746,9 @@ Restart=always
 RestartSec=1
 RestartPreventExitStatus=0
 Environment=GOMAXPROCS=${VCPU}
-Environment=GOGC=100
+Environment=GOGC=${gogc_val}
 Environment=GODEBUG=madvdontneed=1 asyncpreemptoff=0 gccheckmark=0
-Environment=GOMEMLIMIT=1600MiB
+Environment=GOMEMLIMIT=${gomemlimit_val}MiB
 Environment=GOGCTRACE=0
 OOMScoreAdjust=-1000
 MemoryHigh=${XUI_MEM_HIGH}
@@ -582,26 +768,139 @@ EOF
   wait_active x-ui 30 || warn "x-ui not active after override"
   systemctl status x-ui --no-pager
 }
-run_always "step11_xui_override" _step11
+run_always "step15_xui_override" _step15
 
-hdr "STEP 12 — IRQBALANCE"
-_step12() {
-  if command -v irqbalance &>/dev/null; then
-    cat > /etc/default/irqbalance << 'EOF'
-ENABLED=1
-ONESHOT=0
-OPTIONS="--powerthresh=0 --deepestcache=1"
-EOF
-    systemctl enable --now irqbalance 2>/dev/null || true
-    systemctl status irqbalance --no-pager
-  else
-    warn "irqbalance not installed"
+hdr "STEP 16 — x-ui CAPABILITIES + MEMORY LOCK"
+_step16() {
+  local xui_bin
+  xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
+  if [ -x "$xui_bin" ]; then
+    setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw,cap_ipc_lock+eip' "$xui_bin" 2>/dev/null \
+      && info "x-ui capabilities set" || warn "setcap failed"
+  fi
+  local xui_xray
+  xui_xray=$(find /usr/local/x-ui /root/.x-ui -name "xray" -type f 2>/dev/null | head -1 || echo "")
+  if [ -n "$xui_xray" ] && [ -x "$xui_xray" ]; then
+    setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw,cap_ipc_lock+eip' "$xui_xray" 2>/dev/null \
+      && info "xray capabilities set: ${xui_xray}" || true
   fi
 }
-run_always "step12_irq" _step12
+run_always "step16_capabilities" _step16
 
-hdr "STEP 13 — XRAY SOCKOPT PATCH (VMESS WS port 80)"
-_step13() {
+hdr "STEP 17 — IONICE + PROCESS PRIORITY"
+_step17() {
+  local xui_pid
+  xui_pid=$(pgrep -x x-ui 2>/dev/null | head -1 || echo "")
+  if [ -n "$xui_pid" ]; then
+    renice -n -20 -p "$xui_pid"      2>/dev/null || true
+    ionice -c 1 -n 0 -p "$xui_pid"  2>/dev/null || true
+    chrt -b -p 1 "$xui_pid"         2>/dev/null || true
+    taskset -cp 0 "$xui_pid"        2>/dev/null || true
+    info "x-ui pid=${xui_pid}: nice=-20 ionice=realtime:0 chrt=batch taskset=cpu0"
+  else
+    warn "x-ui not running — skip ionice"
+  fi
+
+  cat > /etc/systemd/system/xui-ionice.service << 'EOF'
+[Unit]
+Description=Set x-ui ionice + sched priority
+After=x-ui.service
+Requires=x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c \
+  'PID=$(pgrep -x x-ui | head -1); \
+  [ -n "$PID" ] || exit 0; \
+  renice -n -20 -p "$PID" 2>/dev/null || true; \
+  ionice -c 1 -n 0 -p "$PID" 2>/dev/null || true; \
+  chrt -b -p 1 "$PID" 2>/dev/null || true; \
+  taskset -cp 0 "$PID" 2>/dev/null || true'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now xui-ionice.service 2>/dev/null || true
+}
+run_always "step17_ionice" _step17
+
+hdr "STEP 18 — x-ui DATABASE WAL MODE + OPTIMIZE"
+_step18() {
+  local db="/etc/x-ui/x-ui.db"
+  [ -f "$db" ] || { warn "x-ui.db not found — skip"; return 0; }
+  command -v sqlite3 &>/dev/null || { warn "sqlite3 not found"; return 1; }
+
+  sqlite3 "$db" "PRAGMA journal_mode=WAL;"        2>/dev/null || true
+  sqlite3 "$db" "PRAGMA synchronous=NORMAL;"       2>/dev/null || true
+  sqlite3 "$db" "PRAGMA cache_size=-65536;"        2>/dev/null || true
+  sqlite3 "$db" "PRAGMA temp_store=MEMORY;"        2>/dev/null || true
+  sqlite3 "$db" "PRAGMA mmap_size=268435456;"      2>/dev/null || true
+  sqlite3 "$db" "PRAGMA page_size=4096;"           2>/dev/null || true
+  sqlite3 "$db" "PRAGMA wal_autocheckpoint=1000;"  2>/dev/null || true
+  sqlite3 "$db" "VACUUM;"                          2>/dev/null || true
+  sqlite3 "$db" "ANALYZE;"                         2>/dev/null || true
+
+  local journal_mode
+  journal_mode=$(sqlite3 "$db" "PRAGMA journal_mode;" 2>/dev/null || echo "unknown")
+  info "SQLite journal_mode=${journal_mode}"
+
+  cat > /etc/systemd/system/xui-db-wal.service << EOF
+[Unit]
+Description=x-ui SQLite WAL checkpoint
+After=x-ui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sqlite3 ${db} "PRAGMA wal_checkpoint(TRUNCATE);"
+EOF
+
+  cat > /etc/systemd/system/xui-db-wal.timer << 'EOF'
+[Unit]
+Description=x-ui SQLite WAL checkpoint every 30min
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now xui-db-wal.timer
+  info "SQLite WAL + mmap 256MB + cache 64MB applied"
+}
+run_always "step18_sqlite_wal" _step18
+
+hdr "STEP 19 — XRAY LOG DISABLE"
+_step19() {
+  local db="/etc/x-ui/x-ui.db"
+  [ -f "$db" ] || { warn "x-ui.db not found — skip"; return 0; }
+  command -v sqlite3 &>/dev/null || { warn "sqlite3 not found"; return 1; }
+
+  local template
+  template=$(sqlite3 "$db" "SELECT value FROM settings WHERE key='xrayTemplateConfig';" 2>/dev/null || echo "")
+  if [ -n "$template" ]; then
+    local new_template
+    new_template=$(echo "$template" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+d['log'] = {'access': 'none', 'error': '', 'loglevel': 'none', 'dnsLog': False}
+print(json.dumps(d, separators=(',',':')))
+" 2>/dev/null || echo "")
+    if [ -n "$new_template" ]; then
+      local new_escaped="${new_template//\'/\'\'}"
+      sqlite3 "$db" "UPDATE settings SET value='${new_escaped}' WHERE key='xrayTemplateConfig';" 2>/dev/null || true
+      info "xray log level → none"
+    fi
+  fi
+  systemctl restart x-ui 2>/dev/null || true
+}
+run_always "step19_xray_nolog" _step19
+
+hdr "STEP 20 — XRAY SOCKOPT PATCH (VMESS WS port 80)"
+_step20() {
   local db="/etc/x-ui/x-ui.db"
   [ -f "$db" ] || { warn "x-ui.db not found — create inbound first then re-run"; return 0; }
   command -v sqlite3 &>/dev/null || { warn "sqlite3 not found"; return 1; }
@@ -613,19 +912,17 @@ _step13() {
   count=$(sqlite3 "$db" "SELECT COUNT(*) FROM inbounds WHERE port=80 AND protocol='vmess';" 2>/dev/null || echo "0")
 
   if [ "$count" -gt 0 ]; then
-    local stream_settings
+    local stream_settings new_stream
     stream_settings=$(sqlite3 "$db" "SELECT stream_settings FROM inbounds WHERE port=80 AND protocol='vmess' LIMIT 1;" 2>/dev/null || echo "")
     if [ -n "$stream_settings" ]; then
-      local new_stream
       new_stream=$(echo "$stream_settings" | python3 -c "
 import sys, json
 d = json.load(sys.stdin)
-import json as j
-d['sockopt'] = j.loads(sys.argv[1])
-print(j.dumps(d, separators=(',',':')))
+d['sockopt'] = json.loads(sys.argv[1])
+print(json.dumps(d, separators=(',',':')))
 " "$sockopt" 2>/dev/null || echo "")
       if [ -n "$new_stream" ]; then
-        new_stream_escaped="${new_stream//\'/\'\'}"
+        local new_stream_escaped="${new_stream//\'/\'\'}"
         sqlite3 "$db" "UPDATE inbounds SET stream_settings='${new_stream_escaped}' WHERE port=80 AND protocol='vmess';"
         info "sockopt patched on vmess port 80"
       else
@@ -633,77 +930,187 @@ print(j.dumps(d, separators=(',',':')))
       fi
     fi
   else
-    warn "no vmess port 80 inbound found — create inbound in panel first then re-run"
-    warn "sockopt JSON to apply manually in panel streamSettings:"
+    warn "no vmess port 80 inbound found — create inbound in panel then re-run"
+    warn "sockopt JSON to apply manually:"
     echo "${sockopt}"
   fi
   systemctl restart x-ui 2>/dev/null || true
 }
-run_always "step13_sockopt" _step13
+run_always "step20_sockopt" _step20
 
-hdr "STEP 14 — IONICE + PROCESS PRIORITY"
-_step14() {
-  local xui_pid
-  xui_pid=$(pgrep -x x-ui 2>/dev/null | head -1 || echo "")
-  if [ -n "$xui_pid" ]; then
-    renice -n -20 -p "$xui_pid" 2>/dev/null || true
-    ionice -c 1 -n 0 -p "$xui_pid" 2>/dev/null || true
-    info "x-ui pid=${xui_pid}: nice=-20 ionice=realtime:0"
-  else
-    warn "x-ui not running — skip ionice"
+hdr "STEP 21 — WATCHDOG + AUTO-RECOVERY"
+_step21() {
+  cat > /usr/local/bin/xui-watchdog.sh << 'WEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+LOG="/var/log/xui-watchdog.log"
+MAX_RSS_MB=1400
+RESTART_COOL=60
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+
+while true; do
+  sleep 30
+  XUI_PID=$(pgrep -x x-ui 2>/dev/null | head -1 || echo "")
+  if [ -z "$XUI_PID" ]; then
+    echo "$(ts) [WARN] x-ui not running — restarting" >> "$LOG"
+    systemctl restart x-ui 2>/dev/null || true
+    sleep "$RESTART_COOL"
+    continue
   fi
+  RSS_MB=$(awk '/^VmRSS/ {print int($2/1024)}' /proc/"$XUI_PID"/status 2>/dev/null || echo 0)
+  if [ "$RSS_MB" -gt "$MAX_RSS_MB" ]; then
+    echo "$(ts) [WARN] RSS=${RSS_MB}MB > ${MAX_RSS_MB}MB — restarting x-ui" >> "$LOG"
+    systemctl restart x-ui 2>/dev/null || true
+    sleep "$RESTART_COOL"
+    continue
+  fi
+  AVAIL_MB=$(free -m | awk '/^Mem:/ {print $7}')
+  if [ "$AVAIL_MB" -lt 50 ]; then
+    echo "$(ts) [WARN] RAM avail=${AVAIL_MB}MB < 50MB — drop caches" >> "$LOG"
+    sync
+    echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
+  fi
+done
+WEOF
+  chmod +x /usr/local/bin/xui-watchdog.sh
 
-  cat > /etc/systemd/system/xui-ionice.service << 'EOF'
+  cat > /etc/systemd/system/xui-watchdog.service << 'EOF'
 [Unit]
-Description=Set x-ui ionice realtime
+Description=x-ui Memory Watchdog + Auto-Recovery
 After=x-ui.service
 Requires=x-ui.service
 
 [Service]
-Type=oneshot
-ExecStart=/bin/bash -c \
-  'PID=$(pgrep -x x-ui | head -1); \
-  [ -n "$PID" ] && renice -n -20 -p "$PID" 2>/dev/null || true; \
-  [ -n "$PID" ] && ionice -c 1 -n 0 -p "$PID" 2>/dev/null || true'
-RemainAfterExit=yes
+Type=simple
+ExecStart=/usr/local/bin/xui-watchdog.sh
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
 EOF
   systemctl daemon-reload
-  systemctl enable --now xui-ionice.service 2>/dev/null || true
+  systemctl enable --now xui-watchdog.service
+  info "watchdog: check every 30s restart if RSS>1400MB or crash"
 }
-run_always "step14_ionice" _step14
+run_always "step21_watchdog" _step21
 
-hdr "STEP 15 — PERSIST VERIFY (reboot-safe)"
-_step15() {
+hdr "STEP 22 — PERF SNAPSHOT (ทุก 5 นาที)"
+_step22() {
+  cat > /usr/local/bin/xui-perf-snap.sh << 'PEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+LOG="/var/log/xui-perf.log"
+MAX_LINES=1000
+
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+trim_log() {
+  [ -f "$LOG" ] || return
+  local lines
+  lines=$(wc -l < "$LOG" 2>/dev/null || echo 0)
+  [ "$lines" -gt "$MAX_LINES" ] && tail -n "$MAX_LINES" "$LOG" > "${LOG}.tmp" && mv "${LOG}.tmp" "$LOG"
+}
+trim_log
+XUI_PID=$(pgrep -x x-ui 2>/dev/null | head -1 || echo "")
+RSS_MB=0; CPU_PCT="0"
+if [ -n "$XUI_PID" ]; then
+  RSS_MB=$(awk '/^VmRSS/ {print int($2/1024)}' /proc/"$XUI_PID"/status 2>/dev/null || echo 0)
+  CPU_PCT=$(ps -p "$XUI_PID" -o %cpu --no-headers 2>/dev/null | tr -d ' ' || echo "0")
+fi
+AVAIL_MB=$(free -m | awk '/^Mem:/ {print $7}')
+CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "?")
+CONN=$(ss -s 2>/dev/null | awk '/estab/ {print $4}' | tr -d ',' || echo "?")
+echo "$(ts) | PID=${XUI_PID:-none} RSS=${RSS_MB}MB CPU=${CPU_PCT}% RAM_avail=${AVAIL_MB}MB CC=${CC} ESTAB=${CONN}" >> "$LOG"
+PEOF
+  chmod +x /usr/local/bin/xui-perf-snap.sh
+
+  cat > /etc/systemd/system/xui-perf-snap.service << 'EOF'
+[Unit]
+Description=x-ui Performance Snapshot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/xui-perf-snap.sh
+EOF
+
+  cat > /etc/systemd/system/xui-perf-snap.timer << 'EOF'
+[Unit]
+Description=x-ui Performance Snapshot every 5min
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now xui-perf-snap.timer
+  info "perf snapshot: /var/log/xui-perf.log"
+}
+run_always "step22_perf_snap" _step22
+
+hdr "STEP 23 — PERSIST VERIFY (reboot-safe check)"
+_step23() {
   local errors=0
-  systemctl is-enabled thp-disable.service     || { warn "thp-disable not enabled";       errors=$((errors+1)); }
-  systemctl is-enabled nic-tune.service        || { warn "nic-tune not enabled";           errors=$((errors+1)); }
-  systemctl is-enabled cpu-performance.service || { warn "cpu-performance not enabled";    errors=$((errors+1)); }
-  systemctl is-enabled x-ui 2>/dev/null        || warn "x-ui not enabled"
-  [ -f /etc/sysctl.d/99-ais-vmess-tune.conf ]               || { warn "sysctl conf missing";            errors=$((errors+1)); }
-  [ -f /etc/security/limits.d/99-xui.conf ]                 || { warn "limits conf missing";             errors=$((errors+1)); }
-  [ -f /etc/udev/rules.d/60-io-scheduler.rules ]            || { warn "io scheduler rules missing";      errors=$((errors+1)); }
-  [ -f /etc/networkd-dispatcher/routable.d/50-nic-tune.sh ] || { warn "nic-tune script missing";         errors=$((errors+1)); }
-  [ -f /etc/systemd/system/thp-disable.service ]            || { warn "thp-disable service missing";     errors=$((errors+1)); }
-  [ -f /etc/systemd/system/nic-tune.service ]               || { warn "nic-tune service missing";        errors=$((errors+1)); }
-  [ -f /etc/systemd/system/cpu-performance.service ]        || { warn "cpu-performance service missing"; errors=$((errors+1)); }
-  [ -f /etc/systemd/system/xui-ionice.service ]             || { warn "xui-ionice service missing";      errors=$((errors+1)); }
-  grep -q '/swapfile' /etc/fstab \
-    || { warn "swapfile not in fstab"; errors=$((errors+1)); }
-  swapon --show | grep -q '/swapfile' \
-    || { warn "swapfile not active"; errors=$((errors+1)); }
-  [ -f /etc/systemd/system/x-ui.service.d/override.conf ] \
-    || warn "x-ui override missing"
+  local chk() { systemctl is-enabled "$1" &>/dev/null || { warn "$1 not enabled"; errors=$((errors+1)); }; }
+  chk thp-disable.service
+  chk nic-tune.service
+  chk cpu-performance.service
+  chk x-ui
+  chk xui-watchdog.service
+  chk xui-perf-snap.timer
+  chk xui-db-wal.timer
+
+  [ -f /etc/sysctl.d/99-ais-vmess-tune.conf ]               || { warn "sysctl conf missing";           errors=$((errors+1)); }
+  [ -f /etc/security/limits.d/99-xui.conf ]                 || { warn "limits conf missing";            errors=$((errors+1)); }
+  [ -f /etc/udev/rules.d/60-io-scheduler.rules ]            || { warn "io scheduler rules missing";     errors=$((errors+1)); }
+  [ -f /etc/networkd-dispatcher/routable.d/50-nic-tune.sh ] || { warn "nic-tune script missing";        errors=$((errors+1)); }
+  [ -f /etc/systemd/system/x-ui.service.d/override.conf ]   || { warn "x-ui override missing";          errors=$((errors+1)); }
+  grep -q '/swapfile' /etc/fstab                            || { warn "swapfile not in fstab";           errors=$((errors+1)); }
+  swapon --show | grep -q '/swapfile'                       || { warn "swapfile not active";             errors=$((errors+1)); }
+
+  _chk() {
+    local label="$1" result="$2" expected="$3"
+    if echo "$result" | grep -qF "$expected"; then
+      ok "  ${label}: ${result}"
+    else
+      warn "  ${label}: got='${result}' expected~='${expected}'"
+      errors=$((errors+1))
+    fi
+  }
+  _chk "BBR CC"               "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"   "bbr"
+  _chk "FQ qdisc"             "$(tc qdisc show dev "$NIC" 2>/dev/null | head -1)"           "fq"
+  _chk "THP"                  "$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)" "never"
+  _chk "x-ui active"          "$(systemctl is-active x-ui 2>/dev/null)"                    "active"
+  _chk "ip_forward"           "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"               "1"
+  _chk "slow_start_after_idle" "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null)" "0"
+  _chk "watchdog active"      "$(systemctl is-active xui-watchdog.service 2>/dev/null)"    "active"
+  _chk "perf-snap timer"      "$(systemctl is-active xui-perf-snap.timer 2>/dev/null)"     "active"
+
+  local xui_pid rss_mb
+  xui_pid=$(pgrep -x x-ui 2>/dev/null | head -1 || echo "")
+  rss_mb=0
+  [ -n "$xui_pid" ] && rss_mb=$(awk '/^VmRSS/ {print int($2/1024)}' /proc/"$xui_pid"/status 2>/dev/null || echo 0)
+  info "x-ui RSS live  : ${rss_mb}MB"
+  info "RAM avail      : $(free -m | awk '/^Mem:/ {print $7}')MB"
+  info "Established    : $(ss -s 2>/dev/null | awk '/estab/ {print $4}' | tr -d ',' || echo '?') connections"
+  info "Kernel HZ      : $(grep CONFIG_HZ= /boot/config-$(uname -r) 2>/dev/null | head -1 || echo unknown)"
+  info "Kernel PREEMPT : $(grep ^CONFIG_PREEMPT /boot/config-$(uname -r) 2>/dev/null | head -1 || echo unknown)"
+
+  echo ""
   if [ "$errors" -eq 0 ]; then
-    ok "all persist checks passed — safe to reboot"
+    ok "ALL checks passed — system fully tuned — safe to reboot"
   else
-    warn "${errors} issue(s) found — review above before reboot"
+    warn "${errors} issue(s) found — review above"
     return 1
   fi
 }
-run_always "step15_verify" _step15
+run_always "step23_verify" _step23
 
 hdr "DONE — FULL SUMMARY"
 PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
@@ -717,86 +1124,36 @@ done < "$STATE_FILE"
 
 echo ""
 echo -e "  ══════════════════════════════════════════════════════════"
-echo -e "  ${BLD}Panel URL            :${RST} http://${PUB_IP}:${PANEL_PORT}"
+echo -e "  ${BLD}Panel URL       :${RST} http://${PUB_IP}:${PANEL_PORT}"
 echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}Protocol             :${RST} VMESS WebSocket port 80 None TLS"
-echo -e "  ${BLD}Host header          :${RST} speedtest.net"
-echo -e "  ${BLD}NIC                  :${RST} ${NIC} virtio_net MTU ${EFFECTIVE_MTU}"
-echo -e "  ${BLD}BASE_MSS             :${RST} ${BASE_MSS} bytes"
+echo -e "  ${BLD}Protocol        :${RST} VMESS WebSocket port 80 None TLS"
+echo -e "  ${BLD}Host header     :${RST} speedtest.net"
+echo -e "  ${BLD}Path            :${RST} /VMESS"
+echo -e "  ${BLD}AlterID         :${RST} 0"
+echo -e "  ${BLD}Sniffing        :${RST} ปิดทั้งหมด"
+echo -e "  ${BLD}tcpMaxSeg       :${RST} 1440"
+echo -e "  ${BLD}tcpNoDelay      :${RST} true"
+echo -e "  ${BLD}tcpFastOpen     :${RST} true"
+echo -e "  ${BLD}tcpKeepAliveIdle:${RST} 35"
+echo -e "  ${BLD}tcpUserTimeout  :${RST} 30000"
+echo -e "  ${BLD}tcpcongestion   :${RST} bbr"
 echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}rmem/wmem default    :${RST} $((RMEM_DEFAULT/1024/1024))MB adaptive"
-echo -e "  ${BLD}rmem/wmem max        :${RST} 2GB (kernel-managed)"
-echo -e "  ${BLD}notsent_lowat        :${RST} $((NOTSENT_LOWAT/1024))KB (queue depth control)"
-echo -e "  ${BLD}limit_output         :${RST} $((LIMIT_OUTPUT/1024))KB"
-echo -e "  ${BLD}fq quantum           :${RST} ${TC_QUANTUM} bytes (2xMSS)"
-echo -e "  ${BLD}fq limit             :${RST} 10000 packets"
-echo -e "  ${BLD}txqueuelen           :${RST} 10000"
-echo -e "  ${BLD}coalescing           :${RST} rx-usecs=50 tx-usecs=50 adaptive=on"
-echo -e "  ${BLD}busy_poll/read       :${RST} ${BUSY_POLL}us"
-echo -e "  ${BLD}netdev_budget        :${RST} 1200 pkts / 8000us"
-echo -e "  ${BLD}RPS/RFS entries      :${RST} 32768"
+echo -e "  ${BLD}BBR             :${RST} $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
+echo -e "  ${BLD}Qdisc           :${RST} $(tc qdisc show dev "$NIC" 2>/dev/null | head -1 || echo N/A)"
+echo -e "  ${BLD}THP             :${RST} $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo N/A)"
+echo -e "  ${BLD}CPU governor    :${RST} $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo N/A)"
+echo -e "  ${BLD}x-ui status     :${RST} $(systemctl is-active x-ui 2>/dev/null || echo N/A)"
 echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}GOMAXPROCS           :${RST} ${VCPU}"
-echo -e "  ${BLD}GOGC                 :${RST} 100 (balanced GC)"
-echo -e "  ${BLD}GOMEMLIMIT           :${RST} 1600MiB"
-echo -e "  ${BLD}GODEBUG              :${RST} madvdontneed=1 asyncpreemptoff=0"
-echo -e "  ${BLD}Nice x-ui            :${RST} -20"
-echo -e "  ${BLD}ionice x-ui          :${RST} realtime class 1 prio 0"
-echo -e "  ${BLD}OOMScore x-ui        :${RST} -1000 (unkillable)"
-echo -e "  ${BLD}CPUWeight            :${RST} 10000 (max)"
-echo -e "  ${BLD}IOWeight             :${RST} 10000 (max)"
-echo -e "  ${BLD}TasksMax             :${RST} infinity"
-echo -e "  ${BLD}x-ui MemHigh         :${RST} $((XUI_MEM_HIGH/1024/1024))MB"
-echo -e "  ${BLD}x-ui MemMax          :${RST} $((XUI_MEM_MAX/1024/1024))MB"
-echo -e "  ${BLD}Swap                 :${RST} ${SWAP_SIZE_MB}MB"
-echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}tcp_reordering       :${RST} 6"
-echo -e "  ${BLD}tcp_no_metrics_save  :${RST} 1 (BBR recalculates fresh)"
-echo -e "  ${BLD}tcp_fastopen         :${RST} 3 (client+server)"
-echo -e "  ${BLD}tcp_ecn              :${RST} 1"
-echo -e "  ${BLD}sched_latency_ns     :${RST} 4ms"
-echo -e "  ${BLD}sched_min_gran_ns    :${RST} 0.5ms"
-echo -e "  ${BLD}sched_wakeup_ns      :${RST} 0.05ms"
-echo -e "  ${BLD}sched_nr_migrate     :${RST} 8"
-echo -e "  ${BLD}sched_rt_runtime     :${RST} -1"
-echo -e "  ${BLD}timer_migration      :${RST} 0"
-echo -e "  ${BLD}nmi_watchdog         :${RST} 0"
-echo -e "  ${BLD}C-states             :${RST} disabled"
-echo -e "  ${BLD}THP                  :${RST} never"
-echo -e "  ${BLD}dirty_ratio          :${RST} 10% / 3%"
-echo -e "  ${BLD}fs.file-max          :${RST} 2097152"
-echo -e "  ${BLD}fs.pipe-max-size     :${RST} 1MB"
-echo -e "  ${BLD}keepalive            :${RST} ${KA_TIME}s / ${KA_INTVL}s x ${KA_PROBES}"
-echo -e "  ${BLD}fin_timeout          :${RST} ${FIN_TIMEOUT}s"
-echo -e "  ${BLD}tw_buckets           :${RST} ${TW_BUCKETS}"
-echo -e "  ${BLD}nr_requests          :${RST} 256"
-echo -e "  ${BLD}read_ahead_kb        :${RST} 128"
-echo -e "  ${BLD}wbt_lat_usec         :${RST} 0"
-echo -e "  ${BLD}BBR                  :${RST} $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}Qdisc                :${RST} $(tc qdisc show dev "$NIC" 2>/dev/null | head -1 || echo N/A)"
-echo -e "  ${BLD}THP                  :${RST} $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}CPU governor         :${RST} $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}x-ui status          :${RST} $(systemctl is-active x-ui 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}Log                  :${RST} ${LOG_FILE}"
+echo -e "  ${BLD}Perf log        :${RST} tail -f /var/log/xui-perf.log"
+echo -e "  ${BLD}Watchdog log    :${RST} journalctl -u xui-watchdog -f"
+echo -e "  ${BLD}Install log     :${RST} ${LOG_FILE}"
 echo -e "  ══════════════════════════════════════════════════════════"
 echo ""
-echo -e "  ${BLD}${GRN}Panel config:${RST}"
-echo -e "  Protocol         : VMESS"
-echo -e "  Port             : 80"
-echo -e "  Transport        : WebSocket"
-echo -e "  Path             : /VMESS"
-echo -e "  Host             : speedtest.net"
-echo -e "  Security         : none"
-echo -e "  AlterID          : 0"
-echo -e "  Sniffing         : ปิดทั้งหมด"
-echo -e "  tcpMaxSeg        : 1440"
-echo -e "  tcpNoDelay       : true"
-echo -e "  tcpFastOpen      : true"
-echo -e "  tcpKeepAliveIdle : 35"
-echo -e "  tcpUserTimeout   : 30000"
-echo -e "  tcpcongestion    : bbr"
-echo -e "  tcpWindowClamp   : 0"
+echo -e "  ${BLD}${YEL}→ สร้าง VMESS inbound ใน panel แล้วรัน script อีกครั้งเพื่อ patch sockopt${RST}"
+echo -e "  ${BLD}${YEL}→ reboot เพื่อ confirm ทุก setting persistent${RST}"
 echo ""
-echo -e "  ${BLD}${YEL}-> reboot แล้ว config VMESS WS ใน panel${RST}"
-echo -e "  ${BLD}${YEL}-> step13 patch sockopt อัตโนมัติถ้ามี inbound port 80 แล้ว${RST}"
-echo ""
+ENDOFSCRIPT
+
+chmod +x /mnt/user-data/outputs/xui-full-setup.sh
+wc -l /mnt/user-data/outputs/xui-full-setup.sh
+echo "done"
