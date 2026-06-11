@@ -1,4 +1,4 @@
-"cat > /mnt/user-data/outputs/install.sh << 'ENDOFSCRIPT'
+cat > /mnt/user-data/outputs/install.sh << 'ENDOFSCRIPT'
 #!/usr/bin/env bash
 set -uo pipefail
 export LANG=C
@@ -88,7 +88,6 @@ XUI_MEM_MAX=1879048192
 XUI_MEM_SWAP=536870912
 SWAP_SIZE_MB=512
 PANEL_PORT="${PANEL_PORT:-2053}"
-OPEN_PORTS=(22 443 "${PANEL_PORT}")
 
 _detect_nic() {
   local nic
@@ -107,12 +106,12 @@ RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
 
 echo ""
 echo -e "${BLD}${CYN}╔══════════════════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}${CYN}║  Bughost VPN Pole — VLESS REALITY SETUP v9.0             ║${RST}"
-echo -e "${BLD}${CYN}║  35 Steps · REALITY port 443 · Max Security              ║${RST}"
+echo -e "${BLD}${CYN}║  Bughost VPN Pole — VLESS REALITY SETUP v10.0            ║${RST}"
+echo -e "${BLD}${CYN}║  40 Steps · REALITY port 443 · Max Security              ║${RST}"
 echo -e "${BLD}${CYN}║  NIC: ${NIC}$(printf '%*s' $((51-${#NIC})) '')║${RST}"
 echo -e "${BLD}${CYN}╚══════════════════════════════════════════════════════════╝${RST}"
 echo ""
-info "RAM   : ${RAM_MB}MB  vCPU: ${VCPU}  NIC: ${NIC} MTU ${MTU_PHYSICAL}"
+info "RAM: ${RAM_MB}MB  vCPU: ${VCPU}  NIC: ${NIC} MTU ${MTU_PHYSICAL}"
 echo ""
 
 hdr "STEP 1 — UPDATE & DEPS"
@@ -138,10 +137,11 @@ _step1() {
     linux-tools-common linux-tools-generic nftables libcap2-bin \
     numactl schedtool fail2ban auditd aide rkhunter \
     apparmor apparmor-utils libpam-pwquality \
-    unattended-upgrades knockd python3 attr 2>/dev/null || \
+    unattended-upgrades knockd chrony logwatch \
+    python3 attr 2>/dev/null || \
   DEBIAN_FRONTEND=noninteractive apt-get install -y \
     curl ufw ethtool sqlite3 irqbalance iproute2 iputils-ping \
-    nftables libcap2-bin fail2ban auditd python3
+    nftables libcap2-bin fail2ban auditd python3 chrony
 }
 run_skip "step1_deps" _step1
 
@@ -169,7 +169,7 @@ _step3() {
   ufw default deny forward
   ufw limit 22/tcp
   ufw allow 443/tcp
-  ufw limit "${PANEL_PORT}/tcp"
+  ufw deny "${PANEL_PORT}/tcp"
   ufw deny 23/tcp
   ufw deny 25/tcp
   ufw deny 3389/tcp
@@ -483,7 +483,6 @@ _step9() {
   if [ -f /proc/sys/net/core/rps_sock_flow_entries ]; then
     echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
     echo 32768 > /sys/class/net/"${NIC}"/queues/rx-0/rps_flow_cnt 2>/dev/null || true
-    info "RPS/RFS: 32768 entries"
   fi
   mkdir -p /etc/networkd-dispatcher/routable.d
   cat > /etc/networkd-dispatcher/routable.d/50-nic-tune.sh << NEOF
@@ -509,10 +508,8 @@ tc qdisc add dev "\${NIC}" root handle 1: "\${QDISC}" \
 CPU_COUNT=\$(nproc 2>/dev/null || echo 1)
 RPS_MASK=\$(printf '%x' \$(( (1 << CPU_COUNT) - 1 )))
 echo "\${RPS_MASK}" > /sys/class/net/"\${NIC}"/queues/rx-0/rps_cpus 2>/dev/null || true
-if [ -f /proc/sys/net/core/rps_sock_flow_entries ]; then
-  echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
-  echo 32768 > /sys/class/net/"\${NIC}"/queues/rx-0/rps_flow_cnt 2>/dev/null || true
-fi
+[ -f /proc/sys/net/core/rps_sock_flow_entries ] && echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
+[ -f /sys/class/net/"\${NIC}"/queues/rx-0/rps_flow_cnt ] && echo 32768 > /sys/class/net/"\${NIC}"/queues/rx-0/rps_flow_cnt 2>/dev/null || true
 NEOF
   chmod +x /etc/networkd-dispatcher/routable.d/50-nic-tune.sh
   cat > /etc/systemd/system/nic-tune.service << SEOF
@@ -529,7 +526,6 @@ WantedBy=multi-user.target
 SEOF
   systemctl daemon-reload
   systemctl enable nic-tune.service
-  info "nic-tune.service enabled"
 }
 run_always "step9_nic" _step9
 
@@ -542,10 +538,8 @@ _step10() {
     rot=$(cat "/sys/block/${DEV}/queue/rotational" 2>/dev/null || echo "0")
     if [ "$rot" = "0" ]; then
       echo none        > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null || true
-      info "${DEV}: SSD/NVMe -> none"
     else
       echo mq-deadline > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null || true
-      info "${DEV}: HDD -> mq-deadline"
     fi
     echo 0   > "/sys/block/${DEV}/queue/add_random"    2>/dev/null || true
     echo 256 > "/sys/block/${DEV}/queue/nr_requests"   2>/dev/null || true
@@ -597,6 +591,8 @@ _step12() {
 *    hard nproc    131072
 *    soft memlock  unlimited
 *    hard memlock  unlimited
+*    soft core     0
+*    hard core     0
 *    soft stack    134217728
 *    hard stack    134217728
 root soft nofile   2097152
@@ -605,6 +601,8 @@ root soft nproc    131072
 root hard nproc    131072
 root soft memlock  unlimited
 root hard memlock  unlimited
+root soft core     0
+root hard core     0
 EOF
   local pam
   for pam in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
@@ -624,8 +622,6 @@ ONESHOT=0
 OPTIONS="--powerthresh=0 --deepestcache=1"
 EOF
     systemctl enable --now irqbalance 2>/dev/null || true
-  else
-    warn "irqbalance not installed"
   fi
 }
 run_always "step13_irq" _step13
@@ -646,8 +642,12 @@ ReadKMsg=no
 EOF
   systemctl restart systemd-journald
   if ! grep -q "tmpfs /tmp" /etc/fstab 2>/dev/null; then
-    echo "tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,size=256m 0 0" >> /etc/fstab
+    echo "tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,noexec,size=256m 0 0" >> /etc/fstab
     mount -o remount /tmp 2>/dev/null || true
+  fi
+  if ! grep -q "tmpfs /dev/shm" /etc/fstab 2>/dev/null; then
+    echo "tmpfs /dev/shm tmpfs defaults,noatime,nosuid,nodev,noexec,size=128m 0 0" >> /etc/fstab
+    mount -o remount /dev/shm 2>/dev/null || true
   fi
   cat > /etc/systemd/system/clear-tmp.service << 'EOF'
 [Unit]
@@ -663,7 +663,7 @@ WantedBy=sysinit.target
 EOF
   systemctl daemon-reload
   systemctl enable clear-tmp.service
-  info "journald volatile + tmpfs /tmp 256MB"
+  info "/tmp noexec,nosuid,nodev · /dev/shm noexec"
 }
 run_always "step14_journald_tmpfs" _step14
 
@@ -687,8 +687,27 @@ EOF
 }
 run_always "step15_dns" _step15
 
-hdr "STEP 16 — SSH HARDENING"
+hdr "STEP 16 — CHRONY TIME SYNC"
 _step16() {
+  command -v chronyc &>/dev/null || { warn "chrony not installed — skip"; return 0; }
+  cat > /etc/chrony/chrony.conf << 'EOF'
+pool time.cloudflare.com iburst maxsources 4
+pool ntp.ubuntu.com iburst maxsources 4
+driftfile /var/lib/chrony/chrony.drift
+makestep 1.0 3
+rtcsync
+logchange 0.5
+EOF
+  systemctl enable --now chrony 2>/dev/null || true
+  systemctl restart chrony 2>/dev/null || true
+  sleep 2
+  chronyc tracking 2>/dev/null | head -5 || true
+  info "chrony time sync active (required for REALITY TLS)"
+}
+run_always "step16_chrony" _step16
+
+hdr "STEP 17 — SSH HARDENING"
+_step17() {
   mkdir -p /etc/ssh/sshd_config.d
   cat > /etc/ssh/sshd_config.d/99-hardened.conf << 'EOF'
 Protocol 2
@@ -726,10 +745,10 @@ EOF
     warn "sshd config test failed — not reloading"
   fi
 }
-run_always "step16_ssh_harden" _step16
+run_always "step17_ssh_harden" _step17
 
-hdr "STEP 17 — FAIL2BAN"
-_step17() {
+hdr "STEP 18 — FAIL2BAN"
+_step18() {
   mkdir -p /etc/fail2ban/filter.d /etc/fail2ban/jail.d
   cat > /etc/fail2ban/filter.d/xui-panel.conf << 'EOF'
 [Definition]
@@ -762,12 +781,31 @@ bantime  = 3600
 EOF
   systemctl enable --now fail2ban
   systemctl restart fail2ban
-  info "fail2ban: SSH ban 24h/3fails · panel ban 1h/5fails"
+  info "fail2ban: SSH 24h ban / panel 1h ban"
 }
-run_always "step17_fail2ban" _step17
+run_always "step18_fail2ban" _step18
 
-hdr "STEP 18 — AUDITD"
-_step18() {
+hdr "STEP 19 — CROWDSEC"
+_step19() {
+  if ! command -v cscli &>/dev/null; then
+    curl -fsSL https://packagecloud.io/crowdsec/crowdsec/gpgkey \
+      | gpg --dearmor -o /usr/share/keyrings/crowdsec-archive-keyring.gpg 2>/dev/null || true
+    echo "deb [signed-by=/usr/share/keyrings/crowdsec-archive-keyring.gpg] https://packagecloud.io/crowdsec/crowdsec/ubuntu $(lsb_release -cs 2>/dev/null || echo jammy) main" \
+      > /etc/apt/sources.list.d/crowdsec.list 2>/dev/null || true
+    apt-get update -y 2>/dev/null || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y crowdsec 2>/dev/null \
+      || { warn "crowdsec install failed — skip"; return 0; }
+  fi
+  cscli collections install crowdsecurity/linux 2>/dev/null || true
+  cscli collections install crowdsecurity/sshd  2>/dev/null || true
+  systemctl enable --now crowdsec 2>/dev/null || true
+  systemctl restart crowdsec 2>/dev/null || true
+  info "CrowdSec: crowdsourced IP blocklist active"
+}
+run_always "step19_crowdsec" _step19
+
+hdr "STEP 20 — AUDITD"
+_step20() {
   cat > /etc/audit/rules.d/99-xui-security.rules << 'EOF'
 -D
 -b 8192
@@ -788,16 +826,15 @@ EOF
   augenrules --load 2>/dev/null || auditctl -R /etc/audit/rules.d/99-xui-security.rules 2>/dev/null || true
   systemctl enable --now auditd
   systemctl restart auditd 2>/dev/null || true
-  info "auditd syscall audit active"
 }
-run_always "step18_auditd" _step18
+run_always "step20_auditd" _step20
 
-hdr "STEP 19 — APPARMOR PROFILE"
-_step19() {
+hdr "STEP 21 — APPARMOR PROFILE"
+_step21() {
   command -v aa-status &>/dev/null || { warn "apparmor not available — skip"; return 0; }
   systemctl enable --now apparmor 2>/dev/null || true
   local xui_bin="/usr/local/x-ui/x-ui"
-  [ -x "$xui_bin" ] || { warn "x-ui binary not found — skip apparmor"; return 0; }
+  [ -x "$xui_bin" ] || { warn "x-ui binary not found — skip"; return 0; }
   cat > /etc/apparmor.d/usr.local.x-ui.x-ui << 'EOF'
 #include <tunables/global>
 /usr/local/x-ui/x-ui {
@@ -834,40 +871,99 @@ _step19() {
 }
 EOF
   apparmor_parser -r /etc/apparmor.d/usr.local.x-ui.x-ui 2>/dev/null \
-    && info "AppArmor profile loaded" \
-    || warn "AppArmor profile load failed (non-fatal)"
+    && info "AppArmor profile loaded" || warn "AppArmor profile load failed (non-fatal)"
 }
-run_always "step19_apparmor" _step19
+run_always "step21_apparmor" _step21
 
-hdr "STEP 20 — IMMUTABLE LOG FILES"
-_step20() {
+hdr "STEP 22 — IMMUTABLE LOGS"
+_step22() {
   local f
   for f in /var/lib/ais-reality-setup/install.log \
             /var/log/xui-watchdog.log \
-            /var/log/xui-perf.log; do
+            /var/log/xui-perf.log \
+            /var/log/auth.log; do
     touch "$f" 2>/dev/null || true
-    chattr +a "$f" 2>/dev/null && info "chattr +a ${f}" || warn "chattr +a failed on ${f} (non-fatal)"
+    chattr +a "$f" 2>/dev/null && info "chattr +a ${f}" || warn "chattr +a ${f} failed (non-fatal)"
   done
-  chattr +a /var/log/auth.log 2>/dev/null || true
-  info "log files set append-only (chattr +a)"
 }
-run_always "step20_immutable_logs" _step20
+run_always "step22_immutable_logs" _step22
 
-hdr "STEP 21 — RESTRICT /proc"
-_step21() {
+hdr "STEP 23 — RESTRICT /proc"
+_step23() {
   if ! grep -q "hidepid=2" /etc/fstab 2>/dev/null; then
     sed -i 's|^\(proc\s.*defaults\)|\1,hidepid=2,gid=0|' /etc/fstab 2>/dev/null || true
     mount -o remount,hidepid=2,gid=0 /proc 2>/dev/null \
-      && info "/proc remounted hidepid=2" \
-      || warn "/proc remount failed (non-fatal — applied after reboot)"
+      && info "/proc hidepid=2" \
+      || warn "/proc remount failed (applied after reboot)"
   else
     info "/proc hidepid=2 already set"
   fi
 }
-run_always "step21_proc_restrict" _step21
+run_always "step23_proc_restrict" _step23
 
-hdr "STEP 22 — PORT KNOCKING (panel port)"
-_step22() {
+hdr "STEP 24 — SECURE SHARED MEMORY"
+_step24() {
+  if ! grep -q "tmpfs /run/shm" /etc/fstab 2>/dev/null && \
+     ! grep -q "tmpfs /dev/shm" /etc/fstab 2>/dev/null; then
+    echo "tmpfs /dev/shm tmpfs defaults,noatime,nosuid,nodev,noexec,size=128m 0 0" >> /etc/fstab
+  fi
+  mount -o remount,noexec,nosuid,nodev /dev/shm 2>/dev/null \
+    && info "/dev/shm remounted noexec,nosuid,nodev" \
+    || warn "/dev/shm remount failed (applied after reboot)"
+}
+run_always "step24_secure_shm" _step24
+
+hdr "STEP 25 — REMOVE SUID FROM UNUSED BINARIES"
+_step25() {
+  local suid_list=(
+    /usr/bin/at
+    /usr/bin/newgrp
+    /usr/bin/chage
+    /usr/bin/expiry
+    /usr/bin/wall
+    /usr/bin/write
+    /usr/bin/sg
+    /sbin/unix_chkpwd
+    /usr/lib/openssh/ssh-keysign
+  )
+  local b
+  for b in "${suid_list[@]}"; do
+    [ -f "$b" ] || continue
+    chmod a-s "$b" 2>/dev/null && info "removed SUID: ${b}" || true
+  done
+  info "SUID cleanup done"
+}
+run_always "step25_suid_cleanup" _step25
+
+hdr "STEP 26 — RESTRICT CRON"
+_step26() {
+  echo root > /etc/cron.allow  2>/dev/null || true
+  echo root > /etc/at.allow    2>/dev/null || true
+  rm -f /etc/cron.deny /etc/at.deny 2>/dev/null || true
+  chmod 700 /etc/cron.d /etc/cron.daily /etc/cron.hourly \
+            /etc/cron.monthly /etc/cron.weekly 2>/dev/null || true
+  chmod 600 /etc/crontab 2>/dev/null || true
+  info "cron/at restricted to root only"
+}
+run_always "step26_cron_restrict" _step26
+
+hdr "STEP 27 — DISABLE CORE DUMPS"
+_step27() {
+  echo 'kernel.core_pattern=|/bin/false' > /etc/sysctl.d/99-no-coredump.conf
+  sysctl -p /etc/sysctl.d/99-no-coredump.conf 2>/dev/null || true
+  echo '* hard core 0' >> /etc/security/limits.d/99-xui.conf
+  mkdir -p /etc/systemd/coredump.conf.d
+  cat > /etc/systemd/coredump.conf.d/disable.conf << 'EOF'
+[Coredump]
+Storage=none
+ProcessSizeMax=0
+EOF
+  info "core dumps disabled"
+}
+run_always "step27_no_coredump" _step27
+
+hdr "STEP 28 — PORT KNOCKING (panel port)"
+_step28() {
   command -v knockd &>/dev/null || { warn "knockd not installed — skip"; return 0; }
   local K1 K2 K3
   K1=$(shuf -i 10000-60000 -n 1)
@@ -890,19 +986,15 @@ _step22() {
     command       = /usr/sbin/ufw delete allow from %IP% to any port ${PANEL_PORT}/tcp
     tcpflags      = syn
 EOF
-  ufw delete limit "${PANEL_PORT}/tcp" 2>/dev/null || true
-  ufw deny "${PANEL_PORT}/tcp" 2>/dev/null || true
-  ufw reload 2>/dev/null || true
   systemctl enable --now knockd 2>/dev/null || true
-  info "Port knocking sequence: ${K1} → ${K2} → ${K3}"
-  info "Knock cmd: knock <SERVER_IP> ${K1} ${K2} ${K3}"
+  info "Port knocking: ${K1} → ${K2} → ${K3}"
   echo "KNOCK_SEQUENCE=${K1}:${K2}:${K3}" >> "${STATE_DIR}/config.txt"
   chmod 600 "${STATE_DIR}/config.txt"
 }
-run_always "step22_knockd" _step22
+run_always "step28_knockd" _step28
 
-hdr "STEP 23 — AUTO SECURITY UPDATES"
-_step23() {
+hdr "STEP 29 — AUTO SECURITY UPDATES"
+_step29() {
   cat > /etc/apt/apt.conf.d/50unattended-upgrades-security << 'EOF'
 Unattended-Upgrade::Allowed-Origins {
   "${distro_id}:${distro_codename}-security";
@@ -919,12 +1011,11 @@ APT::Periodic::Unattended-Upgrade "1";
 APT::Periodic::AutocleanInterval "7";
 EOF
   systemctl enable --now unattended-upgrades
-  info "auto security updates enabled"
 }
-run_always "step23_autoupdate" _step23
+run_always "step29_autoupdate" _step29
 
-hdr "STEP 24 — RKHUNTER"
-_step24() {
+hdr "STEP 30 — RKHUNTER"
+_step30() {
   command -v rkhunter &>/dev/null || { warn "rkhunter not installed — skip"; return 0; }
   rkhunter --update --nocolors 2>/dev/null || true
   rkhunter --propupd --nocolors 2>/dev/null || true
@@ -949,12 +1040,11 @@ WantedBy=timers.target
 EOF
   systemctl daemon-reload
   systemctl enable --now rkhunter-scan.timer
-  info "rkhunter daily scan scheduled"
 }
-run_always "step24_rkhunter" _step24
+run_always "step30_rkhunter" _step30
 
-hdr "STEP 25 — AIDE FILE INTEGRITY"
-_step25() {
+hdr "STEP 31 — AIDE FILE INTEGRITY"
+_step31() {
   command -v aide &>/dev/null || { warn "aide not installed — skip"; return 0; }
   cat > /etc/aide/aide.conf.d/99-xui.conf << 'EOF'
 /usr/local/x-ui/x-ui        f+sha512
@@ -988,15 +1078,15 @@ WantedBy=timers.target
 EOF
   systemctl daemon-reload
   systemctl enable --now aide-check.timer
-  info "AIDE file integrity baseline + daily check enabled"
+  info "AIDE baseline + daily check enabled"
 }
-run_always "step25_aide" _step25
+run_always "step31_aide" _step31
 
-hdr "STEP 26 — x-ui SYSTEMD OVERRIDE (hardened)"
-_step26() {
+hdr "STEP 32 — x-ui SYSTEMD OVERRIDE"
+_step32() {
   local xui_bin
   xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
-  [ -x "$xui_bin" ] || { warn "x-ui binary not found — skipping override"; return 0; }
+  [ -x "$xui_bin" ] || { warn "x-ui binary not found — skipping"; return 0; }
   local xui_pid rss_mb gogc_val gomemlimit_val ram_avail_mb
   xui_pid=$(pgrep -x x-ui 2>/dev/null | head -1 || true)
   rss_mb=70
@@ -1007,7 +1097,7 @@ _step26() {
   if [ "$rss_mb" -lt 100 ]; then gogc_val=150
   elif [ "$rss_mb" -lt 200 ]; then gogc_val=100
   else gogc_val=50; fi
-  info "GOGC=${gogc_val} GOMEMLIMIT=${gomemlimit_val}MiB (RSS=${rss_mb}MB)"
+  info "GOGC=${gogc_val} GOMEMLIMIT=${gomemlimit_val}MiB"
   mkdir -p /etc/systemd/system/x-ui.service.d
   cat > /etc/systemd/system/x-ui.service.d/override.conf << EOF
 [Service]
@@ -1055,10 +1145,10 @@ EOF
   wait_active x-ui 30 || warn "x-ui not active after override"
   systemctl status x-ui --no-pager
 }
-run_always "step26_xui_override" _step26
+run_always "step32_xui_override" _step32
 
-hdr "STEP 27 — x-ui CAPABILITIES"
-_step27() {
+hdr "STEP 33 — x-ui CAPABILITIES"
+_step33() {
   local xui_bin
   xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
   if [ -x "$xui_bin" ]; then
@@ -1069,13 +1159,13 @@ _step27() {
   xui_xray=$(find /usr/local/x-ui /root/.x-ui -name "xray" -type f 2>/dev/null | head -1 || true)
   if [ -n "$xui_xray" ] && [ -x "$xui_xray" ]; then
     setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw,cap_ipc_lock+eip' "$xui_xray" 2>/dev/null \
-      && info "xray capabilities set: ${xui_xray}" || true
+      && info "xray capabilities set" || true
   fi
 }
-run_always "step27_capabilities" _step27
+run_always "step33_capabilities" _step33
 
-hdr "STEP 28 — IONICE + PROCESS PRIORITY"
-_step28() {
+hdr "STEP 34 — IONICE + PRIORITY"
+_step34() {
   local xui_pid
   xui_pid=$(pgrep -x x-ui 2>/dev/null | head -1 || true)
   if [ -n "$xui_pid" ]; then
@@ -1083,7 +1173,6 @@ _step28() {
     ionice  -c 1 -n 0 -p "$xui_pid" 2>/dev/null || true
     chrt    -b -p 1   "$xui_pid"    2>/dev/null || true
     taskset -cp 0     "$xui_pid"    2>/dev/null || true
-    info "x-ui pid=${xui_pid}: nice=-20 ionice=rt:0 chrt=batch cpu0"
   fi
   cat > /etc/systemd/system/xui-ionice.service << 'EOF'
 [Unit]
@@ -1100,13 +1189,13 @@ EOF
   systemctl daemon-reload
   systemctl enable --now xui-ionice.service 2>/dev/null || true
 }
-run_always "step28_ionice" _step28
+run_always "step34_ionice" _step34
 
-hdr "STEP 29 — SQLite WAL + OPTIMIZE"
-_step29() {
+hdr "STEP 35 — SQLite WAL"
+_step35() {
   local db="/etc/x-ui/x-ui.db"
   [ -f "$db" ] || { warn "x-ui.db not found — skip"; return 0; }
-  command -v sqlite3 &>/dev/null || { warn "sqlite3 not found"; return 1; }
+  command -v sqlite3 &>/dev/null || return 1
   sqlite3 "$db" "PRAGMA journal_mode=WAL;"       2>/dev/null || true
   sqlite3 "$db" "PRAGMA synchronous=NORMAL;"      2>/dev/null || true
   sqlite3 "$db" "PRAGMA cache_size=-65536;"       2>/dev/null || true
@@ -1115,8 +1204,6 @@ _step29() {
   sqlite3 "$db" "PRAGMA wal_autocheckpoint=1000;" 2>/dev/null || true
   sqlite3 "$db" "VACUUM;"                         2>/dev/null || true
   sqlite3 "$db" "ANALYZE;"                        2>/dev/null || true
-  local jm; jm=$(sqlite3 "$db" "PRAGMA journal_mode;" 2>/dev/null || echo "unknown")
-  info "SQLite journal_mode=${jm}"
   cat > /etc/systemd/system/xui-db-wal.service << EOF
 [Unit]
 Description=x-ui SQLite WAL checkpoint
@@ -1137,10 +1224,10 @@ EOF
   systemctl daemon-reload
   systemctl enable --now xui-db-wal.timer
 }
-run_always "step29_sqlite_wal" _step29
+run_always "step35_sqlite_wal" _step35
 
-hdr "STEP 30 — XRAY LOG DISABLE"
-_step30() {
+hdr "STEP 36 — XRAY LOG DISABLE"
+_step36() {
   local db="/etc/x-ui/x-ui.db"
   [ -f "$db" ] || { warn "x-ui.db not found — skip"; return 0; }
   local template new_template
@@ -1159,13 +1246,13 @@ print(json.dumps(d, separators=(',',':')))
   fi
   systemctl restart x-ui 2>/dev/null || true
 }
-run_always "step30_xray_nolog" _step30
+run_always "step36_xray_nolog" _step36
 
-hdr "STEP 31 — SOCKOPT PATCH (VLESS REALITY port 443)"
-_step31() {
+hdr "STEP 37 — SOCKOPT PATCH (VLESS REALITY port 443)"
+_step37() {
   local db="/etc/x-ui/x-ui.db"
   [ -f "$db" ] || { warn "x-ui.db not found — create inbound first then re-run"; return 0; }
-  command -v sqlite3 &>/dev/null || { warn "sqlite3 not found"; return 1; }
+  command -v sqlite3 &>/dev/null || return 1
   local sockopt
   sockopt='{"acceptProxyProtocol":false,"tcpFastOpen":true,"mark":0,"tproxy":"off","tcpMptcp":false,"penetrate":false,"domainStrategy":"AsIs","tcpMaxSeg":1440,"dialerProxy":"","tcpKeepAliveInterval":35,"tcpKeepAliveIdle":35,"tcpUserTimeout":30000,"tcpcongestion":"bbr","V6Only":false,"tcpWindowClamp":0,"interface":"","trustedXForwardedFor":[],"addressPortStrategy":"none","customSockopt":[],"tcpNoDelay":true}'
   local count
@@ -1184,8 +1271,6 @@ print(json.dumps(d, separators=(',',':')))
         local esc="${new_stream//\'/\'\'}"
         sqlite3 "$db" "UPDATE inbounds SET stream_settings='${esc}' WHERE port=443 AND protocol='vless';"
         info "sockopt patched on vless port 443"
-      else
-        warn "python3 parse failed — sockopt not patched"
       fi
     fi
   else
@@ -1194,10 +1279,10 @@ print(json.dumps(d, separators=(',',':')))
   fi
   systemctl restart x-ui 2>/dev/null || true
 }
-run_always "step31_sockopt" _step31
+run_always "step37_sockopt" _step37
 
-hdr "STEP 32 — WATCHDOG"
-_step32() {
+hdr "STEP 38 — WATCHDOG"
+_step38() {
   cat > /usr/local/bin/xui-watchdog.sh << 'WEOF'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -1221,7 +1306,7 @@ while true; do
   fi
   AVAIL_MB=$(free -m | awk '/^Mem:/ {print $7}')
   if [ "$AVAIL_MB" -lt 50 ]; then
-    echo "$(ts) [WARN] RAM=${AVAIL_MB}MB — drop caches" >> "$LOG"
+    echo "$(ts) [WARN] RAM low — drop caches" >> "$LOG"
     sync; echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
   fi
 done
@@ -1243,10 +1328,10 @@ EOF
   systemctl daemon-reload
   systemctl enable --now xui-watchdog.service
 }
-run_always "step32_watchdog" _step32
+run_always "step38_watchdog" _step38
 
-hdr "STEP 33 — PERF SNAPSHOT"
-_step33() {
+hdr "STEP 39 — PERF SNAPSHOT + DB BACKUP"
+_step39() {
   cat > /usr/local/bin/xui-perf-snap.sh << 'PEOF'
 #!/usr/bin/env bash
 set -uo pipefail
@@ -1285,13 +1370,7 @@ AccuracySec=10s
 [Install]
 WantedBy=timers.target
 EOF
-  systemctl daemon-reload
-  systemctl enable --now xui-perf-snap.timer
-}
-run_always "step33_perf_snap" _step33
 
-hdr "STEP 34 — DB BACKUP (daily)"
-_step34() {
   local db="/etc/x-ui/x-ui.db"
   local backup_dir="/var/lib/ais-reality-setup/backups"
   mkdir -p "$backup_dir"
@@ -1303,7 +1382,8 @@ DB="${db}"
 BACKUP_DIR="${backup_dir}"
 [ -f "\$DB" ] || exit 0
 TS=\$(date '+%Y%m%d_%H%M%S')
-sqlite3 "\$DB" ".backup \${BACKUP_DIR}/x-ui_\${TS}.db" 2>/dev/null || cp "\$DB" "\${BACKUP_DIR}/x-ui_\${TS}.db"
+sqlite3 "\$DB" ".backup \${BACKUP_DIR}/x-ui_\${TS}.db" 2>/dev/null \
+  || cp "\$DB" "\${BACKUP_DIR}/x-ui_\${TS}.db"
 chmod 600 "\${BACKUP_DIR}/x-ui_\${TS}.db"
 find "\$BACKUP_DIR" -name "x-ui_*.db" -mtime +7 -delete 2>/dev/null || true
 BEOF
@@ -1326,14 +1406,15 @@ Persistent=true
 WantedBy=timers.target
 EOF
   systemctl daemon-reload
+  systemctl enable --now xui-perf-snap.timer
   systemctl enable --now xui-db-backup.timer
   /usr/local/bin/xui-db-backup.sh 2>/dev/null || true
-  info "DB backup: ${backup_dir} · 7-day retention"
+  info "perf snap + DB backup (7-day retention) enabled"
 }
-run_always "step34_db_backup" _step34
+run_always "step39_perf_backup" _step39
 
-hdr "STEP 35 — VERIFY"
-_step35() {
+hdr "STEP 40 — VERIFY"
+_step40() {
   local errors=0
   _chk_svc() {
     systemctl is-enabled "$1" &>/dev/null \
@@ -1371,15 +1452,16 @@ _step35() {
   _chk_val "BBR"            "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" "bbr"
   _chk_val "FQ qdisc"       "$(tc qdisc show dev "$NIC" 2>/dev/null | head -1)"         "fq"
   _chk_val "THP"            "$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)" "never"
-  _chk_val "x-ui"           "$(systemctl is-active x-ui 2>/dev/null)"                  "active"
-  _chk_val "ip_forward"     "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"              "1"
+  _chk_val "x-ui"           "$(systemctl is-active x-ui 2>/dev/null)"                   "active"
+  _chk_val "ip_forward"     "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"               "1"
   _chk_val "slow_start"     "$(sysctl -n net.ipv4.tcp_slow_start_after_idle 2>/dev/null)" "0"
-  _chk_val "watchdog"       "$(systemctl is-active xui-watchdog.service 2>/dev/null)"   "active"
-  _chk_val "fail2ban"       "$(systemctl is-active fail2ban 2>/dev/null)"               "active"
-  _chk_val "auditd"         "$(systemctl is-active auditd 2>/dev/null)"                 "active"
-  _chk_val "kptr_restrict"  "$(sysctl -n kernel.kptr_restrict 2>/dev/null)"             "2"
-  _chk_val "bpf_jit_harden" "$(sysctl -n net.core.bpf_jit_harden 2>/dev/null)"         "2"
-  _chk_val "ptrace_scope"   "$(sysctl -n kernel.yama.ptrace_scope 2>/dev/null)"         "2"
+  _chk_val "watchdog"       "$(systemctl is-active xui-watchdog.service 2>/dev/null)"    "active"
+  _chk_val "fail2ban"       "$(systemctl is-active fail2ban 2>/dev/null)"                "active"
+  _chk_val "auditd"         "$(systemctl is-active auditd 2>/dev/null)"                  "active"
+  _chk_val "kptr_restrict"  "$(sysctl -n kernel.kptr_restrict 2>/dev/null)"              "2"
+  _chk_val "bpf_jit_harden" "$(sysctl -n net.core.bpf_jit_harden 2>/dev/null)"          "2"
+  _chk_val "ptrace_scope"   "$(sysctl -n kernel.yama.ptrace_scope 2>/dev/null)"          "2"
+  _chk_val "suid_dumpable"  "$(sysctl -n fs.suid_dumpable 2>/dev/null)"                  "0"
   local xui_pid rss_mb
   xui_pid=$(pgrep -x x-ui 2>/dev/null | head -1 || true)
   rss_mb=0
@@ -1388,56 +1470,58 @@ _step35() {
   info "RAM avail   : $(free -m | awk '/^Mem:/ {print $7}')MB"
   info "Established : $(ss -s 2>/dev/null | awk '/estab/ {print $4}' | tr -d ',' || echo '?')"
   info "Kernel      : $(uname -r)"
+  info "Time sync   : $(chronyc tracking 2>/dev/null | grep 'System time' | head -1 || echo 'n/a')"
   echo ""
   if [ "$errors" -eq 0 ]; then
     ok "ALL checks passed — safe to reboot"
   else
-    warn "${errors} issue(s) found — review above"
+    warn "${errors} issue(s) found"
     return 1
   fi
 }
-run_always "step35_verify" _step35
+run_always "step40_verify" _step40
 
 hdr "DONE"
 PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
   || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
+
+KNOCK=""
+[ -f "${STATE_DIR}/config.txt" ] && KNOCK=$(grep KNOCK_SEQUENCE "${STATE_DIR}/config.txt" 2>/dev/null | cut -d= -f2 || true)
 
 echo ""
 echo -e "${BLD}${GRN}  Steps completed:${RST}"
 while IFS= read -r line; do
   [ -n "$line" ] && echo -e "    ${GRN}✔${RST}  ${line}"
 done < "$STATE_FILE"
-
-KNOCK=""
-[ -f "${STATE_DIR}/config.txt" ] && KNOCK=$(grep KNOCK_SEQUENCE "${STATE_DIR}/config.txt" 2>/dev/null | cut -d= -f2 || true)
-
 echo ""
 echo -e "  ══════════════════════════════════════════════════════════"
-echo -e "  ${BLD}Panel URL    :${RST} https://${PUB_IP}:${PANEL_PORT}/"
-[ -n "$KNOCK" ] && echo -e "  ${BLD}${RED}Panel locked by port knock — unlock first:${RST}"
-[ -n "$KNOCK" ] && echo -e "  ${BLD}${YEL}  knock ${PUB_IP} $(echo "$KNOCK" | tr ':' ' ')${RST}"
+echo -e "  ${BLD}Panel        :${RST} https://${PUB_IP}:${PANEL_PORT}/"
+[ -n "$KNOCK" ] && echo -e "  ${BLD}${RED}Panel locked — unlock:${RST} knock ${PUB_IP} $(echo "$KNOCK" | tr ':' ' ')"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Protocol     :${RST} VLESS  Port: 443  Network: TCP (raw)"
-echo -e "  ${BLD}Security     :${RST} Reality"
-echo -e "  ${BLD}Flow         :${RST} xtls-rprx-vision"
-echo -e "  ${BLD}SNI          :${RST} speedtest.net"
-echo -e "  ${BLD}Fingerprint  :${RST} chrome"
-echo -e "  ${BLD}SpiderX      :${RST} /"
+echo -e "  ${BLD}Security     :${RST} Reality · flow: xtls-rprx-vision"
+echo -e "  ${BLD}SNI          :${RST} speedtest.net · fingerprint: chrome"
 echo -e "  ${BLD}Sniffing     :${RST} ปิดทั้งหมด"
 echo -e "  ──────────────────────────────────────────────────────────"
+echo -e "  ${BLD}Security layers active:${RST}"
+echo -e "    Kernel hardening · AppArmor · Fail2ban · CrowdSec"
+echo -e "    Auditd · AIDE · rkhunter · Port knocking"
+echo -e "    SSH publickey-only · SUID cleanup · /proc hidepid=2"
+echo -e "    /tmp noexec · /dev/shm noexec · core dumps disabled"
+echo -e "    Auto security updates · Time sync (chrony)"
+echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}BBR          :${RST} $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}THP          :${RST} $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo N/A)"
 echo -e "  ${BLD}x-ui         :${RST} $(systemctl is-active x-ui 2>/dev/null || echo N/A)"
 echo -e "  ${BLD}fail2ban     :${RST} $(systemctl is-active fail2ban 2>/dev/null || echo N/A)"
+echo -e "  ${BLD}CrowdSec     :${RST} $(systemctl is-active crowdsec 2>/dev/null || echo N/A)"
 echo -e "  ${BLD}auditd       :${RST} $(systemctl is-active auditd 2>/dev/null || echo N/A)"
 echo -e "  ${BLD}AppArmor     :${RST} $(systemctl is-active apparmor 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}kptr_restrict:${RST} $(sysctl -n kernel.kptr_restrict 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}ptrace_scope :${RST} $(sysctl -n kernel.yama.ptrace_scope 2>/dev/null || echo N/A)"
+echo -e "  ${BLD}chrony       :${RST} $(systemctl is-active chrony 2>/dev/null || echo N/A)"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Perf log     :${RST} tail -f /var/log/xui-perf.log"
-echo -e "  ${BLD}Watchdog     :${RST} journalctl -u xui-watchdog -f"
 echo -e "  ${BLD}Audit        :${RST} ausearch -k xui_exec"
 echo -e "  ${BLD}Fail2ban     :${RST} fail2ban-client status sshd"
+echo -e "  ${BLD}CrowdSec     :${RST} cscli decisions list"
 echo -e "  ${BLD}DB backup    :${RST} /var/lib/ais-reality-setup/backups/"
 echo -e "  ${BLD}Install log  :${RST} ${LOG_FILE}"
 echo -e "  ══════════════════════════════════════════════════════════"
