@@ -204,10 +204,13 @@ grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
 QDISC="fq"
 modinfo sch_fq &>/dev/null || { warn "fq ไม่มี — ใช้ fq_codel"; QDISC="fq_codel"; }
 
-RMEM_MAX=2147483647
-WMEM_MAX=2147483647
-RMEM_DEF=4194304
-WMEM_DEF=4194304
+# ── ค่าบัฟเฟอร์: คำนวณให้พอดีกับ RAM 2GB / 1vCPU 2.69GHz ────────────
+# max 32MB ต่อ socket (เพดานสูงพอสำหรับ throughput เต็มสปีด แต่ไม่กิน RAM
+# จนเหลือไม่พอให้ x-ui/xray/ระบบ แม้เปิดหลาย connection พร้อมกัน)
+RMEM_MAX=33554432
+WMEM_MAX=33554432
+RMEM_DEF=2097152
+WMEM_DEF=2097152
 
 cat > /etc/sysctl.d/99-vless-perf.conf << EOF
 # ── BBR + FQ ──────────────────────────────────────────────────────
@@ -221,9 +224,14 @@ net.core.rmem_default                  = ${RMEM_DEF}
 net.core.wmem_default                  = ${WMEM_DEF}
 net.ipv4.tcp_rmem                      = 4096 ${RMEM_DEF} ${RMEM_MAX}
 net.ipv4.tcp_wmem                      = 4096 ${WMEM_DEF} ${WMEM_MAX}
-net.ipv4.tcp_mem                       = 786432 1048576 1572864
+net.ipv4.tcp_mem                       = 65536 131072 196608
 net.ipv4.tcp_moderate_rcvbuf           = 1
 net.ipv4.tcp_adv_win_scale             = 1
+
+# ── Loss recovery / re-ordering (ฟรี ไม่กิน CPU เพิ่ม) ─────────────
+net.ipv4.tcp_reordering                = 6
+net.ipv4.tcp_frto                      = 2
+net.ipv4.tcp_recovery                  = 1
 
 # ── TCP Fast ──────────────────────────────────────────────────────
 net.ipv4.tcp_fastopen                  = 3
@@ -239,9 +247,6 @@ net.ipv4.tcp_autocorking               = 0
 net.ipv4.tcp_thin_linear_timeouts      = 1
 net.ipv4.tcp_early_retrans             = 3
 net.ipv4.tcp_no_metrics_save           = 1
-net.ipv4.tcp_reordering                = 6
-net.ipv4.tcp_frto                      = 2
-net.ipv4.tcp_recovery                  = 1
 
 # ── Keepalive / Timeout ───────────────────────────────────────────
 net.ipv4.tcp_keepalive_time            = 35
@@ -255,12 +260,17 @@ net.ipv4.tcp_orphan_retries            = 2
 net.ipv4.tcp_max_orphans               = 32768
 
 # ── Queue / Backlog ───────────────────────────────────────────────
-net.core.somaxconn                     = 65535
-net.ipv4.tcp_max_syn_backlog           = 65535
-net.core.netdev_max_backlog            = 65536
-net.core.netdev_budget                 = 1200
-net.core.netdev_budget_usecs           = 8000
+net.core.somaxconn                     = 32768
+net.ipv4.tcp_max_syn_backlog           = 32768
+net.core.netdev_max_backlog            = 16384
+net.core.netdev_budget                 = 600
+net.core.netdev_budget_usecs           = 4000
 net.ipv4.ip_local_port_range           = 1024 65535
+
+# ── Busy poll: ลด latency เพิ่มอีกนิด (50us, เบาพอสำหรับ 1vCPU 2.69GHz
+#    กับผู้ใช้ 2 คน — ถ้า CPU สูงผิดปกติให้ลบ 2 บรรทัดนี้ทิ้ง) ──────
+net.core.busy_poll                     = 50
+net.core.busy_read                     = 50
 
 # ── TIME_WAIT ─────────────────────────────────────────────────────
 net.ipv4.tcp_tw_reuse                  = 1
@@ -283,50 +293,34 @@ vm.dirty_ratio                         = 10
 vm.dirty_background_ratio              = 3
 vm.dirty_expire_centisecs              = 500
 vm.dirty_writeback_centisecs           = 100
-vm.min_free_kbytes                     = 131072
+vm.min_free_kbytes                     = 65536
 vm.vfs_cache_pressure                  = 50
 vm.overcommit_memory                   = 1
 
 # ── File descriptors ──────────────────────────────────────────────
-fs.file-max                            = 2097152
-fs.nr_open                             = 2097152
-
-# ── Busy Poll (ลด latency NIC) ────────────────────────────────────
-net.core.busy_poll                     = 50
-net.core.busy_read                     = 50
+fs.file-max                            = 1048576
+fs.nr_open                             = 1048576
 EOF
 
 sysctl -p /etc/sysctl.d/99-vless-perf.conf
 ok "TCP/network tune เสร็จ"
 
-# ── 3.2 Conntrack ───────────────────────────────────────────────────
+# ── 3.2 Conntrack (เผื่อ connection พร้อมกันได้มาก แต่ยังเบากับ kernel) ─
 info "3.2 ตั้ง nf_conntrack..."
-echo 131072 > /proc/sys/net/netfilter/nf_conntrack_max                     2>/dev/null || true
-echo 0       > /proc/sys/net/netfilter/nf_conntrack_checksum                2>/dev/null || true
-echo 600     > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 2>/dev/null || true
-echo 20      > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait   2>/dev/null || true
-echo 10      > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait    2>/dev/null || true
-echo 1       > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal          2>/dev/null || true
-echo 32768   > /sys/module/nf_conntrack/parameters/hashsize                 2>/dev/null || true
+echo 131072 > /proc/sys/net/netfilter/nf_conntrack_max                      2>/dev/null || true
+echo 600    > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established  2>/dev/null || true
+echo 1      > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal           2>/dev/null || true
 cat >> /etc/sysctl.d/99-vless-perf.conf << 'EOF2'
 net.netfilter.nf_conntrack_max                     = 131072
-net.netfilter.nf_conntrack_checksum                = 0
 net.netfilter.nf_conntrack_tcp_timeout_established = 600
-net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 20
-net.netfilter.nf_conntrack_tcp_timeout_fin_wait    = 10
 net.netfilter.nf_conntrack_tcp_be_liberal          = 1
 EOF2
-ok "conntrack tune เสร็จ"
+ok "conntrack tune เสร็จ (131072 entries ~ใช้ RAM ราว 40MB เท่านั้น)"
 
-# ── 3.3 NIC Tune ────────────────────────────────────────────────────
-info "3.3 Tune NIC: ${NIC}..."
-ethtool -K "${NIC}" gro on lro off tso on gso on      2>/dev/null || true
-ethtool -K "${NIC}" rx-gro-hw off                     2>/dev/null || true
-ethtool -A "${NIC}" rx off tx off                     2>/dev/null || true
-ip link set "${NIC}" txqueuelen 10000
-ip link set "${NIC}" mtu 1500 2>/dev/null || true
+# ── 3.2b NIC Tune (เบา ปลอดภัย แต่ช่วย throughput จริงบน 1vCPU) ─────
+info "3.2b Tune NIC: ${NIC}..."
+ethtool -K "${NIC}" gro on gso on tso on 2>/dev/null || true
 
-# RX ring buffer
 RX_MAX=$(ethtool -g "${NIC}" 2>/dev/null \
   | awk '/^Pre-set maximums/,/^Current/ { if(/RX:/) {match($0,/[0-9]+/); print substr($0,RSTART,RLENGTH); exit}}')
 TX_MAX=$(ethtool -g "${NIC}" 2>/dev/null \
@@ -334,41 +328,30 @@ TX_MAX=$(ethtool -g "${NIC}" 2>/dev/null \
 RX_MAX="${RX_MAX:-1024}"; TX_MAX="${TX_MAX:-1024}"
 ethtool -G "${NIC}" rx "$RX_MAX" tx "$TX_MAX" 2>/dev/null || true
 
-# TC qdisc
+ip link set "${NIC}" txqueuelen 10000 2>/dev/null || true
+
 tc qdisc del dev "${NIC}" root 2>/dev/null || true
-tc qdisc add dev "${NIC}" root handle 1: "${QDISC}" \
-  quantum 3028 buckets 65536 limit 10000 2>/dev/null \
-|| tc qdisc add dev "${NIC}" root handle 1: "${QDISC}" \
-  quantum 3028 buckets 65536 2>/dev/null || true
+tc qdisc add dev "${NIC}" root handle 1: "${QDISC}" 2>/dev/null || true
 
-# RPS/RFS
-CPU_COUNT=$(nproc)
-RPS_MASK=$(printf '%x' $(( (1 << CPU_COUNT) - 1 )))
-echo "${RPS_MASK}" > /sys/class/net/"${NIC}"/queues/rx-0/rps_cpus 2>/dev/null || true
-if [ -f /proc/sys/net/core/rps_sock_flow_entries ]; then
-  echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
-  echo 32768 > /sys/class/net/"${NIC}"/queues/rx-0/rps_flow_cnt 2>/dev/null || true
-fi
-
-# Persist NIC tune ─────────────────────────────────────────────────
+# Persist หลัง reboot
 cat > /etc/systemd/system/nic-tune.service << NSEOF
 [Unit]
-Description=NIC Tuning persistent
+Description=NIC Tuning persistent (light)
 After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'ethtool -K ${NIC} gro on lro off tso on gso on 2>/dev/null; ethtool -A ${NIC} rx off tx off 2>/dev/null; ip link set ${NIC} txqueuelen 10000; ip link set ${NIC} mtu 1500 2>/dev/null; ethtool -G ${NIC} rx ${RX_MAX} tx ${TX_MAX} 2>/dev/null; tc qdisc del dev ${NIC} root 2>/dev/null; tc qdisc add dev ${NIC} root handle 1: ${QDISC} quantum 3028 buckets 65536 limit 10000 2>/dev/null || true; echo ${RPS_MASK} > /sys/class/net/${NIC}/queues/rx-0/rps_cpus 2>/dev/null; if [ -f /proc/sys/net/core/rps_sock_flow_entries ]; then echo 32768 > /proc/sys/net/core/rps_sock_flow_entries; fi'
+ExecStart=/bin/bash -c 'ethtool -K ${NIC} gro on gso on tso on 2>/dev/null; ethtool -G ${NIC} rx ${RX_MAX} tx ${TX_MAX} 2>/dev/null; ip link set ${NIC} txqueuelen 10000 2>/dev/null; tc qdisc del dev ${NIC} root 2>/dev/null; tc qdisc add dev ${NIC} root handle 1: ${QDISC} 2>/dev/null || true'
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 NSEOF
 systemctl daemon-reload
 systemctl enable nic-tune.service
-ok "NIC tune เสร็จ"
+ok "NIC tune เสร็จ (GRO/GSO/TSO on, ring buffer max, qdisc ${QDISC})"
 
-# ── 3.4 Transparent Huge Pages OFF ──────────────────────────────────
-info "3.4 ปิด THP..."
+# ── 3.3 Transparent Huge Pages OFF ──────────────────────────────────
+info "3.3 ปิด THP..."
 echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
 echo never > /sys/kernel/mm/transparent_hugepage/defrag   2>/dev/null || true
 cat > /etc/systemd/system/thp-disable.service << 'THPEOF'
@@ -389,8 +372,8 @@ systemctl daemon-reload
 systemctl enable --now thp-disable.service
 ok "THP ปิดแล้ว"
 
-# ── 3.5 System Limits ───────────────────────────────────────────────
-info "3.5 ตั้ง system limits..."
+# ── 3.4 System Limits ───────────────────────────────────────────────
+info "3.4 ตั้ง system limits..."
 cat > /etc/security/limits.d/99-vless.conf << 'LIMEOF'
 *    soft nofile   2097152
 *    hard nofile   2097152
@@ -408,36 +391,8 @@ for pam in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; d
 done
 ok "limits เสร็จ"
 
-# ── 3.6 CPU Governor + I/O Scheduler ───────────────────────────────
-info "3.6 CPU governor: performance + I/O scheduler..."
-cat > /etc/systemd/system/cpu-performance.service << 'CPUEOF'
-[Unit]
-Description=CPU Governor: performance
-After=multi-user.target
-[Service]
-Type=oneshot
-ExecStart=/bin/bash -c 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f "$f" ] && echo performance > "$f" 2>/dev/null || true; done'
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-CPUEOF
-systemctl daemon-reload
-systemctl enable --now cpu-performance.service
-
-for DEV in sda sdb vda vdb xvda nvme0n1; do
-  [ -b "/dev/${DEV}" ] || continue
-  ROT=$(cat "/sys/block/${DEV}/queue/rotational" 2>/dev/null || echo "0")
-  [ "$ROT" = "0" ] \
-    && echo none > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null \
-    || echo mq-deadline > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null
-  echo 0   > "/sys/block/${DEV}/queue/add_random"    2>/dev/null || true
-  echo 256 > "/sys/block/${DEV}/queue/nr_requests"   2>/dev/null || true
-  echo 128 > "/sys/block/${DEV}/queue/read_ahead_kb" 2>/dev/null || true
-done
-ok "CPU + I/O scheduler เสร็จ"
-
-# ── 3.7 x-ui systemd override (performance) ────────────────────────
-info "3.7 x-ui systemd override..."
+# ── 3.5 x-ui systemd override (performance) ────────────────────────
+info "3.5 x-ui systemd override..."
 xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
 if [ -x "$xui_bin" ]; then
   ram_avail=$(free -m | awk '/^Mem:/ {print $7}')
@@ -455,9 +410,6 @@ Environment=GOGC=100
 Environment=GODEBUG=madvdontneed=1
 Environment=GOMEMLIMIT=${gomemlimit}MiB
 OOMScoreAdjust=-1000
-Nice=-20
-CPUWeight=10000
-IOWeight=10000
 PrivateTmp=yes
 NoNewPrivileges=no
 OEOF
@@ -468,18 +420,8 @@ else
   warn "ไม่เจอ x-ui binary — ข้ามขั้นตอนนี้"
 fi
 
-# ── 3.8 x-ui capabilities ──────────────────────────────────────────
-info "3.8 setcap x-ui + xray..."
-xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
-[ -x "$xui_bin" ] && \
-  setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw,cap_ipc_lock+eip' "$xui_bin" 2>/dev/null || true
-xray_bin=$(find /usr/local/x-ui -name "xray-linux-*" -type f 2>/dev/null | head -1 || true)
-[ -n "$xray_bin" ] && [ -x "$xray_bin" ] && \
-  setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw,cap_ipc_lock+eip' "$xray_bin" 2>/dev/null || true
-ok "capabilities เสร็จ"
-
-# ── 3.9 SQLite WAL ──────────────────────────────────────────────────
-info "3.9 SQLite WAL optimize..."
+# ── 3.6 SQLite WAL ──────────────────────────────────────────────────
+info "3.6 SQLite WAL optimize..."
 DB="/etc/x-ui/x-ui.db"
 if [ -f "$DB" ]; then
   sqlite3 "$DB" "PRAGMA journal_mode=WAL;"       2>/dev/null || true
@@ -515,49 +457,8 @@ else
   warn "ไม่เจอ x-ui.db — SQLite จะ optimize หลัง reboot เมื่อสร้าง inbound แล้ว"
 fi
 
-# ── 3.10 Watchdog ───────────────────────────────────────────────────
-info "3.10 x-ui Watchdog..."
-cat > /usr/local/bin/xui-watchdog.sh << 'WDEOF'
-#!/usr/bin/env bash
-set -uo pipefail
-LOG="/var/log/xui-watchdog.log"
-ts() { date '+%Y-%m-%d %H:%M:%S'; }
-while true; do
-  sleep 30
-  XUI_PID=$(pgrep -x x-ui 2>/dev/null | head -1 || true)
-  if [ -z "$XUI_PID" ]; then
-    echo "$(ts) [WARN] x-ui not running — restarting" >> "$LOG"
-    systemctl restart x-ui 2>/dev/null || true
-    sleep 60; continue
-  fi
-  RSS=$(awk '/^VmRSS/ {print int($2/1024)}' /proc/"$XUI_PID"/status 2>/dev/null || echo 0)
-  if [ "$RSS" -gt 1400 ]; then
-    echo "$(ts) [WARN] RSS=${RSS}MB — restarting" >> "$LOG"
-    systemctl restart x-ui 2>/dev/null || true
-    sleep 60
-  fi
-done
-WDEOF
-chmod +x /usr/local/bin/xui-watchdog.sh
-cat > /etc/systemd/system/xui-watchdog.service << 'WDSEOF'
-[Unit]
-Description=x-ui Watchdog
-After=x-ui.service
-Requires=x-ui.service
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/xui-watchdog.sh
-Restart=always
-RestartSec=5
-[Install]
-WantedBy=multi-user.target
-WDSEOF
-systemctl daemon-reload
-systemctl enable --now xui-watchdog.service
-ok "Watchdog เสร็จ"
-
-# ── 3.11 irqbalance ─────────────────────────────────────────────────
-info "3.11 irqbalance..."
+# ── 3.7 irqbalance ─────────────────────────────────────────────────
+info "3.7 irqbalance..."
 systemctl enable --now irqbalance 2>/dev/null || true
 ok "irqbalance เสร็จ"
 
@@ -905,7 +806,6 @@ chk_svc x-ui
 chk_svc fail2ban
 chk_svc thp-disable.service
 chk_svc nic-tune.service
-chk_svc xui-watchdog.service
 chk_svc dns-privacy-nft.service
 chk_svc unattended-upgrades
 
@@ -941,8 +841,10 @@ echo -e "    ${GRN}✔${RST}  Fingerprint  : firefox"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Performance  :${RST}"
 echo -e "    ${GRN}✔${RST}  BBR congestion control"
-echo -e "    ${GRN}✔${RST}  FQ qdisc | THP off | NIC tuned"
-echo -e "    ${GRN}✔${RST}  TCP fast | Keepalive 35s"
+echo -e "    ${GRN}✔${RST}  FQ qdisc | THP off | NIC: GRO/GSO/TSO + ring max"
+echo -e "    ${GRN}✔${RST}  TCP buffer 32MB | tcp_mem fit 2GB RAM"
+echo -e "    ${GRN}✔${RST}  Busy-poll 50us | TCP fast | Keepalive 35s"
+echo -e "    ${GRN}✔${RST}  Conntrack 131072 entries"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Security     :${RST}"
 echo -e "    ${GRN}✔${RST}  SSH: publickey only"
@@ -951,7 +853,6 @@ echo -e "    ${GRN}✔${RST}  Kernel hardening (kptr/ptrace/BPF)"
 echo -e "    ${GRN}✔${RST}  UFW: 22/80/443/${PANEL_PORT} TCP เท่านั้น"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Logs & Debug :${RST}"
-echo -e "  tail -f /var/log/xui-watchdog.log"
 echo -e "  systemctl status x-ui"
 echo -e "  fail2ban-client status sshd"
 echo -e "  ${BLD}Install log  :${RST} ${LOG_FILE}"
