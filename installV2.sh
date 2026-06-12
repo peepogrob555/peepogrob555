@@ -1,283 +1,249 @@
 #!/usr/bin/env bash
+# ═══════════════════════════════════════════════════════════════════
+#  VLESS REALITY SETUP — 4 STEPS — Ubuntu 22.04
+#  สร้างโดย: Claude | เป้าหมาย: ปิง่ต่ำ + ความเป็นส่วนตัวสูงสุด
+#  SNI: speedtest.net | Fingerprint: firefox
+#  รันเสร็จ → reboot 1 ครั้ง → ใช้งานได้เลย
+# ═══════════════════════════════════════════════════════════════════
 set -uo pipefail
 export LANG=C
 
+# ── สี ──────────────────────────────────────────────────────────────
 GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'
 CYN='\033[0;36m'; BLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
 
-STATE_DIR="/var/lib/reality-setup"
-STATE_FILE="${STATE_DIR}/steps.done"
-LOG_FILE="${STATE_DIR}/install.log"
+# ── log ─────────────────────────────────────────────────────────────
+STATE_DIR="/var/lib/vless-setup"
+LOG_FILE="${STATE_DIR}/setup.log"
 mkdir -p "$STATE_DIR"
-touch "$STATE_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-sep()  { echo -e "${DIM}${CYN}────────────────────────────────────────────────────${RST}"; }
+sep()  { echo -e "${DIM}${CYN}──────────────────────────────────────────────────────${RST}"; }
 hdr()  { echo -e "\n${BLD}${CYN}▶  $1${RST}"; sep; }
 ok()   { echo -e "  ${GRN}✔${RST}  $1"; }
 warn() { echo -e "  ${YEL}⚠${RST}  $1"; }
 info() { echo -e "  ${CYN}ℹ${RST}  $1"; }
 die()  { echo -e "\n${RED}${BLD}✘  $1${RST}\n"; exit 1; }
+ask()  { echo -e "\n  ${BLD}${YEL}▷  $1${RST}"; }
 
-step_done()  { grep -qxF "$1" "$STATE_FILE" 2>/dev/null; }
-mark_done()  { grep -qxF "$1" "$STATE_FILE" 2>/dev/null || echo "$1" >> "$STATE_FILE"; }
-clear_done() { sed -i "/^${1}$/d" "$STATE_FILE" 2>/dev/null || true; }
+[ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root (sudo bash vless-reality-setup.sh)"
 
-run_step() {
-  local name="$1" skip="$2"; shift 2
-  if $skip && step_done "$name"; then ok "[SKIP] ${name}"; return 0; fi
-  clear_done "$name"
-  echo -e "\n${BLD}  → ${name}${RST}"
-  if (set -euo pipefail; "$@"); then
-    mark_done "$name"; ok "[OK]   ${name}"
-  else
-    echo -e "\n${RED}${BLD}✘  FAILED: ${name}${RST}\n"; exit 1
-  fi
-}
-run_skip()   { run_step "$1" true  "${@:2}"; }
-run_always() { run_step "$1" false "${@:2}"; }
-
-retry() {
-  local tries=$1 delay=$2; shift 2; local i=1
-  while true; do
-    "$@" && return 0
-    [ "$i" -ge "$tries" ] && return 1
-    sleep "$delay"; i=$((i+1))
-  done
-}
-
-wait_active() {
-  local svc="$1" timeout="${2:-30}" elapsed=0
-  until systemctl is-active "$svc" &>/dev/null; do
-    [ "$elapsed" -ge "$timeout" ] && { warn "timeout: ${svc}"; return 1; }
-    sleep 2; elapsed=$((elapsed+2))
-  done
-}
-
-[ "$(id -u)" -eq 0 ] || die "must run as root"
-
-VCPU=$(nproc 2>/dev/null || echo 1)
-RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
+# ── ตั้งค่าหลัก ──────────────────────────────────────────────────────
+PANEL_PORT=2053
+TLS_FINGERPRINT="firefox"
+TLS_SNI="speedtest.net"
+SWAP_SIZE_MB=512
 
 _detect_nic() {
-  local nic
-  nic=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
-  [ -z "$nic" ] && nic=$(ip link show 2>/dev/null \
-    | awk -F': ' '/^[0-9]+: / && !/lo:/ {print $2}' \
-    | head -1 | cut -d@ -f1)
-  echo "${nic:-eth0}"
+  ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}'
 }
 NIC=$(_detect_nic)
+[ -z "$NIC" ] && NIC=$(ip link show | awk -F': ' '/^[0-9]+: / && !/lo:/ {print $2}' | head -1 | cut -d@ -f1)
+[ -z "$NIC" ] && NIC="eth0"
+
+RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
+VCPU=$(nproc)
+PUB_IP=$(curl -sf --max-time 8 https://ifconfig.me 2>/dev/null \
+       || curl -sf --max-time 8 https://api.ipify.org 2>/dev/null || echo "N/A")
 
 echo ""
 echo -e "${BLD}${CYN}╔══════════════════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}${CYN}║  VLESS REALITY · Privacy · Performance  V1.0 BETA             ║${RST}"
-echo -e "${BLD}${CYN}║  NIC: ${NIC}$(printf '%*s' $((51-${#NIC})) '')║${RST}"
+echo -e "${BLD}${CYN}║  VLESS REALITY SETUP — 4 STEPS                          ║${RST}"
+echo -e "${BLD}${CYN}║  SNI: speedtest.net | Fingerprint: firefox               ║${RST}"
+echo -e "${BLD}${CYN}║  Port 443 (VLESS) | Panel: ${PANEL_PORT} | IPv6: OFF          ║${RST}"
 echo -e "${BLD}${CYN}╚══════════════════════════════════════════════════════════╝${RST}"
 echo ""
-info "RAM: ${RAM_MB}MB  vCPU: ${VCPU}  NIC: ${NIC}"
+info "Server IP : ${PUB_IP}"
+info "NIC       : ${NIC}"
+info "RAM       : ${RAM_MB}MB  vCPU: ${VCPU}"
 echo ""
 
-# =============================================================================
-hdr "STEP 1 — UPDATE & DEPS"
-_step1() {
-  systemctl stop    unattended-upgrades 2>/dev/null || true
-  systemctl disable unattended-upgrades 2>/dev/null || true
-  systemctl kill --kill-who=all unattended-upgrades 2>/dev/null || true
-  local waited=0
-  while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
-              /var/cache/apt/archives/lock &>/dev/null; do
-    [ "$waited" -ge 90 ] && {
-      fuser -k /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
-               /var/cache/apt/archives/lock 2>/dev/null || true
-      sleep 3; break
-    }
-    sleep 3; waited=$((waited+3))
-  done
-  dpkg --configure -a
-  apt-get update -y
-  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    curl ufw sqlite3 iproute2 ethtool irqbalance \
-    fail2ban chrony python3 libcap2-bin \
-    linux-tools-common linux-tools-generic 2>/dev/null || \
-  DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    curl ufw sqlite3 iproute2 ethtool \
-    fail2ban chrony python3 libcap2-bin
-}
-run_skip "step1_deps" _step1
+# ═══════════════════════════════════════════════════════════════════
+hdr "STEP 1 — อัปเดตระบบ + ติดตั้งแพ็กเกจ + ตั้ง Firewall"
+# ═══════════════════════════════════════════════════════════════════
 
-# =============================================================================
-hdr "STEP 2 — FIREWALL"
-_step2() {
-  ufw --force reset
-  ufw default deny incoming
-  ufw default allow outgoing
-  ufw limit  22/tcp
-  ufw allow  443/tcp
-  ufw deny   80/tcp
-  ufw deny   23/tcp
-  ufw deny   25/tcp
-  ufw deny   3389/tcp
-  ufw --force enable
-}
-run_skip "step2_ufw" _step2
+# ── 1.1 รอ lock apt ─────────────────────────────────────────────────
+info "1.1 หยุด unattended-upgrades + รอ apt lock..."
+systemctl stop    unattended-upgrades 2>/dev/null || true
+systemctl disable unattended-upgrades 2>/dev/null || true
+systemctl kill --kill-who=all unattended-upgrades 2>/dev/null || true
+waited=0
+while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+            /var/cache/apt/archives/lock &>/dev/null; do
+  [ "$waited" -ge 90 ] && {
+    fuser -k /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
+             /var/cache/apt/archives/lock 2>/dev/null || true
+    sleep 3; break
+  }
+  info "รอ apt lock... ${waited}s"
+  sleep 5; waited=$((waited+5))
+done
+dpkg --configure -a
+ok "apt พร้อมแล้ว"
 
-# =============================================================================
-hdr "STEP 3 — INSTALL 3X-UI"
-_step3() {
-  local installer
-  installer=$(mktemp /tmp/3xui.XXXXXX.sh)
-  retry 3 5 curl -fsSL \
-    https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh \
-    -o "$installer" || { rm -f "$installer"; return 1; }
-  chmod +x "$installer"
-  bash "$installer"
-  rm -f "$installer"
-}
-run_skip "step3_3xui" _step3
+# ── 1.2 Update + Upgrade ────────────────────────────────────────────
+info "1.2 apt update + upgrade..."
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+ok "update + upgrade เสร็จ"
 
-# =============================================================================
-hdr "STEP 4 — KILL UNUSED SERVICES"
-_step4() {
-  local svcs=(
-    snapd snapd.socket multipathd multipathd.socket apport
-    apt-daily.timer apt-daily-upgrade.timer
-    man-db.timer motd-news.timer fwupd-refresh.timer
-    avahi-daemon cups cups-browsed bluetooth
-    ModemManager rsyslog syslog rpcbind
-    systemd-networkd-wait-online
-  )
-  local s
-  for s in "${svcs[@]}"; do
-    systemctl list-unit-files "$s" 2>/dev/null | grep -q "$s" || continue
-    systemctl stop    "$s" 2>/dev/null || true
-    systemctl disable "$s" 2>/dev/null || true
-    systemctl mask    "$s" 2>/dev/null || true
-  done
-}
-run_always "step4_kill_svc" _step4
+# ── 1.3 ติดตั้งแพ็กเกจที่จำเป็น ─────────────────────────────────────
+info "1.3 ติดตั้ง dependencies..."
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+  curl ufw nftables sqlite3 ethtool iproute2 \
+  fail2ban auditd \
+  python3 libcap2-bin irqbalance \
+  unattended-upgrades
+ok "ติดตั้งแพ็กเกจเสร็จ"
 
-# =============================================================================
-hdr "STEP 5 — ZERO-LOG"
-_step5() {
-  mkdir -p /etc/systemd/journald.conf.d
-  cat > /etc/systemd/journald.conf.d/99-nolog.conf << 'EOF'
-[Journal]
-Storage=volatile
-Compress=no
-SystemMaxUse=16M
-RuntimeMaxUse=16M
-RateLimitIntervalSec=0
-RateLimitBurst=0
-Seal=no
-ReadKMsg=no
-EOF
-  systemctl restart systemd-journald
+# ── 1.4 Firewall (UFW) ──────────────────────────────────────────────
+info "1.4 ตั้ง UFW Firewall..."
+ufw --force reset
+ufw default deny incoming
+ufw default allow outgoing
+ufw default deny forward
 
-  grep -q "tmpfs /tmp" /etc/fstab 2>/dev/null \
-    || echo "tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,noexec,size=128m 0 0" >> /etc/fstab
-  mount -o remount,noexec,nosuid,nodev /tmp     2>/dev/null || true
-  mount -o remount,noexec,nosuid,nodev /dev/shm 2>/dev/null || true
+# เปิดเฉพาะ TCP ที่จำเป็น (AIS บล็อก UDP หนัก)
+ufw limit   22/tcp      comment "SSH"
+ufw allow   80/tcp      comment "HTTP (bughost redirect)"
+ufw allow   443/tcp     comment "VLESS REALITY"
+ufw allow   ${PANEL_PORT}/tcp comment "3x-ui panel"
 
-  mkdir -p /etc/systemd/coredump.conf.d
-  printf '[Coredump]\nStorage=none\nProcessSizeMax=0\n' \
-    > /etc/systemd/coredump.conf.d/disable.conf
-}
-run_always "step5_zerolog" _step5
+# ปิด UDP ทั้งหมด (AIS บล็อก / ไม่ใช้)
+ufw deny    proto udp from any to any comment "Block UDP"
 
-# =============================================================================
-hdr "STEP 6 — KERNEL PRIVACY + SECURITY"
-_step6() {
-  cat > /etc/sysctl.d/99-privacy.conf << 'EOF'
-kernel.kptr_restrict                       = 2
-kernel.dmesg_restrict                      = 1
-kernel.perf_event_paranoid                 = 3
-kernel.unprivileged_bpf_disabled           = 1
-net.core.bpf_jit_harden                   = 2
-kernel.yama.ptrace_scope                   = 2
-kernel.randomize_va_space                  = 2
-kernel.sysrq                               = 0
-fs.suid_dumpable                           = 0
-kernel.core_pattern                        = |/bin/false
-fs.protected_hardlinks                     = 1
-fs.protected_symlinks                      = 1
-fs.protected_fifos                         = 2
-fs.protected_regular                       = 2
-net.ipv4.conf.all.rp_filter                = 1
-net.ipv4.conf.default.rp_filter            = 1
-net.ipv4.conf.all.accept_redirects         = 0
-net.ipv4.conf.default.accept_redirects     = 0
-net.ipv6.conf.all.accept_redirects         = 0
-net.ipv4.conf.all.send_redirects           = 0
-net.ipv4.conf.all.accept_source_route      = 0
-net.ipv6.conf.all.accept_source_route      = 0
-net.ipv4.conf.all.log_martians             = 1
-net.ipv4.icmp_echo_ignore_broadcasts       = 1
-net.ipv4.icmp_ignore_bogus_error_responses = 1
-net.ipv4.tcp_syncookies                    = 1
-net.ipv4.conf.all.secure_redirects         = 0
-net.ipv6.conf.all.accept_ra                = 0
-net.ipv4.tcp_rfc1337                       = 1
-EOF
-  sysctl -p /etc/sysctl.d/99-privacy.conf
-}
-run_always "step6_kernel_privacy" _step6
+# ปิด port อันตราย
+ufw deny    23/tcp
+ufw deny    25/tcp
+ufw deny    3389/tcp
 
-# =============================================================================
-hdr "STEP 7 — TCP PERFORMANCE + NIC + CPU"
-_step7() {
-  modprobe tcp_bbr     2>/dev/null || true
-  modprobe nf_conntrack 2>/dev/null || true
+# ปิด IPv6 ใน UFW
+sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
 
-  local cc="bbr"
-  grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
-    || { warn "BBR unavailable — fallback cubic"; cc="cubic"; }
-  local qdisc="fq"
-  modinfo sch_fq &>/dev/null || { warn "fq unavailable — fallback fq_codel"; qdisc="fq_codel"; }
+ufw --force enable
+ufw status verbose
+ok "UFW Firewall เปิดแล้ว: 22/80/443/${PANEL_PORT} TCP เท่านั้น"
 
-  {
-    cat << EOF
-net.ipv4.tcp_congestion_control        = ${cc}
-net.core.default_qdisc                 = ${qdisc}
-net.core.rmem_max                      = 2147483647
-net.core.wmem_max                      = 2147483647
-net.core.rmem_default                  = 4194304
-net.core.wmem_default                  = 4194304
-net.ipv4.tcp_rmem                      = 4096 4194304 2147483647
-net.ipv4.tcp_wmem                      = 4096 4194304 2147483647
+# ── 1.5 Swap ────────────────────────────────────────────────────────
+info "1.5 สร้าง Swap ${SWAP_SIZE_MB}MB..."
+if swapon --show | grep -q '/swapfile'; then
+  info "swapfile มีอยู่แล้ว"
+else
+  [ -f /swapfile ] && { swapoff /swapfile 2>/dev/null || true; rm -f /swapfile; }
+  fallocate -l "${SWAP_SIZE_MB}M" /swapfile \
+    || dd if=/dev/zero of=/swapfile bs=1M count="${SWAP_SIZE_MB}" status=progress
+  chmod 600 /swapfile
+  mkswap /swapfile
+  swapon /swapfile
+  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+fi
+swapon --show
+ok "Swap พร้อม"
+
+ok "═══ STEP 1 เสร็จสมบูรณ์ ═══"
+
+# ═══════════════════════════════════════════════════════════════════
+hdr "STEP 2 — ติดตั้ง 3x-ui"
+# ═══════════════════════════════════════════════════════════════════
+# NOTE: ขั้นตอนนี้จะแสดง interactive prompt ของ 3x-ui ให้กรอกเองทุกอย่าง
+# ผมไม่ซ่อน ไม่ข้าม ไม่กรอกอัตโนมัติ
+# คุณจะเห็น: Username / Password / Panel Port / Web Path ให้กรอกตามต้องการ
+
+echo ""
+warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+warn "  3x-ui installer จะถามข้อมูลให้คุณกรอกเอง:"
+warn "  - Username (admin ก็ได้)"
+warn "  - Password (ตั้งให้แข็งแกร่ง)"
+warn "  - Panel Port (แนะนำ: ${PANEL_PORT})"
+warn "  - Web Base Path (แนะนำ: ตั้งเองหรือกด Enter ข้าม)"
+warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+echo ""
+ask "กด ENTER เพื่อเริ่มติดตั้ง 3x-ui (คุณจะเห็น prompt ทุกอย่าง)..."
+read -r
+
+installer=$(mktemp /tmp/3xui-XXXXXX.sh)
+for attempt in 1 2 3; do
+  if curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o "$installer"; then
+    break
+  fi
+  warn "download ล้มเหลว ครั้งที่ ${attempt}/3 รอ 5s..."
+  [ "$attempt" -ge 3 ] && { rm -f "$installer"; die "ดาวน์โหลด 3x-ui installer ไม่ได้"; }
+  sleep 5
+done
+chmod +x "$installer"
+
+# รัน installer ตรงๆ ให้คุณเห็นและกรอกเอง
+bash "$installer"
+rm -f "$installer"
+
+# รอให้ x-ui service ขึ้น
+info "รอ x-ui service..."
+for i in $(seq 1 30); do
+  systemctl is-active x-ui &>/dev/null && break
+  sleep 2
+done
+systemctl is-active x-ui &>/dev/null && ok "x-ui active" || warn "x-ui อาจยังไม่ active — ตรวจ: systemctl status x-ui"
+
+ok "═══ STEP 2 เสร็จสมบูรณ์ ═══"
+
+# ═══════════════════════════════════════════════════════════════════
+hdr "STEP 3 — Optimize: Kernel / Network / TCP (ปิง่ต่ำ + throughput สูง)"
+# ═══════════════════════════════════════════════════════════════════
+
+# ── 3.1 BBR + TCP Tune ──────────────────────────────────────────────
+info "3.1 โหลด BBR + ตั้งค่า TCP/network..."
+modprobe tcp_bbr     2>/dev/null || true
+modprobe nf_conntrack 2>/dev/null || true
+
+# ตรวจ BBR
+CC="bbr"
+grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
+  || { warn "BBR ไม่มี — ใช้ cubic"; CC="cubic"; }
+
+# ตรวจ fq
+QDISC="fq"
+modinfo sch_fq &>/dev/null || { warn "fq ไม่มี — ใช้ fq_codel"; QDISC="fq_codel"; }
+
+RMEM_MAX=2147483647
+WMEM_MAX=2147483647
+RMEM_DEF=4194304
+WMEM_DEF=4194304
+
+cat > /etc/sysctl.d/99-vless-perf.conf << EOF
+# ── BBR + FQ ──────────────────────────────────────────────────────
+net.ipv4.tcp_congestion_control        = ${CC}
+net.core.default_qdisc                 = ${QDISC}
+
+# ── Buffer ────────────────────────────────────────────────────────
+net.core.rmem_max                      = ${RMEM_MAX}
+net.core.wmem_max                      = ${WMEM_MAX}
+net.core.rmem_default                  = ${RMEM_DEF}
+net.core.wmem_default                  = ${WMEM_DEF}
+net.ipv4.tcp_rmem                      = 4096 ${RMEM_DEF} ${RMEM_MAX}
+net.ipv4.tcp_wmem                      = 4096 ${WMEM_DEF} ${WMEM_MAX}
+net.ipv4.tcp_mem                       = 786432 1048576 1572864
 net.ipv4.tcp_moderate_rcvbuf           = 1
 net.ipv4.tcp_adv_win_scale             = 1
-net.core.optmem_max                    = 131072
-net.core.busy_poll                     = 50
-net.core.busy_read                     = 50
-net.core.netdev_budget                 = 1200
-net.core.netdev_budget_usecs           = 8000
-net.core.netdev_max_backlog            = 65536
-net.core.dev_weight                    = 128
-net.core.dev_weight_rx_bias            = 8
-net.core.somaxconn                     = 4096
-net.ipv4.tcp_max_syn_backlog           = 4096
-net.ipv4.tcp_mtu_probing               = 1
-net.ipv4.tcp_base_mss                  = 1440
+
+# ── TCP Fast ──────────────────────────────────────────────────────
 net.ipv4.tcp_fastopen                  = 3
 net.ipv4.tcp_window_scaling            = 1
 net.ipv4.tcp_timestamps                = 1
 net.ipv4.tcp_sack                      = 1
 net.ipv4.tcp_dsack                     = 1
 net.ipv4.tcp_ecn                       = 1
+net.ipv4.tcp_mtu_probing               = 1
+net.ipv4.tcp_base_mss                  = 1440
+net.ipv4.tcp_slow_start_after_idle     = 0
 net.ipv4.tcp_autocorking               = 0
 net.ipv4.tcp_thin_linear_timeouts      = 1
 net.ipv4.tcp_early_retrans             = 3
-net.ipv4.tcp_recovery                  = 1
-net.ipv4.tcp_reordering                = 3
-net.ipv4.tcp_frto                      = 2
 net.ipv4.tcp_no_metrics_save           = 1
-net.ipv4.tcp_slow_start_after_idle     = 0
-net.ipv4.tcp_syncookies                = 1
-net.ipv4.tcp_tw_reuse                  = 1
-net.ipv4.tcp_max_tw_buckets            = 262144
-net.ipv4.ip_local_port_range           = 1024 65535
+net.ipv4.tcp_reordering                = 6
+net.ipv4.tcp_frto                      = 2
+net.ipv4.tcp_recovery                  = 1
+
+# ── Keepalive / Timeout ───────────────────────────────────────────
 net.ipv4.tcp_keepalive_time            = 35
 net.ipv4.tcp_keepalive_intvl           = 5
 net.ipv4.tcp_keepalive_probes          = 5
@@ -286,169 +252,131 @@ net.ipv4.tcp_syn_retries               = 3
 net.ipv4.tcp_synack_retries            = 3
 net.ipv4.tcp_retries2                  = 8
 net.ipv4.tcp_orphan_retries            = 2
-net.ipv4.tcp_max_orphans               = 8192
-net.ipv4.tcp_abort_on_overflow         = 0
-net.ipv4.ip_no_pmtu_disc               = 0
+net.ipv4.tcp_max_orphans               = 32768
+
+# ── Queue / Backlog ───────────────────────────────────────────────
+net.core.somaxconn                     = 65535
+net.ipv4.tcp_max_syn_backlog           = 65535
+net.core.netdev_max_backlog            = 65536
+net.core.netdev_budget                 = 1200
+net.core.netdev_budget_usecs           = 8000
+net.ipv4.ip_local_port_range           = 1024 65535
+
+# ── TIME_WAIT ─────────────────────────────────────────────────────
+net.ipv4.tcp_tw_reuse                  = 1
+net.ipv4.tcp_max_tw_buckets            = 1440000
+
+# ── Forward (จำเป็นสำหรับ VPN/Proxy) ────────────────────────────
 net.ipv4.ip_forward                    = 1
 net.ipv4.conf.all.forwarding           = 1
 net.ipv4.conf.default.forwarding       = 1
-net.ipv6.conf.all.forwarding           = 1
-vm.swappiness                          = 5
+net.ipv6.conf.all.forwarding           = 0
+
+# ── SYN Protect ──────────────────────────────────────────────────
+net.ipv4.tcp_syncookies                = 1
+net.ipv4.tcp_rfc1337                   = 1
+net.ipv4.tcp_challenge_ack_limit       = 1000
+
+# ── VM / Swap ─────────────────────────────────────────────────────
+vm.swappiness                          = 10
 vm.dirty_ratio                         = 10
 vm.dirty_background_ratio              = 3
 vm.dirty_expire_centisecs              = 500
 vm.dirty_writeback_centisecs           = 100
-vm.min_free_kbytes                     = 65536
+vm.min_free_kbytes                     = 131072
 vm.vfs_cache_pressure                  = 50
 vm.overcommit_memory                   = 1
-fs.file-max                            = 1048576
-kernel.sched_autogroup_enabled         = 0
-kernel.sched_rt_runtime_us             = -1
-kernel.timer_migration                 = 0
-kernel.threads-max                     = 131072
-kernel.panic                           = 10
+
+# ── File descriptors ──────────────────────────────────────────────
+fs.file-max                            = 2097152
+fs.nr_open                             = 2097152
+
+# ── Busy Poll (ลด latency NIC) ────────────────────────────────────
+net.core.busy_poll                     = 50
+net.core.busy_read                     = 50
 EOF
-    [ -f /proc/sys/net/ipv4/tcp_notsent_lowat ] \
-      && echo "net.ipv4.tcp_notsent_lowat         = 131072"
-    [ -f /proc/sys/net/ipv4/tcp_fack ]          \
-      && echo "net.ipv4.tcp_fack                  = 1"
-    [ -f /proc/sys/net/ipv4/tcp_low_latency ]   \
-      && echo "net.ipv4.tcp_low_latency           = 1"
-    [ -f /proc/sys/vm/numa_balancing ]           \
-      && echo "vm.numa_balancing                  = 0"
-    [ -f /proc/sys/kernel/sched_min_granularity_ns ]    \
-      && echo "kernel.sched_min_granularity_ns    = 500000"
-    [ -f /proc/sys/kernel/sched_wakeup_granularity_ns ] \
-      && echo "kernel.sched_wakeup_granularity_ns = 50000"
-    [ -f /proc/sys/kernel/sched_migration_cost_ns ]     \
-      && echo "kernel.sched_migration_cost_ns     = 50000"
-    [ -f /proc/sys/kernel/nmi_watchdog ]         \
-      && echo "kernel.nmi_watchdog                = 0"
-    [ -f /proc/sys/kernel/watchdog ]             \
-      && echo "kernel.watchdog                    = 0"
-  } > /etc/sysctl.d/99-tcp-perf.conf
 
-  sysctl -p /etc/sysctl.d/99-tcp-perf.conf
+sysctl -p /etc/sysctl.d/99-vless-perf.conf
+ok "TCP/network tune เสร็จ"
 
-  cat > /etc/sysctl.d/99-bbr-persist.conf << EOF
-net.ipv4.tcp_congestion_control = ${cc}
-net.core.default_qdisc          = ${qdisc}
-EOF
-  sysctl -p /etc/sysctl.d/99-bbr-persist.conf 2>/dev/null || true
+# ── 3.2 Conntrack ───────────────────────────────────────────────────
+info "3.2 ตั้ง nf_conntrack..."
+echo 131072 > /proc/sys/net/netfilter/nf_conntrack_max                     2>/dev/null || true
+echo 0       > /proc/sys/net/netfilter/nf_conntrack_checksum                2>/dev/null || true
+echo 600     > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 2>/dev/null || true
+echo 20      > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait   2>/dev/null || true
+echo 10      > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait    2>/dev/null || true
+echo 1       > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal          2>/dev/null || true
+echo 32768   > /sys/module/nf_conntrack/parameters/hashsize                 2>/dev/null || true
+cat >> /etc/sysctl.d/99-vless-perf.conf << 'EOF2'
+net.netfilter.nf_conntrack_max                     = 131072
+net.netfilter.nf_conntrack_checksum                = 0
+net.netfilter.nf_conntrack_tcp_timeout_established = 600
+net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 20
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait    = 10
+net.netfilter.nf_conntrack_tcp_be_liberal          = 1
+EOF2
+ok "conntrack tune เสร็จ"
 
-  local ct_max=65536
-  echo "$ct_max" > /proc/sys/net/netfilter/nf_conntrack_max                     2>/dev/null || true
-  echo 0         > /proc/sys/net/netfilter/nf_conntrack_checksum                2>/dev/null || true
-  echo 600       > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 2>/dev/null || true
-  echo 15        > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_time_wait   2>/dev/null || true
-  echo 10        > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_close_wait  2>/dev/null || true
-  echo 10        > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_fin_wait    2>/dev/null || true
-  echo 1         > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal          2>/dev/null || true
-  echo $(( ct_max / 4 )) > /sys/module/nf_conntrack/parameters/hashsize        2>/dev/null || true
+# ── 3.3 NIC Tune ────────────────────────────────────────────────────
+info "3.3 Tune NIC: ${NIC}..."
+ethtool -K "${NIC}" gro on lro off tso on gso on      2>/dev/null || true
+ethtool -K "${NIC}" rx-gro-hw off                     2>/dev/null || true
+ethtool -A "${NIC}" rx off tx off                     2>/dev/null || true
+ip link set "${NIC}" txqueuelen 10000
+ip link set "${NIC}" mtu 1500 2>/dev/null || true
 
-  ethtool -K "$NIC" gro on lro off tso on gso on            2>/dev/null || true
-  ethtool -K "$NIC" rx-gro-hw off                           2>/dev/null || true
-  ethtool -K "$NIC" rx-vlan-offload off tx-vlan-offload off 2>/dev/null || true
-  ethtool -A "$NIC" rx off tx off                           2>/dev/null || true
+# RX ring buffer
+RX_MAX=$(ethtool -g "${NIC}" 2>/dev/null \
+  | awk '/^Pre-set maximums/,/^Current/ { if(/RX:/) {match($0,/[0-9]+/); print substr($0,RSTART,RLENGTH); exit}}')
+TX_MAX=$(ethtool -g "${NIC}" 2>/dev/null \
+  | awk '/^Pre-set maximums/,/^Current/ { if(/TX:/) {match($0,/[0-9]+/); print substr($0,RSTART,RLENGTH); exit}}')
+RX_MAX="${RX_MAX:-1024}"; TX_MAX="${TX_MAX:-1024}"
+ethtool -G "${NIC}" rx "$RX_MAX" tx "$TX_MAX" 2>/dev/null || true
 
-  local rx_max tx_max
-  rx_max=$(ethtool -g "$NIC" 2>/dev/null \
-    | awk '/^Pre-set maximums/,/^Current/ { if(/RX:/) { match($0,/[0-9]+/); print substr($0,RSTART,RLENGTH); exit } }')
-  tx_max=$(ethtool -g "$NIC" 2>/dev/null \
-    | awk '/^Pre-set maximums/,/^Current/ { if(/TX:/) { match($0,/[0-9]+/); print substr($0,RSTART,RLENGTH); exit } }')
-  rx_max="${rx_max:-1024}"; tx_max="${tx_max:-1024}"
-  ethtool -G "$NIC" rx "$rx_max" tx "$tx_max"               2>/dev/null || true
-  ethtool -C "$NIC" rx-usecs 50 tx-usecs 50 \
-    adaptive-rx on adaptive-tx on                           2>/dev/null || \
-  ethtool -C "$NIC" rx-usecs 50 tx-usecs 50                2>/dev/null || true
-
-  ip link set "$NIC" txqueuelen 10000
-  ip link set "$NIC" mtu 1500 2>/dev/null || true
-
-  tc qdisc del dev "$NIC" root 2>/dev/null || true
-  tc qdisc add dev "$NIC" root handle 1: "${qdisc}" \
-    quantum 3028 buckets 65536 limit 10000 2>/dev/null \
-  || tc qdisc add dev "$NIC" root handle 1: "${qdisc}" \
-    quantum 3028 buckets 65536 2>/dev/null || true
-
-  local cpu_count rps_mask
-  cpu_count=$(nproc 2>/dev/null || echo 1)
-  rps_mask=$(printf '%x' $(( (1 << cpu_count) - 1 )))
-  echo "${rps_mask}" > /sys/class/net/"${NIC}"/queues/rx-0/rps_cpus 2>/dev/null || true
-  if [ -f /proc/sys/net/core/rps_sock_flow_entries ]; then
-    echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
-    echo 32768 > /sys/class/net/"${NIC}"/queues/rx-0/rps_flow_cnt 2>/dev/null || true
-  fi
-
-  echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-  echo never > /sys/kernel/mm/transparent_hugepage/defrag   2>/dev/null || true
-
-  for DEV in sda sdb vda vdb xvda nvme0n1; do
-    [ -b "/dev/${DEV}" ] || continue
-    local rot
-    rot=$(cat "/sys/block/${DEV}/queue/rotational" 2>/dev/null || echo "0")
-    [ "$rot" = "0" ] \
-      && echo none        > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null || true \
-      || echo mq-deadline > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null || true
-    echo 0   > "/sys/block/${DEV}/queue/add_random"    2>/dev/null || true
-    echo 256 > "/sys/block/${DEV}/queue/nr_requests"   2>/dev/null || true
-    echo 0   > "/sys/block/${DEV}/queue/nomerges"      2>/dev/null || true
-    echo 128 > "/sys/block/${DEV}/queue/read_ahead_kb" 2>/dev/null || true
-    echo 0   > "/sys/block/${DEV}/queue/wbt_lat_usec"  2>/dev/null || true
-  done
-
-  cat > /etc/udev/rules.d/60-io-scheduler.rules << 'EOF'
-ACTION=="add|change", KERNEL=="sd[a-z]",         ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="none"
-ACTION=="add|change", KERNEL=="sd[a-z]",         ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline"
-ACTION=="add|change", KERNEL=="vd[a-z]",         ATTR{queue/rotational}=="0", ATTR{queue/scheduler}="none"
-ACTION=="add|change", KERNEL=="vd[a-z]",         ATTR{queue/rotational}=="1", ATTR{queue/scheduler}="mq-deadline"
-ACTION=="add|change", KERNEL=="nvme[0-9]n[0-9]", ATTR{queue/scheduler}="none"
-EOF
-  udevadm control --reload-rules 2>/dev/null || true
-
-  mkdir -p /etc/networkd-dispatcher/routable.d
-  cat > /etc/networkd-dispatcher/routable.d/50-nic-tune.sh << NEOF
-#!/usr/bin/env bash
-NIC="${NIC}"; QDISC="${qdisc}"; RX_MAX="${rx_max}"; TX_MAX="${tx_max}"
-ip link show "\${NIC}" &>/dev/null || exit 0
-ethtool -K "\${NIC}" gro on lro off tso on gso on 2>/dev/null || true
-ethtool -K "\${NIC}" rx-gro-hw off 2>/dev/null || true
-ethtool -A "\${NIC}" rx off tx off 2>/dev/null || true
-ethtool -G "\${NIC}" rx "\${RX_MAX}" tx "\${TX_MAX}" 2>/dev/null || true
-ethtool -C "\${NIC}" rx-usecs 50 tx-usecs 50 adaptive-rx on adaptive-tx on 2>/dev/null || \
-ethtool -C "\${NIC}" rx-usecs 50 tx-usecs 50 2>/dev/null || true
-ip link set "\${NIC}" txqueuelen 10000
-tc qdisc del dev "\${NIC}" root 2>/dev/null || true
-tc qdisc add dev "\${NIC}" root handle 1: "\${QDISC}" \
-  quantum 3028 buckets 65536 limit 10000 2>/dev/null || \
-tc qdisc add dev "\${NIC}" root handle 1: "\${QDISC}" \
+# TC qdisc
+tc qdisc del dev "${NIC}" root 2>/dev/null || true
+tc qdisc add dev "${NIC}" root handle 1: "${QDISC}" \
+  quantum 3028 buckets 65536 limit 10000 2>/dev/null \
+|| tc qdisc add dev "${NIC}" root handle 1: "${QDISC}" \
   quantum 3028 buckets 65536 2>/dev/null || true
-CPU_COUNT=\$(nproc 2>/dev/null || echo 1)
-RPS_MASK=\$(printf '%x' \$(( (1 << CPU_COUNT) - 1 )))
-echo "\${RPS_MASK}" > /sys/class/net/"\${NIC}"/queues/rx-0/rps_cpus 2>/dev/null || true
-[ -f /proc/sys/net/core/rps_sock_flow_entries ] \
-  && echo 32768 > /proc/sys/net/core/rps_sock_flow_entries 2>/dev/null || true
-NEOF
-  chmod +x /etc/networkd-dispatcher/routable.d/50-nic-tune.sh
 
-  cat > /etc/systemd/system/nic-tune.service << SEOF
+# RPS/RFS
+CPU_COUNT=$(nproc)
+RPS_MASK=$(printf '%x' $(( (1 << CPU_COUNT) - 1 )))
+echo "${RPS_MASK}" > /sys/class/net/"${NIC}"/queues/rx-0/rps_cpus 2>/dev/null || true
+if [ -f /proc/sys/net/core/rps_sock_flow_entries ]; then
+  echo 32768 > /proc/sys/net/core/rps_sock_flow_entries
+  echo 32768 > /sys/class/net/"${NIC}"/queues/rx-0/rps_flow_cnt 2>/dev/null || true
+fi
+
+# Persist NIC tune ─────────────────────────────────────────────────
+cat > /etc/systemd/system/nic-tune.service << NSEOF
 [Unit]
-Description=NIC low-latency tune
+Description=NIC Tuning persistent
 After=network-online.target
 Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/etc/networkd-dispatcher/routable.d/50-nic-tune.sh
+ExecStart=/bin/bash -c 'ethtool -K ${NIC} gro on lro off tso on gso on 2>/dev/null; ethtool -A ${NIC} rx off tx off 2>/dev/null; ip link set ${NIC} txqueuelen 10000; ip link set ${NIC} mtu 1500 2>/dev/null; ethtool -G ${NIC} rx ${RX_MAX} tx ${TX_MAX} 2>/dev/null; tc qdisc del dev ${NIC} root 2>/dev/null; tc qdisc add dev ${NIC} root handle 1: ${QDISC} quantum 3028 buckets 65536 limit 10000 2>/dev/null || true; echo ${RPS_MASK} > /sys/class/net/${NIC}/queues/rx-0/rps_cpus 2>/dev/null; if [ -f /proc/sys/net/core/rps_sock_flow_entries ]; then echo 32768 > /proc/sys/net/core/rps_sock_flow_entries; fi'
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
-SEOF
+NSEOF
+systemctl daemon-reload
+systemctl enable nic-tune.service
+ok "NIC tune เสร็จ"
 
-  cat > /etc/systemd/system/thp-disable.service << 'EOF'
+# ── 3.4 Transparent Huge Pages OFF ──────────────────────────────────
+info "3.4 ปิด THP..."
+echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+echo never > /sys/kernel/mm/transparent_hugepage/defrag   2>/dev/null || true
+cat > /etc/systemd/system/thp-disable.service << 'THPEOF'
 [Unit]
-Description=Disable THP
+Description=Disable Transparent Huge Pages
 DefaultDependencies=no
 After=sysinit.target local-fs.target
+Before=x-ui.service
 [Service]
 Type=oneshot
 ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
@@ -456,91 +384,381 @@ ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
-EOF
+THPEOF
+systemctl daemon-reload
+systemctl enable --now thp-disable.service
+ok "THP ปิดแล้ว"
 
-  cat > /etc/systemd/system/cpu-performance.service << 'EOF'
+# ── 3.5 System Limits ───────────────────────────────────────────────
+info "3.5 ตั้ง system limits..."
+cat > /etc/security/limits.d/99-vless.conf << 'LIMEOF'
+*    soft nofile   2097152
+*    hard nofile   2097152
+*    soft nproc    131072
+*    hard nproc    131072
+root soft nofile   2097152
+root hard nofile   2097152
+root soft nproc    131072
+root hard nproc    131072
+LIMEOF
+for pam in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
+  [ -f "$pam" ] || continue
+  grep -qxF 'session required pam_limits.so' "$pam" \
+    || echo 'session required pam_limits.so' >> "$pam"
+done
+ok "limits เสร็จ"
+
+# ── 3.6 CPU Governor + I/O Scheduler ───────────────────────────────
+info "3.6 CPU governor: performance + I/O scheduler..."
+cat > /etc/systemd/system/cpu-performance.service << 'CPUEOF'
 [Unit]
-Description=CPU Governor performance
+Description=CPU Governor: performance
 After=multi-user.target
 [Service]
 Type=oneshot
 ExecStart=/bin/bash -c 'for f in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do [ -f "$f" ] && echo performance > "$f" 2>/dev/null || true; done'
-ExecStart=/bin/bash -c 'for f in /sys/devices/system/cpu/cpu*/cpuidle/state*/disable; do [ -f "$f" ] && echo 1 > "$f" 2>/dev/null || true; done'
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
-EOF
+CPUEOF
+systemctl daemon-reload
+systemctl enable --now cpu-performance.service
 
+for DEV in sda sdb vda vdb xvda nvme0n1; do
+  [ -b "/dev/${DEV}" ] || continue
+  ROT=$(cat "/sys/block/${DEV}/queue/rotational" 2>/dev/null || echo "0")
+  [ "$ROT" = "0" ] \
+    && echo none > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null \
+    || echo mq-deadline > "/sys/block/${DEV}/queue/scheduler" 2>/dev/null
+  echo 0   > "/sys/block/${DEV}/queue/add_random"    2>/dev/null || true
+  echo 256 > "/sys/block/${DEV}/queue/nr_requests"   2>/dev/null || true
+  echo 128 > "/sys/block/${DEV}/queue/read_ahead_kb" 2>/dev/null || true
+done
+ok "CPU + I/O scheduler เสร็จ"
+
+# ── 3.7 x-ui systemd override (performance) ────────────────────────
+info "3.7 x-ui systemd override..."
+xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
+if [ -x "$xui_bin" ]; then
+  ram_avail=$(free -m | awk '/^Mem:/ {print $7}')
+  gomemlimit=$(( ram_avail - 150 ))
+  [ "$gomemlimit" -lt 400 ] && gomemlimit=400
+  mkdir -p /etc/systemd/system/x-ui.service.d
+  cat > /etc/systemd/system/x-ui.service.d/override.conf << OEOF
+[Service]
+LimitNOFILE=2097152
+LimitNPROC=131072
+Restart=always
+RestartSec=2
+Environment=GOMAXPROCS=${VCPU}
+Environment=GOGC=100
+Environment=GODEBUG=madvdontneed=1
+Environment=GOMEMLIMIT=${gomemlimit}MiB
+OOMScoreAdjust=-1000
+Nice=-20
+CPUWeight=10000
+IOWeight=10000
+PrivateTmp=yes
+NoNewPrivileges=no
+OEOF
   systemctl daemon-reload
-  systemctl enable --now nic-tune.service
-  systemctl enable --now thp-disable.service
-  systemctl enable --now cpu-performance.service
+  systemctl restart x-ui 2>/dev/null || true
+  ok "x-ui override เสร็จ (GOMEMLIMIT=${gomemlimit}MiB)"
+else
+  warn "ไม่เจอ x-ui binary — ข้ามขั้นตอนนี้"
+fi
 
-  if command -v irqbalance &>/dev/null; then
-    cat > /etc/default/irqbalance << 'EOF'
-ENABLED=1
-ONESHOT=0
-OPTIONS="--powerthresh=0 --deepestcache=1"
-EOF
-    systemctl enable --now irqbalance 2>/dev/null || true
+# ── 3.8 x-ui capabilities ──────────────────────────────────────────
+info "3.8 setcap x-ui + xray..."
+xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
+[ -x "$xui_bin" ] && \
+  setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw,cap_ipc_lock+eip' "$xui_bin" 2>/dev/null || true
+xray_bin=$(find /usr/local/x-ui -name "xray-linux-*" -type f 2>/dev/null | head -1 || true)
+[ -n "$xray_bin" ] && [ -x "$xray_bin" ] && \
+  setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw,cap_ipc_lock+eip' "$xray_bin" 2>/dev/null || true
+ok "capabilities เสร็จ"
+
+# ── 3.9 SQLite WAL ──────────────────────────────────────────────────
+info "3.9 SQLite WAL optimize..."
+DB="/etc/x-ui/x-ui.db"
+if [ -f "$DB" ]; then
+  sqlite3 "$DB" "PRAGMA journal_mode=WAL;"       2>/dev/null || true
+  sqlite3 "$DB" "PRAGMA synchronous=NORMAL;"      2>/dev/null || true
+  sqlite3 "$DB" "PRAGMA cache_size=-65536;"       2>/dev/null || true
+  sqlite3 "$DB" "PRAGMA temp_store=MEMORY;"       2>/dev/null || true
+  sqlite3 "$DB" "PRAGMA mmap_size=268435456;"     2>/dev/null || true
+  sqlite3 "$DB" "VACUUM;"                         2>/dev/null || true
+  sqlite3 "$DB" "ANALYZE;"                        2>/dev/null || true
+  JM=$(sqlite3 "$DB" "PRAGMA journal_mode;" 2>/dev/null || echo "?")
+  ok "SQLite journal_mode=${JM}"
+
+  # WAL checkpoint timer
+  cat > /etc/systemd/system/xui-db-wal.service << WEOF
+[Unit]
+Description=x-ui SQLite WAL checkpoint
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/sqlite3 ${DB} "PRAGMA wal_checkpoint(TRUNCATE);"
+WEOF
+  cat > /etc/systemd/system/xui-db-wal.timer << 'WTEOF'
+[Unit]
+Description=x-ui SQLite WAL checkpoint 30min
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=30min
+[Install]
+WantedBy=timers.target
+WTEOF
+  systemctl daemon-reload
+  systemctl enable --now xui-db-wal.timer
+else
+  warn "ไม่เจอ x-ui.db — SQLite จะ optimize หลัง reboot เมื่อสร้าง inbound แล้ว"
+fi
+
+# ── 3.10 Watchdog ───────────────────────────────────────────────────
+info "3.10 x-ui Watchdog..."
+cat > /usr/local/bin/xui-watchdog.sh << 'WDEOF'
+#!/usr/bin/env bash
+set -uo pipefail
+LOG="/var/log/xui-watchdog.log"
+ts() { date '+%Y-%m-%d %H:%M:%S'; }
+while true; do
+  sleep 30
+  XUI_PID=$(pgrep -x x-ui 2>/dev/null | head -1 || true)
+  if [ -z "$XUI_PID" ]; then
+    echo "$(ts) [WARN] x-ui not running — restarting" >> "$LOG"
+    systemctl restart x-ui 2>/dev/null || true
+    sleep 60; continue
   fi
+  RSS=$(awk '/^VmRSS/ {print int($2/1024)}' /proc/"$XUI_PID"/status 2>/dev/null || echo 0)
+  if [ "$RSS" -gt 1400 ]; then
+    echo "$(ts) [WARN] RSS=${RSS}MB — restarting" >> "$LOG"
+    systemctl restart x-ui 2>/dev/null || true
+    sleep 60
+  fi
+done
+WDEOF
+chmod +x /usr/local/bin/xui-watchdog.sh
+cat > /etc/systemd/system/xui-watchdog.service << 'WDSEOF'
+[Unit]
+Description=x-ui Watchdog
+After=x-ui.service
+Requires=x-ui.service
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/xui-watchdog.sh
+Restart=always
+RestartSec=5
+[Install]
+WantedBy=multi-user.target
+WDSEOF
+systemctl daemon-reload
+systemctl enable --now xui-watchdog.service
+ok "Watchdog เสร็จ"
 
-  cat > /etc/security/limits.d/99-perf.conf << 'EOF'
-*    soft nofile  1048576
-*    hard nofile  1048576
-*    soft nproc   65536
-*    hard nproc   65536
-*    soft memlock unlimited
-*    hard memlock unlimited
-*    soft core    0
-*    hard core    0
-root soft nofile  1048576
-root hard nofile  1048576
-root soft core    0
-root hard core    0
-EOF
-  local pam
-  for pam in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; do
-    [ -f "$pam" ] || continue
-    grep -qxF 'session required pam_limits.so' "$pam" \
-      || echo 'session required pam_limits.so' >> "$pam"
-  done
+# ── 3.11 irqbalance ─────────────────────────────────────────────────
+info "3.11 irqbalance..."
+systemctl enable --now irqbalance 2>/dev/null || true
+ok "irqbalance เสร็จ"
 
-  info "BBR=${cc} qdisc=${qdisc} THP=off CPU=performance RPS/RFS=32768"
+ok "═══ STEP 3 เสร็จสมบูรณ์ ═══"
+
+# ═══════════════════════════════════════════════════════════════════
+hdr "STEP 4 — Privacy & Security (ไม่เก็บ log / ไม่ leak IP / ลบตัวตน)"
+# ═══════════════════════════════════════════════════════════════════
+
+# ── 4.1 ปิด IPv6 สมบูรณ์ (ป้องกัน IPv6 leak) ───────────────────────
+info "4.1 ปิด IPv6 ทั้งระบบ..."
+cat > /etc/sysctl.d/99-disable-ipv6.conf << 'V6EOF'
+net.ipv6.conf.all.disable_ipv6     = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6      = 1
+V6EOF
+sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
+
+for iface in $(ip link show | awk -F': ' '/^[0-9]+:/ {print $2}' | cut -d@ -f1); do
+  echo 1 > /proc/sys/net/ipv6/conf/"${iface}"/disable_ipv6 2>/dev/null || true
+done
+
+# ip6tables block outbound
+if command -v ip6tables &>/dev/null; then
+  ip6tables -F OUTPUT 2>/dev/null || true
+  ip6tables -A OUTPUT -o lo -j ACCEPT
+  ip6tables -A OUTPUT -j DROP
+  mkdir -p /etc/iptables
+  ip6tables-save > /etc/iptables/rules.v6 2>/dev/null || true
+fi
+
+# GRUB kernel param
+if [ -f /etc/default/grub ]; then
+  grep -q "ipv6.disable=1" /etc/default/grub || \
+    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 ipv6.disable=1"/' /etc/default/grub
+  update-grub 2>/dev/null || grub-mkconfig -o /boot/grub/grub.cfg 2>/dev/null || warn "grub update ล้มเหลว (non-fatal)"
+fi
+ok "IPv6 ปิดแล้ว: sysctl + ip6tables + grub"
+
+# ── 4.2 DNS over TLS (ไม่มี DNS leak) ──────────────────────────────
+info "4.2 DNS over TLS (Cloudflare DoT) ..."
+mkdir -p /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/99-dot.conf << 'DOTEOF'
+[Resolve]
+DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
+FallbackDNS=9.9.9.9#dns.quad9.net
+DNSOverTLS=yes
+DNSSEC=no
+Cache=yes
+DNSStubListener=yes
+ReadEtcHosts=yes
+DOTEOF
+systemctl enable --now systemd-resolved 2>/dev/null || true
+systemctl restart systemd-resolved
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+
+# Block outbound port 53 ด้วย nftables
+cat > /etc/nftables-dns-block.conf << 'NFTEOF'
+#!/usr/sbin/nft -f
+table inet dns_privacy {
+  chain output_dns_block {
+    type filter hook output priority 0; policy accept;
+    ip  daddr 127.0.0.53 udp dport 53 accept
+    ip  daddr 127.0.0.53 tcp dport 53 accept
+    udp dport 53 drop
+    tcp dport 53 drop
+  }
 }
-run_always "step7_perf" _step7
+NFTEOF
+nft -f /etc/nftables-dns-block.conf 2>/dev/null && info "nftables: block port 53 plain DNS" || warn "nftables DNS block ล้มเหลว (non-fatal)"
 
-# =============================================================================
-hdr "STEP 8 — KERNEL MODULE BLACKLIST"
-_step8() {
-  cat > /etc/modprobe.d/99-blacklist.conf << 'EOF'
-install dccp          /bin/false
-install sctp          /bin/false
-install rds           /bin/false
-install tipc          /bin/false
-install n-hdlc        /bin/false
-install ax25          /bin/false
-install netrom        /bin/false
-install x25           /bin/false
-install rose          /bin/false
-install decnet        /bin/false
-install af_802154     /bin/false
-install ipx           /bin/false
-install appletalk     /bin/false
-install can           /bin/false
-install atm           /bin/false
-install usb-storage   /bin/false
-install firewire-core /bin/false
-EOF
-  depmod -a 2>/dev/null || true
-}
-run_always "step8_blacklist" _step8
+cat > /etc/systemd/system/dns-privacy-nft.service << 'DNSSEOF'
+[Unit]
+Description=Block plaintext DNS (force DoT)
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/nftables-dns-block.conf
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+DNSSEOF
+systemctl daemon-reload
+systemctl enable --now dns-privacy-nft.service
+ok "DNS over TLS เสร็จ | plain DNS port 53 ถูก block"
 
-# =============================================================================
-hdr "STEP 9 — SSH HARDENING"
-_step9() {
-  mkdir -p /etc/ssh/sshd_config.d
-  cat > /etc/ssh/sshd_config.d/99-hardened.conf << 'EOF'
+# ── 4.3 Kernel Security Hardening ──────────────────────────────────
+info "4.3 Kernel security hardening..."
+cat > /etc/sysctl.d/99-security.conf << 'SECEOF'
+kernel.kptr_restrict                       = 2
+kernel.dmesg_restrict                      = 1
+kernel.perf_event_paranoid                 = 3
+kernel.unprivileged_bpf_disabled           = 1
+net.core.bpf_jit_harden                   = 2
+fs.suid_dumpable                           = 0
+kernel.yama.ptrace_scope                   = 2
+kernel.randomize_va_space                  = 2
+kernel.sysrq                               = 0
+fs.protected_hardlinks                     = 1
+fs.protected_symlinks                      = 1
+net.ipv4.conf.all.rp_filter                = 1
+net.ipv4.conf.default.rp_filter            = 1
+net.ipv4.conf.all.accept_redirects         = 0
+net.ipv4.conf.default.accept_redirects     = 0
+net.ipv4.conf.all.send_redirects           = 0
+net.ipv4.conf.all.accept_source_route      = 0
+net.ipv4.conf.all.log_martians             = 1
+net.ipv4.icmp_echo_ignore_broadcasts       = 1
+net.ipv4.icmp_ignore_bogus_error_responses = 1
+SECEOF
+sysctl -p /etc/sysctl.d/99-security.conf
+ok "kernel hardening เสร็จ"
+
+# ── 4.4 Xray: ปิด log ทั้งหมด (ไม่เก็บ access/error) ──────────────
+info "4.4 ปิด xray log..."
+DB="/etc/x-ui/x-ui.db"
+if [ -f "$DB" ] && command -v sqlite3 &>/dev/null && command -v python3 &>/dev/null; then
+  template=$(sqlite3 "$DB" "SELECT value FROM settings WHERE key='xrayTemplateConfig';" 2>/dev/null || true)
+  if [ -n "$template" ]; then
+    new_template=$(printf '%s' "$template" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+d['log'] = {'access': 'none', 'error': '', 'loglevel': 'none', 'dnsLog': False}
+print(json.dumps(d, separators=(',',':')))
+" 2>/dev/null || true)
+    if [ -n "$new_template" ]; then
+      esc="${new_template//\'/\'\'}"
+      sqlite3 "$DB" "UPDATE settings SET value='${esc}' WHERE key='xrayTemplateConfig';" 2>/dev/null || true
+      ok "xray log ปิดแล้ว (ไม่บันทึก access/error)"
+    fi
+  else
+    warn "xrayTemplateConfig ว่างเปล่า — จะ patch ใหม่ได้หลังสร้าง inbound"
+  fi
+else
+  warn "ไม่เจอ x-ui.db — จะ patch log หลัง reboot + สร้าง inbound"
+fi
+
+# ── 4.5 Patch sockopt + Firefox fingerprint + SNI ───────────────────
+info "4.5 Patch fingerprint=firefox + SNI=speedtest.net บน VLESS port 443..."
+DB="/etc/x-ui/x-ui.db"
+SOCKOPT='{"acceptProxyProtocol":false,"tcpFastOpen":true,"mark":0,"tproxy":"off","tcpcongestion":"bbr","tcpNoDelay":true,"tcpKeepAliveInterval":35,"tcpKeepAliveIdle":35,"tcpUserTimeout":30000,"V6Only":false,"domainStrategy":"AsIs"}'
+if [ -f "$DB" ] && command -v sqlite3 &>/dev/null && command -v python3 &>/dev/null; then
+  count=$(sqlite3 "$DB" "SELECT COUNT(*) FROM inbounds WHERE port=443 AND protocol='vless';" 2>/dev/null || echo "0")
+  if [ "$count" -gt 0 ]; then
+    stream=$(sqlite3 "$DB" "SELECT stream_settings FROM inbounds WHERE port=443 AND protocol='vless' LIMIT 1;" 2>/dev/null || true)
+    if [ -n "$stream" ]; then
+      new_stream=$(printf '%s' "$stream" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+d['sockopt'] = json.loads(sys.argv[1])
+if 'realitySettings' in d:
+    d['realitySettings']['fingerprint'] = 'firefox'
+    d['realitySettings']['serverNames'] = ['speedtest.net', 'www.speedtest.net']
+if 'tlsSettings' in d:
+    d['tlsSettings']['fingerprint'] = 'firefox'
+print(json.dumps(d, separators=(',',':')))
+" "$SOCKOPT" 2>/dev/null || true)
+      if [ -n "$new_stream" ]; then
+        esc="${new_stream//\'/\'\'}"
+        sqlite3 "$DB" "UPDATE inbounds SET stream_settings='${esc}' WHERE port=443 AND protocol='vless';"
+        ok "fingerprint=firefox + SNI=speedtest.net patch เสร็จ"
+      fi
+    fi
+  else
+    warn "ยังไม่มี vless port 443 — รันสคริปต์นี้อีกครั้งหลังสร้าง inbound หรือจะตั้งใน panel เอง"
+    info "ตั้งใน panel: fingerprint=firefox | serverName=speedtest.net"
+  fi
+fi
+
+# ── 4.6 Journald: ไม่เขียน disk ─────────────────────────────────────
+info "4.6 journald → RAM only (volatile)..."
+mkdir -p /etc/systemd/journald.conf.d
+cat > /etc/systemd/journald.conf.d/99-volatile.conf << 'JEOF'
+[Journal]
+Storage=volatile
+Compress=no
+SystemMaxUse=32M
+RuntimeMaxUse=32M
+RateLimitIntervalSec=0
+RateLimitBurst=0
+Seal=no
+ReadKMsg=no
+JEOF
+journalctl --rotate      2>/dev/null || true
+journalctl --vacuum-time=1s 2>/dev/null || true
+find /var/log/journal -type f -name "*.journal" -delete 2>/dev/null || true
+systemctl restart systemd-journald
+ok "journald: RAM เท่านั้น ไม่เขียน disk"
+
+# ── 4.7 /tmp → tmpfs ────────────────────────────────────────────────
+info "4.7 /tmp → tmpfs (RAM)..."
+if ! grep -q "tmpfs /tmp" /etc/fstab 2>/dev/null; then
+  echo "tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,size=256m 0 0" >> /etc/fstab
+fi
+mount -o remount /tmp 2>/dev/null || true
+ok "/tmp → tmpfs 256MB"
+
+# ── 4.8 SSH Hardening ───────────────────────────────────────────────
+info "4.8 SSH hardening..."
+mkdir -p /etc/ssh/sshd_config.d
+cat > /etc/ssh/sshd_config.d/99-hardened.conf << 'SSHEOF'
 Protocol 2
 PermitRootLogin prohibit-password
 PasswordAuthentication no
@@ -548,36 +766,32 @@ ChallengeResponseAuthentication no
 PubkeyAuthentication yes
 AuthenticationMethods publickey
 MaxAuthTries 3
-MaxSessions 3
+MaxSessions 5
 LoginGraceTime 20
 ClientAliveInterval 120
 ClientAliveCountMax 3
 AllowTcpForwarding no
 X11Forwarding no
 PermitEmptyPasswords no
-Banner none
-UsePAM yes
-StrictModes yes
 IgnoreRhosts yes
 HostbasedAuthentication no
-Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
-KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org
-EOF
-  [ -f /etc/ssh/ssh_host_ed25519_key ] \
-    || ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" 2>/dev/null || true
-  sshd -t 2>/dev/null \
-    && { systemctl reload sshd 2>/dev/null || systemctl restart sshd 2>/dev/null || true; } \
-    || warn "sshd config test failed — not reloading"
-}
-run_always "step9_ssh" _step9
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512
+SSHEOF
+if sshd -t 2>/dev/null; then
+  systemctl reload sshd 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+  ok "SSH hardened — publickey only"
+else
+  warn "sshd config test failed — ไม่ reload"
+fi
 
-# =============================================================================
-hdr "STEP 10 — FAIL2BAN"
-_step10() {
-  cat > /etc/fail2ban/jail.d/99-hardened.conf << 'EOF'
+# ── 4.9 Fail2ban ────────────────────────────────────────────────────
+info "4.9 fail2ban..."
+mkdir -p /etc/fail2ban/jail.d
+cat > /etc/fail2ban/jail.d/99-vless.conf << FBEOF
 [DEFAULT]
-bantime  = 604800
+bantime  = 3600
 findtime = 300
 maxretry = 3
 banaction = ufw
@@ -588,146 +802,185 @@ port     = ssh
 filter   = sshd
 logpath  = /var/log/auth.log
 maxretry = 3
-bantime  = 604800
-EOF
-  systemctl enable --now fail2ban
-  systemctl restart fail2ban
-}
-run_always "step10_fail2ban" _step10
+bantime  = 86400
+FBEOF
+systemctl enable --now fail2ban
+systemctl restart fail2ban
+ok "fail2ban: SSH ban 24h/3 tries"
 
-# =============================================================================
-hdr "STEP 11 — CHRONY"
-_step11() {
-  command -v chronyc &>/dev/null || return 0
-  cat > /etc/chrony/chrony.conf << 'EOF'
-pool time.cloudflare.com iburst maxsources 4
-pool ntp.ubuntu.com iburst maxsources 4
-driftfile /var/lib/chrony/chrony.drift
-makestep 1.0 3
-rtcsync
-maxdistance 1.0
-EOF
-  systemctl enable --now chrony 2>/dev/null || true
-  systemctl restart chrony 2>/dev/null || true
-}
-run_always "step11_chrony" _step11
+# ── 4.10 Auto security updates ──────────────────────────────────────
+info "4.10 auto security updates..."
+cat > /etc/apt/apt.conf.d/50unattended-upgrades-security << 'AUTEOF'
+Unattended-Upgrade::Allowed-Origins {
+  "${distro_id}:${distro_codename}-security";
+};
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+Unattended-Upgrade::Automatic-Reboot "false";
+AUTEOF
+cat > /etc/apt/apt.conf.d/20auto-upgrades << 'AUTEOF2'
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+APT::Periodic::AutocleanInterval "7";
+AUTEOF2
+systemctl enable --now unattended-upgrades
+ok "auto security updates เสร็จ"
 
-# =============================================================================
-hdr "STEP 12 — x-ui OVERRIDE"
-_step12() {
-  local xui_bin
-  xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
-  [ -x "$xui_bin" ] || { warn "x-ui not found — skipping"; return 0; }
-
-  local ram_avail_mb gomemlimit_val
-  ram_avail_mb=$(free -m | awk '/^Mem:/ {print $7}')
-  gomemlimit_val=$(( ram_avail_mb - 150 ))
-  [ "$gomemlimit_val" -lt 400 ] && gomemlimit_val=400
-
-  mkdir -p /etc/systemd/system/x-ui.service.d
-  cat > /etc/systemd/system/x-ui.service.d/override.conf << EOF
+# ── 4.11 DB Backup (daily, เก็บ 7 วัน) ─────────────────────────────
+info "4.11 DB backup..."
+BACKUP_DIR="/var/lib/vless-setup/backups"
+mkdir -p "$BACKUP_DIR"
+chmod 700 "$BACKUP_DIR"
+DB="/etc/x-ui/x-ui.db"
+cat > /usr/local/bin/xui-backup.sh << BKEOF
+#!/usr/bin/env bash
+DB="${DB}"
+BACKUP_DIR="${BACKUP_DIR}"
+[ -f "\$DB" ] || exit 0
+TS=\$(date '+%Y%m%d_%H%M%S')
+sqlite3 "\$DB" ".backup \${BACKUP_DIR}/x-ui_\${TS}.db" 2>/dev/null \
+  || cp "\$DB" "\${BACKUP_DIR}/x-ui_\${TS}.db"
+chmod 600 "\${BACKUP_DIR}/x-ui_\${TS}.db"
+find "\$BACKUP_DIR" -name "x-ui_*.db" -mtime +7 -delete 2>/dev/null || true
+BKEOF
+chmod +x /usr/local/bin/xui-backup.sh
+cat > /etc/systemd/system/xui-backup.service << 'BKSEOF'
+[Unit]
+Description=x-ui DB Backup
 [Service]
-LimitNOFILE=1048576
-LimitNPROC=65536
-LimitMEMLOCK=infinity
-LimitCORE=0
-Restart=always
-RestartSec=2
-Environment=GOMAXPROCS=${VCPU}
-Environment=GOGC=150
-Environment=GODEBUG=madvdontneed=1
-Environment=GOMEMLIMIT=${gomemlimit_val}MiB
-OOMScoreAdjust=-1000
-Nice=-20
-PrivateTmp=yes
-ProtectHome=read-only
-ProtectSystem=strict
-ReadWritePaths=/etc/x-ui /usr/local/x-ui /var/lib/reality-setup /tmp
-ProtectKernelModules=yes
-ProtectControlGroups=yes
-RestrictRealtime=yes
-LockPersonality=yes
-NoNewPrivileges=no
-TasksMax=infinity
-CPUWeight=10000
-IOWeight=10000
-EOF
+Type=oneshot
+ExecStart=/usr/local/bin/xui-backup.sh
+BKSEOF
+cat > /etc/systemd/system/xui-backup.timer << 'BKTEOF'
+[Unit]
+Description=x-ui DB daily backup
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=30min
+Persistent=true
+[Install]
+WantedBy=timers.target
+BKTEOF
+systemctl daemon-reload
+systemctl enable --now xui-backup.timer
+/usr/local/bin/xui-backup.sh 2>/dev/null || true
+ok "DB backup: ${BACKUP_DIR} (เก็บ 7 วัน)"
 
-  setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw,cap_ipc_lock+eip' \
-    "$xui_bin" 2>/dev/null || true
-  local xray
-  xray=$(find /usr/local/x-ui -name "xray" -type f 2>/dev/null | head -1 || true)
-  [ -n "$xray" ] && [ -x "$xray" ] && \
-    setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw,cap_ipc_lock+eip' \
-      "$xray" 2>/dev/null || true
+# ── 4.12 Persist ip6tables ──────────────────────────────────────────
+info "4.12 persist ip6tables rules on reboot..."
+cat > /etc/systemd/system/ip6tables-restore.service << 'IP6EOF'
+[Unit]
+Description=Restore ip6tables rules
+After=network.target
+[Service]
+Type=oneshot
+ExecStart=/bin/bash -c 'ip6tables-restore < /etc/iptables/rules.v6 2>/dev/null || true'
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+IP6EOF
+systemctl daemon-reload
+systemctl enable ip6tables-restore.service
+ok "ip6tables persist เสร็จ"
 
-  systemctl daemon-reload
-  systemctl restart x-ui
-  wait_active x-ui 30 || warn "x-ui not active"
+ok "═══ STEP 4 เสร็จสมบูรณ์ ═══"
+
+# ═══════════════════════════════════════════════════════════════════
+hdr "VERIFY — ตรวจสอบก่อน reboot"
+# ═══════════════════════════════════════════════════════════════════
+errors=0
+chk_svc() {
+  systemctl is-enabled "$1" &>/dev/null \
+    && ok "$1 enabled" \
+    || { warn "$1 NOT enabled"; errors=$((errors+1)); }
 }
-run_always "step12_xui" _step12
-
-# =============================================================================
-hdr "STEP 13 — XRAY NO-LOG + SQLite WAL"
-_step13() {
-  local db="/etc/x-ui/x-ui.db"
-  [ -f "$db" ] || return 0
-  command -v sqlite3 &>/dev/null || return 0
-
-  local template new_template
-  template=$(sqlite3 "$db" \
-    "SELECT value FROM settings WHERE key='xrayTemplateConfig';" 2>/dev/null || true)
-  if [ -n "$template" ]; then
-    new_template=$(printf '%s' "$template" | python3 -c "
-import sys, json
-d = json.load(sys.stdin)
-d['log'] = {'access': 'none', 'error': '', 'loglevel': 'none', 'dnsLog': False}
-print(json.dumps(d, separators=(',',':')))
-" 2>/dev/null || true)
-    if [ -n "$new_template" ]; then
-      local esc="${new_template//\'/\'\'}"
-      sqlite3 "$db" \
-        "UPDATE settings SET value='${esc}' WHERE key='xrayTemplateConfig';" 2>/dev/null || true
-    fi
-  fi
-
-  sqlite3 "$db" "PRAGMA journal_mode=WAL;"   2>/dev/null || true
-  sqlite3 "$db" "PRAGMA synchronous=NORMAL;" 2>/dev/null || true
-  sqlite3 "$db" "PRAGMA temp_store=MEMORY;"  2>/dev/null || true
-  sqlite3 "$db" "PRAGMA mmap_size=134217728;" 2>/dev/null || true
-  sqlite3 "$db" "PRAGMA cache_size=-32768;"  2>/dev/null || true
-  sqlite3 "$db" "VACUUM;"                    2>/dev/null || true
-
-  systemctl restart x-ui 2>/dev/null || true
+chk_val() {
+  local label="$1" got="$2" want="$3"
+  echo "$got" | grep -qF "$want" \
+    && ok "${label}: ${got}" \
+    || { warn "${label}: ได้ '${got}' คาดหวัง '${want}'"; errors=$((errors+1)); }
 }
-run_always "step13_xray_nolog" _step13
 
-# =============================================================================
-hdr "DONE"
+chk_svc x-ui
+chk_svc fail2ban
+chk_svc thp-disable.service
+chk_svc nic-tune.service
+chk_svc xui-watchdog.service
+chk_svc dns-privacy-nft.service
+chk_svc unattended-upgrades
+
+chk_val "BBR"          "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" "bbr"
+chk_val "FQ qdisc"     "$(tc qdisc show dev "${NIC}" 2>/dev/null | head -1)"      "fq"
+chk_val "THP"          "$(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null)" "never"
+chk_val "IPv6 disable" "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" "1"
+chk_val "IP forward"   "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"            "1"
+chk_val "kptr_restrict" "$(sysctl -n kernel.kptr_restrict 2>/dev/null)"          "2"
+
+echo ""
 PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
-  || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
+       || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
 
-echo ""
-echo -e "${BLD}${GRN}  Steps completed:${RST}"
-while IFS= read -r line; do
-  [ -n "$line" ] && echo -e "    ${GRN}✔${RST}  ${line}"
-done < "$STATE_FILE"
-echo ""
 echo -e "  ══════════════════════════════════════════════════════════"
-echo -e "  ${BLD}IP           :${RST} ${PUB_IP}"
-echo -e "  ${BLD}BBR          :${RST} $(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}THP          :${RST} $(cat /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}x-ui         :${RST} $(systemctl is-active x-ui 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}fail2ban     :${RST} $(systemctl is-active fail2ban 2>/dev/null || echo N/A)"
-echo -e "  ${BLD}chrony       :${RST} $(systemctl is-active chrony 2>/dev/null || echo N/A)"
+echo -e "  ${BLD}Server IP    :${RST} ${PUB_IP}"
+echo -e "  ${BLD}Panel URL    :${RST} http://${PUB_IP}:${PANEL_PORT}/"
 echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}VLESS inbound settings:${RST}"
-echo -e "    port=443 · network=tcp · security=reality"
-echo -e "    flow=xtls-rprx-vision · SNI=speedtest.net"
-echo -e "    fingerprint=firefox · SpiderX=/"
-echo -e "    sniffing=ปิดทั้งหมด"
+echo -e "  ${BLD}Protocol     :${RST} VLESS | Port: 443 | Network: TCP"
+echo -e "  ${BLD}Security     :${RST} Reality"
+echo -e "  ${BLD}Flow         :${RST} xtls-rprx-vision"
+echo -e "  ${BLD}SNI          :${RST} ${TLS_SNI}"
+echo -e "  ${BLD}Fingerprint  :${RST} ${TLS_FINGERPRINT}"
+echo -e "  ${BLD}SpiderX      :${RST} /"
+echo -e "  ──────────────────────────────────────────────────────────"
+echo -e "  ${BLD}Privacy      :${RST}"
+echo -e "    ${GRN}✔${RST}  IPv6         : ปิดสมบูรณ์"
+echo -e "    ${GRN}✔${RST}  DNS          : over TLS (Cloudflare 853)"
+echo -e "    ${GRN}✔${RST}  DNS port 53  : blocked (nftables)"
+echo -e "    ${GRN}✔${RST}  Xray log     : ปิด (none)"
+echo -e "    ${GRN}✔${RST}  journald     : RAM only (volatile)"
+echo -e "    ${GRN}✔${RST}  Fingerprint  : firefox"
+echo -e "  ──────────────────────────────────────────────────────────"
+echo -e "  ${BLD}Performance  :${RST}"
+echo -e "    ${GRN}✔${RST}  BBR congestion control"
+echo -e "    ${GRN}✔${RST}  FQ qdisc | THP off | NIC tuned"
+echo -e "    ${GRN}✔${RST}  TCP fast | Keepalive 35s"
+echo -e "  ──────────────────────────────────────────────────────────"
+echo -e "  ${BLD}Security     :${RST}"
+echo -e "    ${GRN}✔${RST}  SSH: publickey only"
+echo -e "    ${GRN}✔${RST}  fail2ban: SSH ban 24h"
+echo -e "    ${GRN}✔${RST}  Kernel hardening (kptr/ptrace/BPF)"
+echo -e "    ${GRN}✔${RST}  UFW: 22/80/443/${PANEL_PORT} TCP เท่านั้น"
+echo -e "  ──────────────────────────────────────────────────────────"
+echo -e "  ${BLD}Logs & Debug :${RST}"
+echo -e "  tail -f /var/log/xui-watchdog.log"
+echo -e "  systemctl status x-ui"
+echo -e "  fail2ban-client status sshd"
+echo -e "  ${BLD}Install log  :${RST} ${LOG_FILE}"
 echo -e "  ══════════════════════════════════════════════════════════"
 echo ""
-echo -e "  ${BLD}${RED}⚠  SSH = publickey-only ตรวจ authorized_keys ก่อน reboot${RST}"
-echo -e "  ${BLD}${YEL}→  reboot เพื่อ confirm ทุก setting${RST}"
+
+if [ "$errors" -eq 0 ]; then
+  echo -e "${BLD}${GRN}"
+  echo -e "  ✔  ทุก step ผ่านหมด!"
+  echo -e "${RST}"
+else
+  echo -e "${YEL}  ⚠  พบ ${errors} รายการ — ตรวจสอบด้านบน${RST}"
+fi
+
+echo -e "${BLD}${YEL}"
+echo -e "  ════ ขั้นตอนต่อไป ═══════════════════════════════════════"
+echo -e "  1. เข้า panel: http://${PUB_IP}:${PANEL_PORT}/"
+echo -e "  2. สร้าง inbound:"
+echo -e "     Protocol  : VLESS"
+echo -e "     Port      : 443"
+echo -e "     Network   : TCP (raw)"
+echo -e "     Security  : Reality"
+echo -e "     Flow      : xtls-rprx-vision"
+echo -e "     SNI       : speedtest.net"
+echo -e "     Fingerprint: firefox"
+echo -e "     SpiderX   : /"
+echo -e "     Sniffing  : ปิดทั้งหมด"
+echo -e "  3. reboot ครั้งเดียว: reboot"
+echo -e "  ════════════════════════════════════════════════════════"
+echo -e "${RST}"
+echo -e "${BLD}${RED}  ⚠ ตรวจ authorized_keys ก่อน reboot! SSH = publickey only${RST}"
 echo ""
