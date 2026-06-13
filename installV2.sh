@@ -4,7 +4,6 @@
 #  สร้างโดย: Claude | เป้าหมาย: ปิง่ต่ำ + ความเป็นส่วนตัวสูงสุด
 #  SNI: speedtest.net | Fingerprint: firefox
 #  รันเสร็จ → reboot 1 ครั้ง → ใช้งานได้เลย
-#  ทำแบบล็อคสเปค1vCPU RAM2GB สำหรับใช้2คน
 # ═══════════════════════════════════════════════════════════════════
 set -uo pipefail
 export LANG=C
@@ -205,13 +204,18 @@ grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
 QDISC="fq"
 modinfo sch_fq &>/dev/null || { warn "fq ไม่มี — ใช้ fq_codel"; QDISC="fq_codel"; }
 
-# ── ค่าบัฟเฟอร์: คำนวณให้พอดีกับ RAM 2GB / 1vCPU 2.69GHz ────────────
-# max 32MB ต่อ socket (เพดานสูงพอสำหรับ throughput เต็มสปีด แต่ไม่กิน RAM
-# จนเหลือไม่พอให้ x-ui/xray/ระบบ แม้เปิดหลาย connection พร้อมกัน)
-RMEM_MAX=33554432
-WMEM_MAX=33554432
-RMEM_DEF=2097152
-WMEM_DEF=2097152
+# ── ค่าบัฟเฟอร์สุดแบบคำนวณตามงบ RAM 2GB / 1vCPU 2.69GHz ─────────────
+# งบ: เผื่อ OS+x-ui+xray+อื่นๆ ไว้ 768MB → เหลือให้ network buffer ได้
+# 1280MB = 327680 pages (4KB/page)
+#   tcp_mem min      = 50% = 163840 pages (640MB)
+#   tcp_mem pressure = 80% = 262144 pages (1024MB)
+#   tcp_mem max      = 100% = 327680 pages (1280MB)
+# rmem/wmem max ตั้งไว้ที่ 64MB ต่อ socket (เพดานสูง แต่ tcp_mem ข้างบน
+# เป็นเพดานรวมที่คุมไม่ให้เกินงบจริงอีกชั้น — ปลอดภัยแม้เปิดหลาย socket)
+RMEM_MAX=67108864
+WMEM_MAX=67108864
+RMEM_DEF=4194304
+WMEM_DEF=4194304
 
 cat > /etc/sysctl.d/99-vless-perf.conf << EOF
 # ── BBR + FQ ──────────────────────────────────────────────────────
@@ -225,7 +229,7 @@ net.core.rmem_default                  = ${RMEM_DEF}
 net.core.wmem_default                  = ${WMEM_DEF}
 net.ipv4.tcp_rmem                      = 4096 ${RMEM_DEF} ${RMEM_MAX}
 net.ipv4.tcp_wmem                      = 4096 ${WMEM_DEF} ${WMEM_MAX}
-net.ipv4.tcp_mem                       = 65536 131072 196608
+net.ipv4.tcp_mem                       = 163840 262144 327680
 net.ipv4.tcp_moderate_rcvbuf           = 1
 net.ipv4.tcp_adv_win_scale             = 1
 
@@ -263,7 +267,7 @@ net.ipv4.tcp_max_orphans               = 32768
 # ── Queue / Backlog ───────────────────────────────────────────────
 net.core.somaxconn                     = 32768
 net.ipv4.tcp_max_syn_backlog           = 32768
-net.core.netdev_max_backlog            = 16384
+net.core.netdev_max_backlog            = 32768
 net.core.netdev_budget                 = 600
 net.core.netdev_budget_usecs           = 4000
 net.ipv4.ip_local_port_range           = 1024 65535
@@ -294,7 +298,7 @@ vm.dirty_ratio                         = 10
 vm.dirty_background_ratio              = 3
 vm.dirty_expire_centisecs              = 500
 vm.dirty_writeback_centisecs           = 100
-vm.min_free_kbytes                     = 65536
+vm.min_free_kbytes                     = 98304
 vm.vfs_cache_pressure                  = 50
 vm.overcommit_memory                   = 1
 
@@ -308,15 +312,15 @@ ok "TCP/network tune เสร็จ"
 
 # ── 3.2 Conntrack (เผื่อ connection พร้อมกันได้มาก แต่ยังเบากับ kernel) ─
 info "3.2 ตั้ง nf_conntrack..."
-echo 131072 > /proc/sys/net/netfilter/nf_conntrack_max                      2>/dev/null || true
+echo 262144 > /proc/sys/net/netfilter/nf_conntrack_max                      2>/dev/null || true
 echo 600    > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established  2>/dev/null || true
 echo 1      > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal           2>/dev/null || true
 cat >> /etc/sysctl.d/99-vless-perf.conf << 'EOF2'
-net.netfilter.nf_conntrack_max                     = 131072
+net.netfilter.nf_conntrack_max                     = 262144
 net.netfilter.nf_conntrack_tcp_timeout_established = 600
 net.netfilter.nf_conntrack_tcp_be_liberal          = 1
 EOF2
-ok "conntrack tune เสร็จ (131072 entries ~ใช้ RAM ราว 40MB เท่านั้น)"
+ok "conntrack tune เสร็จ (262144 entries ~ใช้ RAM ราว 80MB เท่านั้น)"
 
 # ── 3.2b NIC Tune (เบา ปลอดภัย แต่ช่วย throughput จริงบน 1vCPU) ─────
 info "3.2b Tune NIC: ${NIC}..."
@@ -817,6 +821,15 @@ chk_val "IPv6 disable" "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)"
 chk_val "IP forward"   "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"            "1"
 chk_val "kptr_restrict" "$(sysctl -n kernel.kptr_restrict 2>/dev/null)"          "2"
 
+# ── ตรวจงบ RAM จริง vs ค่าที่คำนวณบัฟเฟอร์ไว้ (สมมติฐาน ~2048MB) ────
+if [ "$RAM_MB" -lt 1800 ]; then
+  warn "RAM จริง = ${RAM_MB}MB ต่ำกว่าที่คำนวณบัฟเฟอร์ไว้ (2048MB)"
+  warn "ค่า tcp_mem/rmem_max ที่ตั้งอาจสูงเกินไปสำหรับเครื่องนี้ — พิจารณาลดลง"
+  errors=$((errors+1))
+else
+  ok "RAM จริง = ${RAM_MB}MB ตรงกับงบที่คำนวณบัฟเฟอร์ (2048MB)"
+fi
+
 echo ""
 PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
        || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
@@ -843,9 +856,9 @@ echo -e "  ───────────────────────
 echo -e "  ${BLD}Performance  :${RST}"
 echo -e "    ${GRN}✔${RST}  BBR congestion control"
 echo -e "    ${GRN}✔${RST}  FQ qdisc | THP off | NIC: GRO/GSO/TSO + ring max"
-echo -e "    ${GRN}✔${RST}  TCP buffer 32MB | tcp_mem fit 2GB RAM"
+echo -e "    ${GRN}✔${RST}  TCP buffer 64MB | tcp_mem 640/1024/1280MB (fit 2GB)"
 echo -e "    ${GRN}✔${RST}  Busy-poll 50us | TCP fast | Keepalive 35s"
-echo -e "    ${GRN}✔${RST}  Conntrack 131072 entries"
+echo -e "    ${GRN}✔${RST}  Conntrack 262144 entries (~80MB)"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Security     :${RST}"
 echo -e "    ${GRN}✔${RST}  SSH: publickey only"
