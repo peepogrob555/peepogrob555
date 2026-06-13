@@ -504,12 +504,12 @@ fi
 ok "IPv6 ปิดแล้ว: sysctl + ip6tables + grub"
 
 # ── 4.2 DNS over TLS (ไม่มี DNS leak) ──────────────────────────────
-info "4.2 DNS over TLS (Cloudflare DoT) ..."
+info "4.2 DNS over TLS (Mullvad DoT) ..."
 mkdir -p /etc/systemd/resolved.conf.d
 cat > /etc/systemd/resolved.conf.d/99-dot.conf << 'DOTEOF'
 [Resolve]
-DNS=1.1.1.1#cloudflare-dns.com 1.0.0.1#cloudflare-dns.com
-FallbackDNS=9.9.9.9#dns.quad9.net
+DNS=194.242.2.2#dns.mullvad.net
+FallbackDNS=194.242.2.3#dns.mullvad.net
 DNSOverTLS=yes
 DNSSEC=no
 Cache=yes
