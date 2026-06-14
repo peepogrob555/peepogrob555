@@ -2,9 +2,9 @@ local Players = game:GetService("Players")
 local CollectionService = game:GetService("CollectionService")
 local TweenService = game:GetService("TweenService")
 local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
 
 local running = false
-local harvestThread = nil
 
 local function autoHarvest()
     while running do
@@ -26,19 +26,20 @@ end
 local gui = Instance.new("ScreenGui")
 gui.Name = "AutoHarvestGui"
 gui.ResetOnSpawn = false
-gui.Parent = player:WaitForChild("PlayerGui")
+gui.IgnoreGuiInset = true
+gui.DisplayOrder = 999
+gui.Parent = playerGui
 
 local frame = Instance.new("Frame")
 frame.Size = UDim2.new(0, 180, 0, 60)
-frame.Position = UDim2.new(0, 20, 0, 450)
+frame.Position = UDim2.new(0.5, -90, 0, 20)
 frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+frame.BorderSizePixel = 0
 frame.Active = true
 frame.Draggable = true
 frame.Parent = gui
 
-local frameCorner = Instance.new("UICorner")
-frameCorner.CornerRadius = UDim.new(0, 8)
-frameCorner.Parent = frame
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 
 local label = Instance.new("TextLabel")
 label.Size = UDim2.new(1, 0, 0, 25)
@@ -47,11 +48,10 @@ label.TextColor3 = Color3.new(1, 1, 1)
 label.Text = "Auto Harvest"
 label.Font = Enum.Font.GothamBold
 label.TextSize = 14
+label.BorderSizePixel = 0
 label.Parent = frame
 
-local labelCorner = Instance.new("UICorner")
-labelCorner.CornerRadius = UDim.new(0, 8)
-labelCorner.Parent = label
+Instance.new("UICorner", label).CornerRadius = UDim.new(0, 8)
 
 local btn = Instance.new("TextButton")
 btn.Size = UDim2.new(1, -20, 0, 25)
@@ -62,15 +62,15 @@ btn.Font = Enum.Font.Gotham
 btn.TextSize = 14
 btn.Text = "OFF Auto Harvest"
 btn.AutoButtonColor = false
+btn.BorderSizePixel = 0
 btn.Parent = frame
 
-local btnCorner = Instance.new("UICorner")
-btnCorner.CornerRadius = UDim.new(0, 6)
-btnCorner.Parent = btn
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
 
 btn.MouseEnter:Connect(function()
     TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(70, 70, 70)}):Play()
 end)
+
 btn.MouseLeave:Connect(function()
     if not running then
         TweenService:Create(btn, TweenInfo.new(0.15), {BackgroundColor3 = Color3.fromRGB(50, 50, 50)}):Play()
@@ -79,21 +79,18 @@ end)
 
 btn.MouseButton1Click:Connect(function()
     running = not running
-
-    local targetColor = running and Color3.fromRGB(40, 110, 60) or Color3.fromRGB(50, 50, 50)
-    TweenService:Create(btn, TweenInfo.new(0.2), {BackgroundColor3 = targetColor}):Play()
-
+    TweenService:Create(btn, TweenInfo.new(0.2), {
+        BackgroundColor3 = running and Color3.fromRGB(40, 110, 60) or Color3.fromRGB(50, 50, 50)
+    }):Play()
     local pop = TweenService:Create(btn, TweenInfo.new(0.08), {Size = UDim2.new(1, -24, 0, 23)})
     pop:Play()
     pop.Completed:Connect(function()
         TweenService:Create(btn, TweenInfo.new(0.08), {Size = UDim2.new(1, -20, 0, 25)}):Play()
     end)
-
     btn.Text = (running and "ON" or "OFF") .. " Auto Harvest"
-
     if running then
-        harvestThread = task.spawn(autoHarvest)
-    else
-        harvestThread = nil
+        task.spawn(autoHarvest)
     end
 end)
+
+print("Auto Harvest GUI loaded")
