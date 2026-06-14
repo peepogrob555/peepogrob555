@@ -12,15 +12,14 @@ local function autoHarvest()
             if prompt:IsDescendantOf(workspace) and prompt.Enabled then
                 if not prompt:GetAttribute("Collected") then
                     prompt:InputHoldBegin()
-                    local holdTime = math.max(0.05, prompt.HoldDuration + 0.05)
-                    task.wait(holdTime)
+                    task.wait(math.max(0.05, prompt.HoldDuration + 0.05))
                     if prompt and prompt:IsDescendantOf(workspace) then
                         prompt:InputHoldEnd()
                     end
                 end
             end
         end
-        task.wait(0.1)
+        task.wait(0.01)
     end
 end
 
