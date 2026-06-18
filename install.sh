@@ -618,49 +618,13 @@ else
   warn "ไม่เจอ x-ui.db — จะ patch Xray DNS หลัง reboot + สร้าง inbound"
 fi
 
-# ── 4.2c TCP ONLY: บล็อก outbound UDP ทั้งหมด (เก็บแค่ DHCP renew) ──
-# ทำไมต้องทำเพิ่ม: UFW เดิม block แค่ UDP "ขาเข้า" (default ของ ufw คือ
-# incoming เว้นแต่ระบุ out) ส่วน VLESS เซ็ตเป็น Network:TCP อยู่แล้วก็จริง
-# แต่ Xray ที่ proxy ให้ client ยังสามารถเปิด UDP socket ขาออกได้ถ้า client
-# ขอ relay UDP ผ่าน tunnel (เช่นเว็บที่ใช้ HTTP/3 QUIC บน UDP/443) — เคส
-# นี้คือ UDP ที่ "หลุด" ออกไปจริงโดยไม่ผ่าน UFW rule เดิมเลย ปิดให้สนิทที่
-# ระดับ kernel netfilter ตรงนี้ การันตีว่าไม่มี UDP ออกแม้แต่ packet เดียว
-# ยกเว้น DHCP (udp dport 67) ซึ่งจำเป็นต่อการ renew lease IP ของตัวเครื่อง
-# เอง — ถ้าบล็อกอันนี้ด้วยเสี่ยงหลุดเน็ตหลัง lease หมดอายุ (เสีย SSH ไปเลย)
-info "4.2c TCP-only lockdown: บล็อก outbound UDP ทั้งหมด..."
-cat > /etc/nftables-udp-lockdown.conf << 'UDPEOF'
-#!/usr/sbin/nft -f
-table inet tcp_only_lockdown {
-  chain output_udp_block {
-    type filter hook output priority 0; policy accept;
-    oif "lo" accept
-    udp dport 67 accept
-    meta l4proto udp counter drop
-  }
-}
-UDPEOF
-nft -f /etc/nftables-udp-lockdown.conf 2>/dev/null \
-  && ok "TCP-only lockdown โหลดแล้ว: UDP ขาออกทั้งหมดถูกบล็อก (ยกเว้น DHCP)" \
-  || warn "โหลด nft TCP-only lockdown ล้มเหลว (non-fatal)"
-
-cat > /etc/systemd/system/tcp-only-lockdown.service << 'TLEOF'
-[Unit]
-Description=TCP-only lockdown (block all outbound UDP except DHCP)
-After=network.target
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/nft -f /etc/nftables-udp-lockdown.conf
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-TLEOF
-systemctl daemon-reload
-systemctl enable --now tcp-only-lockdown.service
-warn "ผลกระทบที่ต้องรู้: NTP (UDP/123) จะใช้ไม่ได้ — เครื่อง VPS ส่วนใหญ่ได้เวลาที่แม่นยำ"
-warn "จาก hypervisor (paravirtual clock) อยู่แล้วโดยไม่ต้องพึ่ง NTP ความเสี่ยง drift ต่ำ"
-warn "เว็บที่ใช้ HTTP/3 (QUIC บน UDP/443) จะ fallback เป็น HTTP/2 over TCP อัตโนมัติ"
-warn "(บราวเซอร์ทุกตัวทำ fallback เองภายในไม่กี่วินาที ไม่ใช่ error ที่ต้องแก้)"
-ok "TCP-only lockdown เสร็จ"
+# (TCP-only lockdown step ถูกถอดออก — เกม RoV/Roblox/อื่นๆ พึ่ง UDP จริง
+#  สำหรับ traffic ระหว่างเล่น บล็อก UDP ขาออกทั้งหมดทำให้เกมพวกนี้เล่นไม่ได้
+#  เพราะ Xray relay UDP request ของ client ไม่ได้เลย — "TCP only 0% UDP"
+#  กับ "เล่นเกมที่พึ่ง UDP ผ่าน tunnel ได้" ขัดกันโดยธรรมชาติ เลือกอย่างใด
+#  อย่างหนึ่ง ในเมื่อต้องเล่นเกมได้ จึงถอด lockdown นี้ทิ้ง — DNS leak
+#  protection (DoT/Domains=~./Xray internal DNS) ที่ทำไว้ก่อนหน้านี้ไม่ถูก
+#  แตะต้องเลย เพราะนั่นบล็อกเฉพาะ "พอร์ต 53" ไม่ใช่ UDP ทั้งหมด)
 
 # ── 4.3 Kernel Security Hardening ──────────────────────────────────
 info "4.3 Kernel security hardening..."
@@ -924,7 +888,6 @@ chk_svc fail2ban
 chk_svc thp-disable.service
 chk_svc nic-tune.service
 chk_svc dns-privacy-nft.service
-chk_svc tcp-only-lockdown.service
 chk_svc unattended-upgrades
 
 chk_val "BBR"          "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" "bbr"
@@ -944,23 +907,6 @@ else
 fi
 chk_val "resolved Domains=~." "$(resolvectl status 2>/dev/null | grep -m1 'DNS Domain')" "~."
 
-# ── TCP-only: ทดสอบจริงว่า UDP ขาออกถูก drop (ใช้ nft counter ยืนยัน) ─
-info "ทดสอบ TCP-only lockdown: ลองส่ง UDP packet ออกจริงแล้วเช็ค counter..."
-get_udp_drop_count() {
-  nft list chain inet tcp_only_lockdown output_udp_block 2>/dev/null \
-    | grep -oP 'packets \d+' | grep -oP '\d+' | tail -1
-}
-udp_before=$(get_udp_drop_count); udp_before=${udp_before:-0}
-(exec 3<>/dev/udp/8.8.8.8/53; echo -n "x" >&3; exec 3>&-) 2>/dev/null || true
-sleep 1
-udp_after=$(get_udp_drop_count); udp_after=${udp_after:-0}
-if [ "$udp_after" -gt "$udp_before" ]; then
-  ok "ยืนยันแล้ว: UDP packet ทดสอบถูก drop จริง (counter ${udp_before} → ${udp_after})"
-else
-  warn "ไม่เห็น counter เพิ่ม (${udp_before} → ${udp_after}) — ตรวจ: nft list table inet tcp_only_lockdown"
-  errors=$((errors+1))
-fi
-
 # ── ตรวจงบ RAM จริง vs ค่าที่คำนวณบัฟเฟอร์ไว้ (สมมติฐาน ~2048MB) ────
 if [ "$RAM_MB" -lt 1800 ]; then
   warn "RAM จริง = ${RAM_MB}MB ต่ำกว่าที่คำนวณบัฟเฟอร์ไว้ (2048MB)"
@@ -978,7 +924,7 @@ echo -e "  ═══════════════════════
 echo -e "  ${BLD}Server IP    :${RST} ${PUB_IP}"
 echo -e "  ${BLD}Panel URL    :${RST} http://${PUB_IP}:${PANEL_PORT}/"
 echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}Protocol     :${RST} VLESS | Port: 443 | Network: TCP only (UDP ขาออก = 0%, block ที่ kernel)"
+echo -e "  ${BLD}Protocol     :${RST} VLESS | Port: 443 | Network: TCP (UDP relay เปิดใช้งานได้ปกติ — เกมที่พึ่ง UDP เล่นได้)"
 echo -e "  ${BLD}Security     :${RST} Reality"
 echo -e "  ${BLD}Flow         :${RST} xtls-rprx-vision"
 echo -e "  ${BLD}SNI          :${RST} ${TLS_SNI}"
