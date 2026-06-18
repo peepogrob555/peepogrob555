@@ -1,29 +1,19 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════
-#  VMESS WS (no TLS) + CloudFront — REMASTER 2.0 — Ubuntu 24.04 LTS
-#  สร้างโดย: Claude | เป้าหมาย: ความเป็นส่วนตัวสูงสุด + เสถียรผ่าน CDN
-#  Transport: WebSocket | Security: none (TLS terminate ที่ CloudFront)
-#  เหตุผลเปลี่ยนจาก VLESS Reality → VMess WS:
-#    Reality พึ่ง TLS fingerprint ของ server เองตรงๆ ไม่ผ่าน CDN ชั้นกลาง
-#    ส่วน VMess+WS+CloudFront ให้ CloudFront เป็นเลเยอร์ TLS/CDN แทน
-#    เหมาะกับเคสที่ Reality เริ่มถูกตรวจจับ/ไม่เสถียรหลังใช้ไปสักพัก
+#  VLESS Reality (RAW TCP) Port 443 — REMASTER 3.0 — Ubuntu 24.04 LTS
+#  สร้างโดย: Claude | เป้าหมาย: ปิงต่ำ + รองรับ 1Gbps + privacy สูงสุด
+#  Transport: tcp (raw, ไม่มี WS) | Security: Reality
+#  Fingerprint: firefox | Dest/SNI: speedtest.net | Port: 443
 #
-#  ⚠ ขอบเขตของสคริปต์นี้ (ตามที่ระบุ):
-#    - จะไม่ติดตั้ง/ตั้งค่า 3x-ui installer ใดๆ ทั้งสิ้น
-#    - จะไม่สร้าง/แก้ inbound, client, หรือ sockopt ใดๆ ใน x-ui.db
-#    - ทุกอย่างที่เกี่ยวกับ VMess inbound (path, port ภายใน xray, UUID,
-#      sockopt ฯลฯ) ผู้ใช้ตั้งเองทั้งหมดผ่าน panel — สคริปต์นี้แค่
-#      เตรียม "พื้นที่" (firewall, kernel, privacy, CDN-facing port)
-#      ให้พร้อมใช้งาน แล้วแนะนำค่าที่ควรตั้งไว้ตอนจบสคริปต์เท่านั้น
+#  ⚠ ขอบเขตของสคริปต์นี้ (ตามที่ตกลง):
+#    - จะติดตั้ง 3x-ui ให้ (interactive installer ของจริง) แต่จะ "ไม่"
+#      auto-กรอก inbound/client/sockopt ใดๆ ทั้งสิ้น — ผู้ใช้กรอกเอง
+#      ทุกช่องในหน้า panel หลังติดตั้งเสร็จ
+#    - จะไม่แก้ x-ui.db, ไม่ฉีด systemd override ไปยุ่ง sockopt ของ xray
+#    - MSS 1440: สคริปต์ clamp ระดับ firewall (iptables/mangle) ให้
+#      เข้ากันเฉยๆ ส่วน tcpMaxSeg ใน 3x-ui inbound settings ผู้ใช้ตั้งเอง
 #
-#  MTU/MSS: ออกแบบให้เข้ากับ MTU 1500 ฝั่ง v2box (mobile client) —
-#  clamp TCP MSS ที่ระดับ iptables (เสถียรกว่า sysctl base_mss อย่างเดียว
-#  เพราะ base_mss เป็นแค่ค่า "เริ่มต้น" ตอน SYN แรกของฝั่งเรา ไม่บังคับ
-#  ทุก connection ที่วิ่งผ่านจริง ส่วน iptables --clamp-mss-to-pmtu
-#  บังคับทุก SYN/SYN-ACK ที่ผ่าน firewall ให้ไม่เกิน ceiling ที่ตั้งไว้
-#  ป้องกัน fragmentation ที่มักเกิดจาก overhead เพิ่มของ WS+CloudFront)
-#
-#  รันเสร็จ → reboot 1 ครั้ง → ไปตั้ง inbound เองใน 3x-ui ตามค่าแนะนำท้ายสคริปต์
+#  รันเสร็จ → reboot 1 ครั้ง → เข้า panel กรอก inbound เอง
 # ═══════════════════════════════════════════════════════════════════
 set -uo pipefail
 export LANG=C
@@ -33,7 +23,7 @@ GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'
 CYN='\033[0;36m'; BLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
 
 # ── log ─────────────────────────────────────────────────────────────
-STATE_DIR="/var/lib/vmess-setup"
+STATE_DIR="/var/lib/vless-reality-setup"
 LOG_FILE="${STATE_DIR}/setup.log"
 mkdir -p "$STATE_DIR"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -46,7 +36,7 @@ info() { echo -e "  ${CYN}ℹ${RST}  $1"; }
 die()  { echo -e "\n${RED}${BLD}✘  $1${RST}\n"; exit 1; }
 ask()  { echo -e "\n  ${BLD}${YEL}▷  $1${RST}"; }
 
-[ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root (sudo bash vmess-ws-setup.sh)"
+[ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root (sudo bash vless-reality-setup.sh)"
 
 # ── ตรวจ Ubuntu version (non-fatal — แค่เตือน) ───────────────────────
 OS_ID=""; OS_VER=""
@@ -63,19 +53,30 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-#  ตั้งค่าหลัก — แก้ค่าด้านล่างนี้ก่อนรัน ถ้าจำเป็น
+#  ตั้งค่าหลัก
 # ═══════════════════════════════════════════════════════════════════
 PANEL_PORT=2053
-VMESS_WS_PORT=80          # origin port ที่ CloudFront ยิงเข้ามา (HTTP)
+REALITY_PORT=443           # VLESS Reality listen ตรงนี้ raw TCP ไม่มี CDN
 SWAP_SIZE_MB=512
-TCP_MSS_CEIL=1440          # ตามที่ขอ: เข้ากับ MTU 1500 ฝั่ง v2box
+TCP_MSS_CEIL=1440           # เข้ากับ MTU 1500 ฝั่ง v2box
+REALITY_DEST="speedtest.net:443"
+REALITY_SNI="speedtest.net"
+REALITY_FINGERPRINT="firefox"
 
-# ⚠ แก้ตรงนี้เป็น IP จริงของคุณก่อนรัน! ใช้จำกัดการเข้าถึง panel port
-# วิธีหา IP ตัวเอง: เปิดเบราว์เซอร์จากเครื่องที่จะใช้เข้า panel แล้วเข้า
-# https://ifconfig.me หรือรัน `curl ifconfig.me` จากเครื่องนั้น
-# ถ้าใช้เน็ตมือถือที่ IP เปลี่ยนบ่อย ใส่เป็น CIDR กว้างขึ้นได้ เช่น
-# 203.0.113.0/24 (แต่ยิ่งกว้างยิ่งปลอดภัยน้อยลง)
-ALLOWED_PANEL_IP="CHANGE_ME_TO_YOUR_IP"
+# UDP ports สำหรับเกมหลักๆที่รู้ port แน่นอน + Xray relay เอง
+# (ไม่เปิด ephemeral เต็ม 1024-65535 ตามที่ตกลง — แคบกว่านี้ ปลอดภัยกว่า)
+GAME_UDP_PORTS=(
+  "3478:3480"     # RoV / Garena (STUN-style voice/lobby)
+  "5055:5057"     # RoV เกมเพลย์
+  "10000:10100"   # PUBG Mobile
+  "7000:7999"     # Mobile Legends / Free Fire ช่วงที่ใช้บ่อย
+  "50000:50100"   # Valorant (เผื่อกรณีเล่นผ่าน PC tether)
+  "9000:9100"     # Roblox UDP
+)
+
+ask "กรอก IP เครื่องที่จะใช้เข้า panel (เว้นว่างเพื่อเปิดให้ทุก IP — ไม่แนะนำ):"
+read -r ALLOWED_PANEL_IP
+[ -z "$ALLOWED_PANEL_IP" ] && ALLOWED_PANEL_IP="ANY"
 
 _detect_nic() {
   ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}'
@@ -91,9 +92,9 @@ PUB_IP=$(curl -sf --max-time 8 https://ifconfig.me 2>/dev/null \
 
 echo ""
 echo -e "${BLD}${CYN}╔══════════════════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}${CYN}║  VMESS WS (no TLS) + CloudFront — REMASTER 2.0            ║${RST}"
-echo -e "${BLD}${CYN}║  Transport: WS | Security: none | CDN: CloudFront         ║${RST}"
-echo -e "${BLD}${CYN}║  Origin Port: ${VMESS_WS_PORT} | Panel: ${PANEL_PORT} | IPv6: OFF              ║${RST}"
+echo -e "${BLD}${CYN}║  VLESS Reality (RAW TCP) Port 443 — REMASTER 3.0          ║${RST}"
+echo -e "${BLD}${CYN}║  Fingerprint: firefox | Dest/SNI: speedtest.net           ║${RST}"
+echo -e "${BLD}${CYN}║  Port: ${REALITY_PORT} | Panel: ${PANEL_PORT} | IPv6: OFF                  ║${RST}"
 echo -e "${BLD}${CYN}╚══════════════════════════════════════════════════════════╝${RST}"
 echo ""
 info "Server IP : ${PUB_IP}"
@@ -101,25 +102,22 @@ info "NIC       : ${NIC}"
 info "RAM       : ${RAM_MB}MB  vCPU: ${VCPU}"
 echo ""
 
-if [ "$ALLOWED_PANEL_IP" = "CHANGE_ME_TO_YOUR_IP" ]; then
+if [ "$ALLOWED_PANEL_IP" = "ANY" ]; then
   warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  warn "  ALLOWED_PANEL_IP ยังไม่ถูกแก้! ยังเป็นค่า placeholder อยู่"
-  warn "  ถ้าปล่อยแบบนี้ panel port ${PANEL_PORT} จะถูกบล็อกทุก IP"
-  warn "  (ปลอดภัยไว้ก่อน แต่คุณจะเข้า panel เองไม่ได้เช่นกัน)"
-  warn "  แก้ตัวแปรนี้ในไฟล์สคริปต์ก่อนรัน แล้วรันใหม่"
+  warn "  panel port ${PANEL_PORT} จะเปิดให้ทุก IP เข้าได้ — ไม่ปลอดภัย"
+  warn "  ถ้าต้องการจำกัด ให้ Ctrl+C แล้วรันใหม่พร้อมกรอก IP"
   warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-  ask "กด ENTER เพื่อรันต่อแบบ panel port ถูกบล็อกทุก IP ไปก่อน (Ctrl+C เพื่อยกเลิกไปแก้ก่อน)..."
+  ask "กด ENTER เพื่อรันต่อแบบเปิด panel ให้ทุก IP (Ctrl+C เพื่อยกเลิก)..."
   read -r
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-hdr "STEP 1 — อัปเดตระบบ + ติดตั้งแพ็กเกจ + ตั้ง Firewall"
+hdr "STEP 1 — Full Upgrade + ติดตั้งแพ็กเกจ + Firewall"
 # ═══════════════════════════════════════════════════════════════════
 
 # ── 1.1 รอ lock apt ─────────────────────────────────────────────────
-info "1.1 หยุด unattended-upgrades + รอ apt lock..."
+info "1.1 หยุด unattended-upgrades ชั่วคราว + รอ apt lock..."
 systemctl stop    unattended-upgrades 2>/dev/null || true
-systemctl disable unattended-upgrades 2>/dev/null || true
 systemctl kill --kill-who=all unattended-upgrades 2>/dev/null || true
 waited=0
 while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
@@ -135,15 +133,29 @@ done
 dpkg --configure -a
 ok "apt พร้อมแล้ว"
 
-# ── 1.2 Update + Upgrade ────────────────────────────────────────────
-info "1.2 apt update + upgrade..."
+# ── 1.2 Full update + upgrade ทุกอย่างจริงๆ (รวม dist-upgrade + firmware) ──
+info "1.2 apt update + full-upgrade + dist-upgrade (อัปเดตทุกอย่างที่มี)..."
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
-ok "update + upgrade เสร็จ"
+DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+DEBIAN_FRONTEND=noninteractive apt-get dist-upgrade -y
+DEBIAN_FRONTEND=noninteractive apt-get autoremove -y --purge
+apt-get autoclean -y
+ok "full-upgrade + dist-upgrade + autoremove เสร็จ"
+
+if command -v fwupdmgr &>/dev/null; then
+  info "1.2b ตรวจ firmware update (ถ้า VPS provider รองรับ)..."
+  fwupdmgr refresh --force 2>/dev/null || true
+  fwupdmgr get-updates 2>/dev/null || true
+  fwupdmgr update -y 2>/dev/null || true
+  ok "firmware check เสร็จ (ถ้าไม่มีอะไรให้อัปเดตจะข้ามแบบไม่ error)"
+fi
+
+if [ -f /var/run/reboot-required ]; then
+  warn "ระบบแจ้งว่าต้อง reboot จาก kernel/lib update — สคริปต์จะแนะนำ reboot ท้ายสุดอยู่แล้ว"
+fi
 
 # ── 1.3 ติดตั้งแพ็กเกจที่จำเป็น ─────────────────────────────────────
-# หมายเหตุ: ใส่ iptables ตรงๆ เพราะใช้ทำ MSS clamp ใน STEP 3 ด้วย
-# (ไม่ใช่แค่กัน ip6tables ขาดเหมือนสคริปต์เดิม)
 info "1.3 ติดตั้ง dependencies..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   curl ufw nftables iptables sqlite3 ethtool iproute2 \
@@ -159,37 +171,37 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw default deny forward
 
-# เปิดเฉพาะ TCP ที่จำเป็น
-ufw limit   22/tcp              comment "SSH"
-ufw allow   80/tcp              comment "VMess WS origin (CloudFront -> here)"
+# SSH + Reality port
+ufw limit 22/tcp                comment "SSH"
+ufw allow ${REALITY_PORT}/tcp   comment "VLESS Reality raw TCP"
 
-# Panel port: จำกัดเฉพาะ IP ที่กำหนด (ถ้ายังเป็น placeholder จะไม่เปิดให้ใครเลย)
-if [ "$ALLOWED_PANEL_IP" != "CHANGE_ME_TO_YOUR_IP" ]; then
+# Panel port
+if [ "$ALLOWED_PANEL_IP" != "ANY" ]; then
   ufw allow from "${ALLOWED_PANEL_IP}" to any port "${PANEL_PORT}" proto tcp comment "3x-ui panel (restricted)"
   ok "Panel port ${PANEL_PORT} เปิดเฉพาะจาก ${ALLOWED_PANEL_IP}"
 else
-  warn "Panel port ${PANEL_PORT} ไม่ถูกเปิดให้ใคร (ALLOWED_PANEL_IP ยังไม่ถูกแก้)"
-  warn "แก้ตัวแปรในสคริปต์แล้วรันคำสั่งนี้เองทีหลังได้:"
-  warn "  ufw allow from <YOUR_IP> to any port ${PANEL_PORT} proto tcp"
+  ufw allow ${PANEL_PORT}/tcp comment "3x-ui panel (open - no IP restriction set)"
+  warn "Panel port ${PANEL_PORT} เปิดให้ทุก IP (ไม่ได้กรอก IP ตอนเริ่มสคริปต์)"
 fi
 
-# ⚠ หมายเหตุ UDP:
-# ไม่ block UDP ทั้งหมด เพราะ Xray ต้องใช้ relay UDP ให้ client ได้
-# (เกมอย่าง Roblox / RoV / เกมอื่นๆ ที่พึ่ง UDP จะเล่นไม่ได้ถ้า block)
-# DNS leak ถูกกันด้วยวิธีอื่นแทน: DoT (port 853) + nftables block port 53
-# ซึ่งแม่นยำกว่าการ block UDP ทั้งหมด
+# UDP เกม — เปิดเฉพาะช่วงที่รู้จัก ไม่เปิด ephemeral เต็มช่วง
+info "1.4b เปิด UDP ports สำหรับเกม (เฉพาะช่วงที่รู้จัก ไม่เปิดกว้างทั้ง ephemeral)..."
+for range in "${GAME_UDP_PORTS[@]}"; do
+  ufw allow ${range}/udp comment "Game UDP"
+  info "  เปิด UDP ${range}"
+done
 
 # ปิด port อันตราย
-ufw deny    23/tcp
-ufw deny    25/tcp
-ufw deny    3389/tcp
+ufw deny 23/tcp
+ufw deny 25/tcp
+ufw deny 3389/tcp
 
 # ปิด IPv6 ใน UFW
 sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
 
 ufw --force enable
 ufw status verbose
-ok "UFW Firewall เปิดแล้ว: 22 (limit) / 80 TCP เปิดกว้าง | ${PANEL_PORT} TCP จำกัด IP | UDP relay เปิด"
+ok "UFW Firewall เปิดแล้ว: 22 (limit) / ${REALITY_PORT} TCP เปิด | ${PANEL_PORT} TCP | UDP เกมเฉพาะช่วงที่กำหนด"
 
 # ── 1.5 Swap ────────────────────────────────────────────────────────
 info "1.5 สร้าง Swap ${SWAP_SIZE_MB}MB..."
@@ -210,80 +222,93 @@ ok "Swap พร้อม"
 ok "═══ STEP 1 เสร็จสมบูรณ์ ═══"
 
 # ═══════════════════════════════════════════════════════════════════
-hdr "STEP 2 — ตรวจสอบ 3x-ui (ไม่ติดตั้ง / ไม่แก้ inbound ใดๆ)"
+hdr "STEP 2 — ติดตั้ง 3x-ui (Interactive — ผู้ใช้กรอกเอง ไม่ auto)"
 # ═══════════════════════════════════════════════════════════════════
-# ตามที่ตกลง: สคริปต์นี้จะไม่รัน 3x-ui installer, ไม่สร้าง/แก้ inbound,
-# ไม่แตะ client หรือ sockopt ใดๆ ทั้งสิ้น — ผู้ใช้จัดการส่วนนี้เองทั้งหมด
-# ขั้นตอนนี้แค่เช็คว่า service มีอยู่หรือยัง เพื่อให้ verify ท้ายสคริปต์
-# ทำงานได้ถูกต้อง (ถ้ายังไม่ติดตั้งก็ข้ามแบบไม่ error)
+# ตามที่ตกลง: รัน installer ตัวจริงแบบ interactive ให้ผู้ใช้กรอก
+# username/password/port เองทั้งหมด สคริปต์นี้ "ไม่" auto-เติมอะไรให้
+# และจะไม่ไปสร้าง/แก้ inbound, client, sockopt ใดๆ ใน x-ui.db ทั้งสิ้น
 
 if command -v x-ui &>/dev/null || [ -x /usr/local/x-ui/x-ui ]; then
-  ok "พบ 3x-ui ติดตั้งอยู่แล้วในระบบ"
-  systemctl is-active x-ui &>/dev/null && ok "x-ui service active" || warn "x-ui ติดตั้งแล้วแต่ service ยังไม่ active — ไปเช็คเองที่: systemctl status x-ui"
+  ok "พบ 3x-ui ติดตั้งอยู่แล้วในระบบ — ข้ามการติดตั้ง"
+  systemctl is-active x-ui &>/dev/null && ok "x-ui service active" || warn "x-ui ติดตั้งแล้วแต่ service ยังไม่ active — เช็คเอง: systemctl status x-ui"
 else
-  info "ยังไม่พบ 3x-ui ในระบบ — ข้ามขั้นตอนนี้ตามที่ตกลง (ไม่ติดตั้งให้)"
-  info "ติดตั้งเองได้จาก: https://github.com/mhsanaei/3x-ui"
+  info "เริ่มติดตั้ง 3x-ui (interactive) — กรอก username/password/port ของคุณเองตามที่ installer ถาม..."
+  echo ""
+  bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+  echo ""
+  if command -v x-ui &>/dev/null || [ -x /usr/local/x-ui/x-ui ]; then
+    ok "ติดตั้ง 3x-ui สำเร็จ"
+  else
+    warn "ไม่พบ x-ui หลังติดตั้ง — ตรวจสอบ output ด้านบนว่า installer error หรือไม่"
+  fi
 fi
 
 echo ""
 warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-warn "  ค่าที่แนะนำให้ตั้งตอนสร้าง VMess inbound เอง (ดูสรุปท้ายสคริปต์ด้วย):"
-warn "  - Protocol     : VMess"
-warn "  - Network      : WS (WebSocket)"
-warn "  - Port         : ${VMESS_WS_PORT} (origin ที่ firewall เปิดให้ CloudFront ยิงเข้ามา)"
-warn "  - Security     : none (TLS terminate ที่ CloudFront แล้ว ไม่ต้อง TLS ซ้อนที่ server)"
-warn "  - Path         : ตั้งเอง ให้ตรงกับ CloudFront origin path ทุกตัวอักษร"
-warn "  - Host header   : ให้ตรงกับ domain ที่ผูกกับ CloudFront distribution"
-warn "  - Sniffing     : ปิดทั้งหมด (เพิ่ม privacy — ไม่ให้ xray sniff destination)"
+warn "  ค่าที่ต้องกรอกเองตอนสร้าง VLESS Reality inbound ใน panel:"
+warn "  - Protocol      : VLESS"
+warn "  - Network       : tcp (raw — ไม่ใช่ WS)"
+warn "  - Port          : ${REALITY_PORT}"
+warn "  - Security      : reality"
+warn "  - Dest          : ${REALITY_DEST}"
+warn "  - Server Name(s): ${REALITY_SNI}"
+warn "  - Fingerprint   : ${REALITY_FINGERPRINT}"
+warn "  - Private/Public Key + Short ID : กด generate ในหน้า panel เอง"
+warn "  - tcpMaxSeg     : ${TCP_MSS_CEIL} (ตั้งเองในหน้า sockopt ของ inbound)"
+warn "  - Sniffing      : แนะนำปิดทั้งหมด"
 warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
 
-ok "═══ STEP 2 เสร็จสมบูรณ์ (ไม่มีการแก้ไข 3x-ui/inbound) ═══"
+ok "═══ STEP 2 เสร็จสมบูรณ์ ═══"
 
 # ═══════════════════════════════════════════════════════════════════
-hdr "STEP 3 — Optimize: Kernel / Network / TCP (ปิงต่ำ + throughput สูง)"
+hdr "STEP 3 — Optimize: Kernel / Network / TCP (เกม + Netflix 4K60, รองรับ 1Gbps)"
 # ═══════════════════════════════════════════════════════════════════
 
-# ── 3.1 BBR + TCP Tune ──────────────────────────────────────────────
+# ── 3.1 BBR + FQ ────────────────────────────────────────────────────
 info "3.1 โหลด BBR + ตั้งค่า TCP/network..."
 modprobe tcp_bbr     2>/dev/null || true
 modprobe nf_conntrack 2>/dev/null || true
 
-# ตรวจ BBR
 CC="bbr"
 grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
   || { warn "BBR ไม่มี — ใช้ cubic"; CC="cubic"; }
 
-# ตรวจ fq
 QDISC="fq"
 modinfo sch_fq &>/dev/null || { warn "fq ไม่มี — ใช้ fq_codel"; QDISC="fq_codel"; }
 
-# ── ค่าบัฟเฟอร์ — เน้น latency ต่ำ/ไม่แลคบนมือถือ (anti-bufferbloat)
-# ceiling ต่อ socket 8MB + default เล็ก 128KB ให้ tcp_moderate_rcvbuf
-# auto-tune เอง ไม่ commit memory ตั้งแต่ต้น (ค่าอ้างอิงจากสคริปต์เดิม)
-RMEM_MAX=8388608
-WMEM_MAX=8388608
+# ── บัฟเฟอร์: เล็กพอไม่ bufferbloat/ไม่ร้อน CPU แต่พอสำหรับ 1Gbps
+# คำนวณจาก BDP ที่ RTT เฉลี่ย (~150ms) บนลิงก์ 1Gbps:
+#   BDP = 1,000,000,000 bps * 0.15s / 8 = ~18.75MB ทางทฤษฎี
+# แต่ค่านี้ใหญ่เกินจำเป็นจริงสำหรับ 2 ผู้ใช้ และจะทำให้ bufferbloat
+# (แลคตอน burst) แทนที่จะช่วย — ใช้ BBR เป็นตัวคุม pacing หลัก ส่วน
+# socket buffer ตั้งแค่ "พอเผื่อ" BBR ทำงานโดยไม่ติด ceiling ไว ๆ
+# เลือก ceiling 16MB ต่อ socket: พอสำหรับ Netflix 4K60 (~25-40Mbps
+# เฉลี่ย, burst ระยะสั้นสูงกว่านั้น) + เกม latency-sensitive ไม่กิน
+# RAM เกินจำเป็นบนเครื่อง 1-2GB
+RMEM_MAX=16777216
+WMEM_MAX=16777216
 RMEM_DEF=131072
 WMEM_DEF=131072
 
-cat > /etc/sysctl.d/99-vmess-perf.conf << EOF
+cat > /etc/sysctl.d/99-reality-perf.conf << EOF
 # ── BBR + FQ ──────────────────────────────────────────────────────
 net.ipv4.tcp_congestion_control        = ${CC}
 net.core.default_qdisc                 = ${QDISC}
 
-# ── Buffer (ปรับเน้น low-latency / anti-bufferbloat) ───────────────
+# ── Buffer (เล็กพอ ไม่ bufferbloat แต่พอสำหรับ 1Gbps + 4K60) ───────
 net.core.rmem_max                      = ${RMEM_MAX}
 net.core.wmem_max                      = ${WMEM_MAX}
 net.core.rmem_default                  = ${RMEM_DEF}
 net.core.wmem_default                  = ${WMEM_DEF}
 net.ipv4.tcp_rmem                      = 4096 ${RMEM_DEF} ${RMEM_MAX}
 net.ipv4.tcp_wmem                      = 4096 ${WMEM_DEF} ${WMEM_MAX}
-net.ipv4.tcp_mem                       = 65536 98304 131072
+net.ipv4.tcp_mem                       = 65536 131072 262144
 net.ipv4.tcp_moderate_rcvbuf           = 1
 net.ipv4.tcp_adv_win_scale             = 1
 net.ipv4.tcp_notsent_lowat             = 131072
 
-# ── Loss recovery / re-ordering (ฟรี ไม่กิน CPU เพิ่ม) ─────────────
+# ── Loss recovery / re-ordering ────────────────────────────────────
 net.ipv4.tcp_reordering                = 6
 net.ipv4.tcp_frto                      = 2
 net.ipv4.tcp_recovery                  = 1
@@ -296,9 +321,6 @@ net.ipv4.tcp_sack                      = 1
 net.ipv4.tcp_dsack                     = 1
 net.ipv4.tcp_ecn                       = 1
 net.ipv4.tcp_mtu_probing               = 1
-# base_mss ตั้งคู่กับ iptables clamp ด้านล่าง (STEP 3.1b) — base_mss
-# เป็นค่าเริ่มต้นตอน SYN แรกของฝั่งเรา ส่วน iptables clamp คือตัวบังคับ
-# จริงกับทุก connection ที่วิ่งผ่าน เข้ากับ MTU 1500 ฝั่ง v2box
 net.ipv4.tcp_base_mss                  = ${TCP_MSS_CEIL}
 net.ipv4.tcp_slow_start_after_idle     = 0
 net.ipv4.tcp_autocorking               = 0
@@ -317,7 +339,7 @@ net.ipv4.tcp_retries2                  = 8
 net.ipv4.tcp_orphan_retries            = 2
 net.ipv4.tcp_max_orphans               = 32768
 
-# ── Queue / Backlog ───────────────────────────────────────────────
+# ── Queue / Backlog (รองรับ throughput สูงถึง 1Gbps) ───────────────
 net.core.somaxconn                     = 32768
 net.ipv4.tcp_max_syn_backlog           = 32768
 net.core.netdev_max_backlog            = 32768
@@ -325,8 +347,7 @@ net.core.netdev_budget                 = 600
 net.core.netdev_budget_usecs           = 4000
 net.ipv4.ip_local_port_range           = 1024 65535
 
-# ── Busy poll: ลด latency เพิ่มอีกนิด (50us, เบาพอสำหรับ 1vCPU 2.69GHz
-#    กับผู้ใช้ 2 คน — ถ้า CPU สูงผิดปกติให้ลบ 2 บรรทัดนี้ทิ้ง) ──────
+# ── Busy poll: ลด latency เพิ่มอีกนิด (เบาพอสำหรับ 1vCPU, ผู้ใช้ 2 คน) ──
 net.core.busy_poll                     = 50
 net.core.busy_read                     = 50
 
@@ -360,19 +381,10 @@ fs.file-max                            = 1048576
 fs.nr_open                             = 1048576
 EOF
 
-sysctl -p /etc/sysctl.d/99-vmess-perf.conf
-ok "TCP/network tune เสร็จ"
+sysctl -p /etc/sysctl.d/99-reality-perf.conf
+ok "TCP/network tune เสร็จ (buffer ceiling 16MB/socket, รองรับ 1Gbps ไม่ bufferbloat)"
 
-# ── 3.1b MSS Clamp ผ่าน iptables (เสถียรกว่า sysctl base_mss อย่างเดียว) ─
-# เหตุผลที่เลือก iptables clamp แทนตั้งแค่ sysctl:
-#   - base_mss คือค่า "เริ่มต้น" ที่ kernel ใช้ตอนยังไม่รู้ PMTU จริง
-#     มันมีผลแค่บาง edge case ตอนเริ่ม connection ไม่ใช่บังคับทุกแพ็กเกต
-#   - --clamp-mss-to-pmtu (+ ceiling 1440) บังคับ "ทุก" SYN/SYN-ACK ที่
-#     วิ่งผ่าน chain นี้ให้ MSS ไม่เกินค่าที่ตั้ง ป้องกัน fragmentation
-#     จาก overhead ที่ WS + CloudFront เพิ่มเข้ามาเทียบกับ raw TCP ปกติ
-#     ได้แน่นอนกว่า ไม่ขึ้นกับว่า client/kernel ฝั่งโน้นจะ negotiate ยังไง
-# หมายเหตุ: นี่คือ firewall-level clamp เท่านั้น ไม่ใช่การตั้งค่าใน sockopt
-# ของ xray/3x-ui (ตามที่ตกลงว่าจะไม่ยุ่งส่วนนั้น)
+# ── 3.1b MSS Clamp ผ่าน iptables (firewall-level, เข้ากับ tcpMaxSeg ที่ตั้งใน panel) ─
 info "3.1b ตั้ง MSS clamp ที่ ${TCP_MSS_CEIL} ผ่าน iptables..."
 iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 iptables -t mangle -D OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
@@ -395,19 +407,19 @@ systemctl daemon-reload
 systemctl enable mss-clamp-restore.service
 ok "MSS clamp ${TCP_MSS_CEIL} เสร็จ (FORWARD + OUTPUT, persist ผ่าน reboot)"
 
-# ── 3.2 Conntrack (เผื่อ connection พร้อมกันได้มาก แต่ยังเบากับ kernel) ─
+# ── 3.2 Conntrack ───────────────────────────────────────────────────
 info "3.2 ตั้ง nf_conntrack..."
 echo 262144 > /proc/sys/net/netfilter/nf_conntrack_max                      2>/dev/null || true
 echo 600    > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established  2>/dev/null || true
 echo 1      > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal           2>/dev/null || true
-cat >> /etc/sysctl.d/99-vmess-perf.conf << 'EOF2'
+cat >> /etc/sysctl.d/99-reality-perf.conf << 'EOF2'
 net.netfilter.nf_conntrack_max                     = 262144
 net.netfilter.nf_conntrack_tcp_timeout_established = 600
 net.netfilter.nf_conntrack_tcp_be_liberal          = 1
 EOF2
 ok "conntrack tune เสร็จ (262144 entries ~ใช้ RAM ราว 80MB เท่านั้น)"
 
-# ── 3.2b NIC Tune (เบา ปลอดภัย แต่ช่วย throughput จริงบน 1vCPU) ─────
+# ── 3.2b NIC Tune ───────────────────────────────────────────────────
 info "3.2b Tune NIC: ${NIC}..."
 ethtool -K "${NIC}" gro on gso on tso on 2>/dev/null || true
 
@@ -423,7 +435,6 @@ ip link set "${NIC}" txqueuelen 10000 2>/dev/null || true
 tc qdisc del dev "${NIC}" root 2>/dev/null || true
 tc qdisc add dev "${NIC}" root handle 1: "${QDISC}" 2>/dev/null || true
 
-# Persist หลัง reboot
 cat > /etc/systemd/system/nic-tune.service << NSEOF
 [Unit]
 Description=NIC Tuning persistent (light)
@@ -460,11 +471,11 @@ WantedBy=multi-user.target
 THPEOF
 systemctl daemon-reload
 systemctl enable --now thp-disable.service
-ok "THP ปิดแล้ว"
+ok "THP ปิดแล้ว (ลดโอกาส latency spike จาก huge page compaction)"
 
 # ── 3.4 System Limits ───────────────────────────────────────────────
 info "3.4 ตั้ง system limits..."
-cat > /etc/security/limits.d/99-vmess.conf << 'LIMEOF'
+cat > /etc/security/limits.d/99-reality.conf << 'LIMEOF'
 *    soft nofile   2097152
 *    hard nofile   2097152
 *    soft nproc    131072
@@ -482,19 +493,29 @@ done
 ok "limits เสร็จ"
 
 # ── 3.5 irqbalance ──────────────────────────────────────────────────
-info "3.5 irqbalance..."
+info "3.5 irqbalance (กระจาย interrupt ข้าม core ลด CPU spike ตัวเดียว)..."
 systemctl enable --now irqbalance 2>/dev/null || true
 ok "irqbalance เสร็จ"
 
+# ── 3.6 CPU governor: performance (ถ้า VPS provider expose ให้ปรับ) ─
+info "3.6 ตรวจ CPU governor..."
+if [ -d /sys/devices/system/cpu/cpu0/cpufreq ]; then
+  for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
+    echo performance > "$gov" 2>/dev/null || true
+  done
+  ok "ตั้ง CPU governor = performance (ลด latency จาก frequency scaling)"
+else
+  info "VPS นี้ไม่ expose cpufreq governor ให้ปรับ (ปกติสำหรับ KVM ส่วนใหญ่) — ข้าม"
+fi
+
 ok "═══ STEP 3 เสร็จสมบูรณ์ ═══"
-info "หมายเหตุ: ไม่มีการแก้ x-ui systemd override / x-ui.db / SQLite WAL ใดๆ ในขั้นนี้"
-info "เพราะเป็นการ 'จัดการ x-ui' ตามขอบเขตที่ตกลงไว้ — ตั้งเองใน panel ได้ตามสบาย"
+info "หมายเหตุ: ไม่มีการแก้ x-ui systemd override / x-ui.db / sockopt ใดๆ ในขั้นนี้"
 
 # ═══════════════════════════════════════════════════════════════════
-hdr "STEP 4 — Privacy & Security (ไม่เก็บ log / ไม่ leak IP / ลบตัวตน)"
+hdr "STEP 4 — Privacy & Security (ไม่เก็บ log / ไม่ leak IP-DNS / ซ่อนตัวตน)"
 # ═══════════════════════════════════════════════════════════════════
 
-# ── 4.1 ปิด IPv6 สมบูรณ์ (ป้องกัน IPv6 leak) ───────────────────────
+# ── 4.1 ปิด IPv6 สมบูรณ์ ────────────────────────────────────────────
 info "4.1 ปิด IPv6 ทั้งระบบ..."
 cat > /etc/sysctl.d/99-disable-ipv6.conf << 'V6EOF'
 net.ipv6.conf.all.disable_ipv6     = 1
@@ -507,7 +528,6 @@ for iface in $(ip link show | awk -F': ' '/^[0-9]+:/ {print $2}' | cut -d@ -f1);
   echo 1 > /proc/sys/net/ipv6/conf/"${iface}"/disable_ipv6 2>/dev/null || true
 done
 
-# ip6tables block outbound (มาจาก iptables package — ติดตั้งชัดเจนใน step 1.3)
 if command -v ip6tables &>/dev/null; then
   ip6tables -F OUTPUT 2>/dev/null || true
   ip6tables -A OUTPUT -o lo -j ACCEPT
@@ -518,7 +538,6 @@ else
   warn "ไม่เจอ ip6tables — ข้าม outbound IPv6 block ชั้นนี้ (sysctl disable_ipv6 ยังทำงานอยู่)"
 fi
 
-# GRUB kernel param
 if [ -f /etc/default/grub ]; then
   grep -q "ipv6.disable=1" /etc/default/grub || \
     sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 ipv6.disable=1"/' /etc/default/grub
@@ -526,8 +545,8 @@ if [ -f /etc/default/grub ]; then
 fi
 ok "IPv6 ปิดแล้ว: sysctl + ip6tables + grub"
 
-# ── 4.2 DNS over TLS (ไม่มี DNS leak) — ใช้ Mullvad DoT เดิมตามที่ยืนยัน ─
-info "4.2 DNS over TLS (Mullvad DoT) ..."
+# ── 4.2 DNS over TLS (Mullvad DoT) ที่ระดับ OS ──────────────────────
+info "4.2 DNS over TLS (Mullvad DoT) ที่ระดับ OS..."
 mkdir -p /etc/systemd/resolved.conf.d
 cat > /etc/systemd/resolved.conf.d/99-dot.conf << 'DOTEOF'
 [Resolve]
@@ -538,13 +557,10 @@ DNSSEC=no
 Cache=yes
 DNSStubListener=yes
 ReadEtcHosts=yes
-# Domains=~. คือตัวที่กัน "DNS leak ผ่าน per-link DHCP" — ถ้าไม่ตั้งตัวนี้
-# query บางตัวอาจหลุดไปใช้ DNS server ที่ DHCP ของ NIC ยัดมาให้ (เช่นของ
-# host provider) แทน Mullvad DoT โดยไม่รู้ตัว นี่คือสาเหตุ DNS leak ที่พบ
-# บ่อยที่สุดในเคส VPN/proxy จริง ไม่ใช่แค่ทฤษฎี
+# Domains=~. กัน DNS leak ผ่าน per-link DHCP — ถ้าไม่ตั้งตัวนี้ query
+# บางตัวอาจหลุดไปใช้ DNS server ที่ DHCP ของ NIC ยัดมาให้ (เช่นของ
+# host provider) แทน Mullvad DoT โดยไม่รู้ตัว
 Domains=~.
-# ปิด mDNS/LLMNR — ไม่เกี่ยวกับ leak ข้อมูล browsing โดยตรง แต่ลด broadcast
-# metadata ที่เครื่องป่าวประกาศ hostname ออกไปใน local network โดยไม่จำเป็น
 MulticastDNS=no
 LLMNR=no
 DOTEOF
@@ -552,9 +568,7 @@ systemctl enable --now systemd-resolved 2>/dev/null || true
 systemctl restart systemd-resolved
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
 
-# Block outbound port 53 ด้วย nftables
-# ⚠ หมายเหตุ: block เฉพาะ port 53 (plain DNS) ไม่ใช่ UDP ทั้งหมด
-# เพื่อให้ Xray relay UDP ของ client ได้ปกติ (เกม RoV/Roblox ฯลฯ)
+# Block outbound port 53 plaintext — ไม่แตะ UDP เกม/Xray relay
 cat > /etc/nftables-dns-block.conf << 'NFTEOF'
 #!/usr/sbin/nft -f
 table inet dns_privacy {
@@ -582,18 +596,15 @@ WantedBy=multi-user.target
 DNSSEOF
 systemctl daemon-reload
 systemctl enable --now dns-privacy-nft.service
-ok "DNS over TLS เสร็จ | plain DNS port 53 ถูก block"
+ok "DNS over TLS เสร็จ (OS-level) | plain DNS port 53 ถูก block"
 
 echo ""
 warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-warn "  สคริปต์นี้ 'ไม่' แก้ Xray internal DNS / log / sockopt ใน x-ui.db"
-warn "  เพราะนับเป็นการยุ่งกับ inbound/client ตามที่ตกลงไว้"
-warn "  แนะนำให้ไปตั้งเองใน panel (Xray Configs หรือหน้า inbound):"
-warn "  - DNS object ของ Xray ตั้งให้ชี้ 127.0.0.53 (local DoT stub ที่"
-warn "    ตั้งไว้ข้างบนแล้ว) ป้องกัน Xray query DNS หลุดออกไปตรงๆ"
-warn "    โดยไม่ผ่าน OS resolver — เคสนี้เกิดได้ถ้า template ของ x-ui"
-warn "    บางรุ่นฝัง public resolver (เช่น 8.8.8.8) มาเป็นค่า default"
-warn "  - Log: ตั้ง access=none, error=\"\", loglevel=none, dnsLog=false"
+warn "  ไปตั้งเองในหน้า 3x-ui panel (Xray Configs):"
+warn "  - DNS object ของ Xray → ชี้ 127.0.0.53 (local DoT stub ที่ตั้งไว้ข้างบน)"
+warn "    ป้องกัน Xray query DNS หลุดออกตรงๆไม่ผ่าน OS resolver — บาง"
+warn "    template ของ x-ui ฝัง public resolver (เช่น 8.8.8.8) มาเป็น default"
+warn "  - Log: access=none, error=\"\", loglevel=none, dnsLog=false"
 warn "  - Sniffing: ปิดทั้งหมดในหน้า inbound"
 warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo ""
@@ -625,7 +636,7 @@ SECEOF
 sysctl -p /etc/sysctl.d/99-security.conf
 ok "kernel hardening เสร็จ"
 
-# ── 4.4 Journald: ไม่เขียน disk ─────────────────────────────────────
+# ── 4.4 journald → RAM only (ไม่เขียน disk) ─────────────────────────
 info "4.4 journald → RAM only (volatile)..."
 mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/99-volatile.conf << 'JEOF'
@@ -687,7 +698,7 @@ fi
 # ── 4.7 Fail2ban ────────────────────────────────────────────────────
 info "4.7 fail2ban..."
 mkdir -p /etc/fail2ban/jail.d
-cat > /etc/fail2ban/jail.d/99-vmess.conf << FBEOF
+cat > /etc/fail2ban/jail.d/99-reality.conf << FBEOF
 [DEFAULT]
 bantime  = 3600
 findtime = 300
@@ -724,9 +735,9 @@ AUTEOF2
 systemctl enable --now unattended-upgrades
 ok "auto security updates เสร็จ"
 
-# ── 4.9 DB Backup (daily, เก็บ 7 วัน) — backup เฉยๆ ไม่แก้เนื้อหา DB ──
-info "4.9 DB backup (อ่านอย่างเดียว, ไม่แก้เนื้อหาใน x-ui.db)..."
-BACKUP_DIR="/var/lib/vmess-setup/backups"
+# ── 4.9 DB Backup (daily, อ่านอย่างเดียว ไม่แก้เนื้อหา) ─────────────
+info "4.9 DB backup (read-only copy, ไม่แก้เนื้อหาใน x-ui.db)..."
+BACKUP_DIR="/var/lib/vless-reality-setup/backups"
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
 DB="/etc/x-ui/x-ui.db"
@@ -781,6 +792,13 @@ systemctl daemon-reload
 systemctl enable ip6tables-restore.service
 ok "ip6tables persist เสร็จ"
 
+# ── 4.11 ลบ/ลด metadata ที่ระบุตัวตนเครื่อง ──────────────────────────
+info "4.11 ลด system metadata ที่อาจระบุตัวตน (motd, hostname banner)..."
+chmod -x /etc/update-motd.d/* 2>/dev/null || true
+echo "" > /etc/motd 2>/dev/null || true
+sed -i 's/^Banner.*/#Banner none/' /etc/ssh/sshd_config 2>/dev/null || true
+ok "ลด metadata เสร็จ"
+
 ok "═══ STEP 4 เสร็จสมบูรณ์ ═══"
 
 # ═══════════════════════════════════════════════════════════════════
@@ -813,7 +831,6 @@ chk_val "IPv6 disable" "$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)"
 chk_val "IP forward"   "$(sysctl -n net.ipv4.ip_forward 2>/dev/null)"            "1"
 chk_val "kptr_restrict" "$(sysctl -n kernel.kptr_restrict 2>/dev/null)"          "2"
 
-# ── DNS leak: ทดสอบจริง ไม่ใช่แค่เช็คว่า rule โหลดสำเร็จ ────────────
 info "ทดสอบ DNS leak: ลองต่อ TCP:53 ไป public resolver ตรงๆ (ควรถูกบล็อก)..."
 if timeout 3 bash -c 'exec 3<>/dev/tcp/8.8.8.8/53' 2>/dev/null; then
   warn "เชื่อมต่อ TCP:53 ไป 8.8.8.8 ได้สำเร็จ — nftables DNS block ไม่ทำงานจริง!"
@@ -823,16 +840,22 @@ else
 fi
 chk_val "resolved Domains=~." "$(resolvectl status 2>/dev/null | grep -m1 'DNS Domain')" "~."
 
-# ── ตรวจ UFW ว่าไม่มี rule block UDP ทั้งหมด (เกม RoV/Roblox ต้องใช้ UDP) ──
-info "ตรวจ UFW: ต้องไม่มี rule 'deny udp' ที่ block UDP ทั้งหมด..."
-if ufw status 2>/dev/null | grep -qE "^DENY.*Anywhere.*\(v6\)$|deny.*proto udp.*any.*any"; then
-  warn "⚠ พบ UFW rule ที่ block UDP ทั้งหมด! เกม RoV/Roblox จะใช้ไม่ได้ — ลบด้วย: ufw delete deny proto udp from any to any"
-  errors=$((errors+1))
+info "ตรวจ Reality port ${REALITY_PORT} เปิดอยู่ใน UFW..."
+if ufw status 2>/dev/null | grep -qE "^${REALITY_PORT}/tcp"; then
+  ok "Port ${REALITY_PORT}/tcp เปิดอยู่"
 else
-  ok "UFW ไม่มี rule block UDP ทั้งหมด (เกมเล่นได้ปกติ)"
+  warn "ไม่พบ port ${REALITY_PORT}/tcp ใน UFW status"
+  errors=$((errors+1))
 fi
 
-# ── ตรวจ MSS clamp ────────────────────────────────────────────────
+info "ตรวจ outbound ไป ${REALITY_SNI}:443 (สำหรับ Reality handshake fallback)..."
+if timeout 5 bash -c "exec 3<>/dev/tcp/${REALITY_SNI}/443" 2>/dev/null; then
+  ok "ต่อออกไปยัง ${REALITY_SNI}:443 ได้ (Reality dest พร้อมใช้งาน)"
+else
+  warn "ต่อออกไปยัง ${REALITY_SNI}:443 ไม่ได้ — ตรวจ DNS/outbound firewall อีกครั้ง"
+  errors=$((errors+1))
+fi
+
 info "ตรวจ MSS clamp rule ใน iptables..."
 if iptables -t mangle -L OUTPUT -n 2>/dev/null | grep -q "TCPMSS"; then
   ok "MSS clamp rule ติดตั้งอยู่ใน mangle OUTPUT chain"
@@ -841,21 +864,10 @@ else
   errors=$((errors+1))
 fi
 
-# ── ตรวจ panel port restriction ─────────────────────────────────────
-if [ "$ALLOWED_PANEL_IP" = "CHANGE_ME_TO_YOUR_IP" ]; then
-  warn "ALLOWED_PANEL_IP ยังเป็น placeholder — panel port ${PANEL_PORT} ปิดทุก IP อยู่"
-  errors=$((errors+1))
+if [ "$ALLOWED_PANEL_IP" = "ANY" ]; then
+  warn "Panel port ${PANEL_PORT} เปิดให้ทุก IP (ไม่ได้กรอก IP จำกัดไว้)"
 else
   ok "Panel port ${PANEL_PORT} จำกัดเฉพาะ ${ALLOWED_PANEL_IP}"
-fi
-
-# ── ตรวจงบ RAM จริง vs ค่าที่คำนวณบัฟเฟอร์ไว้ (สมมติฐาน ~2048MB) ────
-if [ "$RAM_MB" -lt 1800 ]; then
-  warn "RAM จริง = ${RAM_MB}MB ต่ำกว่าที่คำนวณบัฟเฟอร์ไว้ (2048MB)"
-  warn "ค่า tcp_mem/rmem_max ที่ตั้งอาจสูงเกินไปสำหรับเครื่องนี้ — พิจารณาลดลง"
-  errors=$((errors+1))
-else
-  ok "RAM จริง = ${RAM_MB}MB ตรงกับงบที่คำนวณบัฟเฟอร์ (2048MB)"
 fi
 
 echo ""
@@ -864,46 +876,54 @@ PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
 
 echo -e "  ══════════════════════════════════════════════════════════"
 echo -e "  ${BLD}Server IP    :${RST} ${PUB_IP}"
-echo -e "  ${BLD}Panel URL    :${RST} http://${PUB_IP}:${PANEL_PORT}/  (เข้าได้เฉพาะจาก ${ALLOWED_PANEL_IP})"
+echo -e "  ${BLD}Panel URL    :${RST} http://${PUB_IP}:${PANEL_PORT}/"
 echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}แนะนำการตั้ง Inbound (ตั้งเองใน panel — สคริปต์ไม่แตะ):${RST}"
-echo -e "  ${BLD}Protocol     :${RST} VMess"
-echo -e "  ${BLD}Network      :${RST} WS (WebSocket)"
-echo -e "  ${BLD}Origin Port  :${RST} ${VMESS_WS_PORT}  (firewall เปิดรอ CloudFront อยู่แล้ว)"
-echo -e "  ${BLD}Security     :${RST} none (TLS terminate ที่ CloudFront)"
-echo -e "  ${BLD}Path/Host    :${RST} ให้ตรงกับ CloudFront origin path/domain ทุกตัวอักษร"
+echo -e "  ${BLD}ค่าที่ต้องกรอกเองใน VLESS Reality Inbound:${RST}"
+echo -e "  ${BLD}Protocol     :${RST} VLESS"
+echo -e "  ${BLD}Network      :${RST} tcp (raw)"
+echo -e "  ${BLD}Port         :${RST} ${REALITY_PORT}"
+echo -e "  ${BLD}Security     :${RST} reality"
+echo -e "  ${BLD}Dest         :${RST} ${REALITY_DEST}"
+echo -e "  ${BLD}Server Name  :${RST} ${REALITY_SNI}"
+echo -e "  ${BLD}Fingerprint  :${RST} ${REALITY_FINGERPRINT}"
+echo -e "  ${BLD}tcpMaxSeg    :${RST} ${TCP_MSS_CEIL}  ${YEL}(ตั้งเองในหน้า sockopt ของ inbound)${RST}"
 echo -e "  ${BLD}Sniffing     :${RST} แนะนำปิดทั้งหมด"
-echo -e "  ${BLD}Xray DNS     :${RST} แนะนำชี้ 127.0.0.53 (ดูคำแนะนำ STEP 4.2 ด้านบน)"
+echo -e "  ${BLD}Xray DNS     :${RST} แนะนำชี้ 127.0.0.53"
 echo -e "  ${BLD}Xray Log     :${RST} แนะนำ access=none, loglevel=none, dnsLog=false"
+echo -e "  ──────────────────────────────────────────────────────────"
+echo -e "  ${BLD}UDP เกมที่เปิดไว้:${RST}"
+for range in "${GAME_UDP_PORTS[@]}"; do
+  echo -e "    ${GRN}✔${RST}  ${range}/udp"
+done
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}MTU/MSS      :${RST}"
 echo -e "    ${GRN}✔${RST}  tcp_base_mss = ${TCP_MSS_CEIL} (sysctl, ค่าเริ่มต้น)"
-echo -e "    ${GRN}✔${RST}  iptables MSS clamp = ${TCP_MSS_CEIL} (บังคับจริงทุก connection)"
+echo -e "    ${GRN}✔${RST}  iptables MSS clamp = ${TCP_MSS_CEIL} (บังคับจริงทุก connection ระดับ firewall)"
+echo -e "    ${YEL}⚠${RST}  tcpMaxSeg ใน 3x-ui inbound: ยังไม่ตั้ง — ไปตั้ง ${TCP_MSS_CEIL} เองในหน้า sockopt"
 echo -e "    ${GRN}✔${RST}  เข้ากับ MTU 1500 ฝั่ง v2box"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Privacy      :${RST}"
 echo -e "    ${GRN}✔${RST}  IPv6         : ปิดสมบูรณ์"
 echo -e "    ${GRN}✔${RST}  DNS          : Mullvad DoT (853) + Domains=~. (กัน DHCP override leak)"
 echo -e "    ${GRN}✔${RST}  DNS port 53  : blocked (nftables) + ทดสอบจริงแล้วใน VERIFY"
-echo -e "    ${GRN}✔${RST}  mDNS/LLMNR   : ปิด (ลด broadcast metadata)"
+echo -e "    ${GRN}✔${RST}  mDNS/LLMNR   : ปิด"
 echo -e "    ${GRN}✔${RST}  journald     : RAM only (volatile)"
 echo -e "    ${GRN}✔${RST}  /tmp         : tmpfs (RAM)"
+echo -e "    ${GRN}✔${RST}  motd/banner  : ลด metadata"
 echo -e "    ${YEL}⚠${RST}  Xray log/DNS object : ยังไม่ patch (ต้องตั้งเองใน panel ตามคำแนะนำ STEP 4.2)"
-echo -e "    ${YEL}⚠${RST}  UDP          : เปิด (จำเป็นสำหรับ Xray relay เกม RoV/Roblox)"
-echo -e "                  DNS leak กันด้วย DoT + block port 53 แทน"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Performance  :${RST}"
 echo -e "    ${GRN}✔${RST}  BBR congestion control"
 echo -e "    ${GRN}✔${RST}  FQ qdisc | THP off | NIC: GRO/GSO/TSO + ring max"
-echo -e "    ${GRN}✔${RST}  TCP buffer 8MB/socket (anti-bufferbloat) | tcp_mem 256/384/512MB"
-echo -e "    ${GRN}✔${RST}  Busy-poll 50us | TCP fast | Keepalive 35s"
+echo -e "    ${GRN}✔${RST}  TCP buffer 16MB/socket ceiling (รองรับ 1Gbps, ไม่ bufferbloat)"
+echo -e "    ${GRN}✔${RST}  Busy-poll 50us | TCP fast | Keepalive 35s | CPU governor performance"
 echo -e "    ${GRN}✔${RST}  Conntrack 262144 entries (~80MB)"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Security     :${RST}"
 echo -e "    ${GRN}✔${RST}  SSH: publickey only"
 echo -e "    ${GRN}✔${RST}  fail2ban: SSH ban 24h"
 echo -e "    ${GRN}✔${RST}  Kernel hardening (kptr/ptrace/BPF)"
-echo -e "    ${GRN}✔${RST}  UFW: 22 (limit) / 80 TCP เปิด | ${PANEL_PORT} จำกัด IP | UDP relay เปิด"
+echo -e "    ${GRN}✔${RST}  UFW: 22 (limit) / ${REALITY_PORT} TCP เปิด | UDP เกมเฉพาะช่วงที่กำหนด"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Logs & Debug :${RST}"
 echo -e "  systemctl status x-ui"
@@ -922,22 +942,21 @@ else
 fi
 
 echo -e "${BLD}${YEL}"
-echo -e "  ════ ขั้นตอนต่อไป (คุณจัดการเองทั้งหมดตามที่ตกลง) ═══════════"
-echo -e "  1. ถ้ายังไม่ติดตั้ง 3x-ui: ติดตั้งเอง"
-echo -e "     bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)"
-echo -e "  2. เข้า panel จาก IP ที่อนุญาต: http://${PUB_IP}:${PANEL_PORT}/"
-echo -e "  3. สร้าง inbound เอง:"
-echo -e "     Protocol  : VMess"
-echo -e "     Port      : ${VMESS_WS_PORT}"
-echo -e "     Network   : WS"
-echo -e "     Security  : none"
-echo -e "     Path      : ตั้งเอง ให้ตรงกับ CloudFront origin path"
-echo -e "     Sniffing  : ปิดทั้งหมด"
-echo -e "  4. ตั้ง CloudFront distribution ให้ origin ชี้มาที่ ${PUB_IP}:${VMESS_WS_PORT}"
-echo -e "     (HTTP only ที่ origin, TLS ให้ CloudFront จัดการที่ edge)"
-echo -e "  5. ถ้า ALLOWED_PANEL_IP ยังเป็น placeholder ให้แก้ในสคริปต์แล้ว"
-echo -e "     รันคำสั่งนี้เอง: ufw allow from <YOUR_IP> to any port ${PANEL_PORT} proto tcp"
-echo -e "  6. reboot ครั้งเดียว: reboot"
+echo -e "  ════ ขั้นตอนต่อไป (คุณกรอกเองทั้งหมดใน panel) ═══════════"
+echo -e "  1. เข้า panel: http://${PUB_IP}:${PANEL_PORT}/"
+echo -e "  2. สร้าง inbound เอง:"
+echo -e "     Protocol     : VLESS"
+echo -e "     Network      : tcp"
+echo -e "     Port         : ${REALITY_PORT}"
+echo -e "     Security     : reality"
+echo -e "     Dest         : ${REALITY_DEST}"
+echo -e "     Server Name  : ${REALITY_SNI}"
+echo -e "     Fingerprint  : ${REALITY_FINGERPRINT}"
+echo -e "     tcpMaxSeg    : ${TCP_MSS_CEIL}"
+echo -e "     Sniffing     : ปิดทั้งหมด"
+echo -e "  3. กด generate key pair + short ID เองในหน้า panel"
+echo -e "  4. ตั้ง Xray DNS object → 127.0.0.53, Log → none ตามคำแนะนำ STEP 4.2"
+echo -e "  5. reboot ครั้งเดียว: reboot"
 echo -e "  ════════════════════════════════════════════════════════"
 echo -e "${RST}"
 echo -e "${BLD}${RED}  ⚠ ตรวจ authorized_keys ก่อน reboot! SSH = publickey only${RST}"
