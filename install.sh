@@ -174,6 +174,7 @@ ufw default deny forward
 # SSH + Reality port
 ufw limit 22/tcp                comment "SSH"
 ufw allow ${REALITY_PORT}/tcp   comment "VLESS Reality raw TCP"
+ufw allow 80/tcp                comment "HTTP"
 
 # Panel port
 if [ "$ALLOWED_PANEL_IP" != "ANY" ]; then
