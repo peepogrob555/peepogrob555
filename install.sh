@@ -81,13 +81,38 @@ ok "3x-ui ติดตั้งเสร็จ"
 hdr "STEP 4 — Kernel & Network Tuning (Gaming / Low Latency)"
 # ════════════════════════════════════════════════════
 
-# BBR + best available qdisc
+# ── BBR: โหลด module แล้วตรวจว่าใช้ได้จริง ──
 modprobe tcp_bbr 2>/dev/null || true
-CC=cubic
-grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null && CC=bbr
+if grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+  CC=bbr
+  ok "BBR พร้อมใช้"
+else
+  CC=cubic
+  warn "BBR ไม่พร้อม → fallback cubic"
+fi
+
+# ── CAKE: โหลด module แล้วทดสอบ apply จริงบน lo ──
+modprobe sch_cake     2>/dev/null || true
+modprobe sch_fq_codel 2>/dev/null || true
+
 QDISC=fq
-modinfo sch_fq_codel &>/dev/null && QDISC=fq_codel
-modinfo sch_cake    &>/dev/null && QDISC=cake
+if tc qdisc add dev lo root cake 2>/dev/null; then
+  tc qdisc del dev lo root 2>/dev/null || true
+  QDISC=cake
+  ok "CAKE พร้อมใช้"
+elif tc qdisc add dev lo root fq_codel 2>/dev/null; then
+  tc qdisc del dev lo root 2>/dev/null || true
+  QDISC=fq_codel
+  warn "CAKE ไม่พร้อม → fallback fq_codel"
+else
+  QDISC=fq
+  warn "fq_codel ไม่พร้อม → fallback fq"
+fi
+
+# persist modules โหลดทุก boot
+grep -q tcp_bbr      /etc/modules 2>/dev/null || echo tcp_bbr      >> /etc/modules
+grep -q sch_cake     /etc/modules 2>/dev/null || echo sch_cake     >> /etc/modules
+grep -q sch_fq_codel /etc/modules 2>/dev/null || echo sch_fq_codel >> /etc/modules
 
 # Buffer: 500Mbps × 60ms RTT × 1.5 headroom = ~5.6MB ≈ capped 4MB เหมาะกับ mobile
 # MTU 1500 → TCP MSS 1440 (20 IP + 20 TCP + 20 options = 60 header)
