@@ -192,40 +192,26 @@ if command -v iptables &>/dev/null; then
 fi
 ok "MSS clamp ${MSS} bytes"
 
-# ── THP disable ──
+# ── THP disable (ทำตรงๆ ไม่ผ่าน systemd เพื่อไม่ให้ค้าง) ──
 echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
 echo never > /sys/kernel/mm/transparent_hugepage/defrag   2>/dev/null || true
-cat > /etc/systemd/system/thp-disable.service << 'EOF'
-[Unit]
-Description=Disable THP
-DefaultDependencies=no
-After=sysinit.target local-fs.target
-Before=x-ui.service
-[Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
-ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-EOF
+
+# persist THP disable ผ่าน rc.local แทน systemd service
+grep -q 'transparent_hugepage' /etc/rc.local 2>/dev/null || {
+  [ -f /etc/rc.local ] || echo '#!/bin/bash' > /etc/rc.local
+  cat >> /etc/rc.local << 'RCEOF'
+echo never > /sys/kernel/mm/transparent_hugepage/enabled
+echo never > /sys/kernel/mm/transparent_hugepage/defrag
+RCEOF
+  chmod +x /etc/rc.local
+}
 
 # ── initcwnd = 20 ──
 DEV=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
 if [ -n "${DEV:-}" ]; then
-  cat > /etc/systemd/system/initcwnd-tune.service << SVCEOF
-[Unit]
-Description=Tune initcwnd/initrwnd
-After=network-online.target
-Wants=network-online.target
-[Service]
-Type=oneshot
-ExecStart=/sbin/ip route change default dev ${DEV} initcwnd 20 initrwnd 20
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-SVCEOF
   ip route change default dev "${DEV}" initcwnd 20 initrwnd 20 2>/dev/null || true
+  # persist ผ่าน rc.local
+  grep -q 'initcwnd' /etc/rc.local 2>/dev/null ||     echo "ip route change default dev ${DEV} initcwnd 20 initrwnd 20" >> /etc/rc.local
 fi
 
 # ── x-ui override: realtime + autorestart ──
@@ -248,9 +234,8 @@ root soft nofile 1000000
 root hard nofile 1000000
 EOF
 
-systemctl daemon-reload
-systemctl enable --now thp-disable.service 2>/dev/null || true
-[ -n "${DEV:-}" ] && systemctl enable --now initcwnd-tune.service 2>/dev/null || true
+# daemon-reload ให้ x-ui รับ override — timeout 15s ป้องกันค้าง
+timeout 15 systemctl daemon-reload 2>/dev/null || true
 ok "THP off + initcwnd 20 + x-ui realtime + fd 1M"
 
 # ── Swap 512MB ──
@@ -366,8 +351,8 @@ ok "SSH hardened + rate-limited"
 # ════════════════════════════════════════════════════
 hdr "STEP 8 — Restart x-ui"
 # ════════════════════════════════════════════════════
-systemctl restart x-ui
-sleep 5
+timeout 15 systemctl restart x-ui 2>/dev/null || true
+sleep 3
 
 # ════════════════════════════════════════════════════
 hdr "VERIFY"
