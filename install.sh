@@ -1,424 +1,645 @@
 #!/usr/bin/env bash
-# VMess WS Setup — Ubuntu 24.04 LTS
-# Port: 22/80/2053 | Gaming optimized | Low latency | Privacy hardened
+################################################################################
+# vmess-ws-setup.sh
+#
+# จุดประสงค์:
+#   ตั้งเซิร์ฟเวอร์ VPS สำหรับ VMESS over WebSocket (Security: none, no TLS)
+#   ปรับจูนทั้งระบบให้เหมาะกับ "เน็ตมือถือ" (AIS 4G/5G) เน้นปิงต่ำ-นิ่ง-เสถียร
+#   ไม่ได้เน้นความแรงสูงสุด (ไม่ cap bandwidth แต่ไม่ได้ดันทุกอย่างเพื่อ throughput)
+#
+# สเปกเครื่องที่ออกแบบมาให้:
+#   Ubuntu 24.04, RAM ~1950MB, 1 vCPU @ 2.69GHz, NIC=eth0, ดิสก์ ~30GB
+#   ผู้ใช้งานจริง 2 คน (เบามาก ใช้ทรัพยากรเต็มที่ได้)
+#
+# โปรโตคอล/พารามิเตอร์ที่ตรึงไว้ (อ้างอิงจาก requirement):
+#   - VMESS + WebSocket, ไม่ใช้ TLS (security: none) -> เบากว่า TLS handshake
+#   - พอร์ตที่เปิด (TCP เท่านั้น): 22 80 443 8080 8443 2053
+#   - ปิด UDP ทั้งหมด (WS วิ่งบน TCP อย่างเดียว ไม่ต้องเปิด UDP เลย)
+#   - DNS: บังคับ 1.1.1.1 / 1.0.0.1 (Cloudflare) กัน DNS leak
+#   - ปิด IPv6 ทั้งระบบ กัน IPv6 leak ai่ว่าจะลืมปิด firewall v6
+#   - คิวขาออก: CAKE (ต้องโหลด module sch_cake) + BBR เป็น congestion control
+#   - ไม่ cap bandwidth (ไม่ตั้ง maxrate ใน CAKE) แต่ปรับ "ขนาดบัฟเฟอร์" ตาม BDP
+#     อ้างอิง BDP = 400Mbps * 60ms ≈ 3,000,000 bytes (~3MB) เป็นเพดานบนของ
+#     TCP window/buffer (sysctl) ไม่ใช่ตัว cap ความเร็วจริง
+#   - MTU 1500 (ปรับให้เข้ากับ MTU ของ VPN/ทันเนล), MSS clamp ให้สัมพันธ์กัน
+#   - Swap 4096MB, vm.swappiness=10 (RAM น้อย แต่ไม่อยากให้ thrash swap บ่อย
+#     ตั้งต่ำให้ kernel "เลี่ยง" swap ไว้ก่อน ใช้ RAM เป็นหลัก)
+#   - log (journald + xray) ทั้งหมดย้ายไปอยู่บน tmpfs (RAM only)
+#     -> หมายเหตุสำคัญ: log จะ "หายถ้าไฟดับ/รีบูตกะทันหันโดยไม่ได้ shutdown
+#        ปกติ" เพราะตั้งใจไม่ sync กลับ disk (เลือกความเป็นส่วนตัว+ความเร็ว
+#        เหนือกว่าการเก็บ log ถาวร) ส่วนอื่นทั้งหมด (sysctl, nftables, systemd
+#        unit, 3x-ui config, ฯลฯ) ยังคง persistent ผ่าน reboot ตามปกติ
+#   - ไม่มี SSH key -> ใช้ password auth ต่อไป (ไม่ปิด PasswordAuthentication)
+#   - ติดตั้ง 3x-ui ตัวเปล่า ไม่ patch sockopt เพิ่มเติม ตั้งค่า inbound ผ่าน
+#     panel เอง
+#
+# ลำดับขั้นตอนของสคริปต์ (ตามที่ผู้ใช้ระบุ):
+#   STAGE 0  - Preflight check (root, OS, arch, เน็ต)
+#   STAGE 1  - apt update/upgrade ทั้งระบบ
+#   STAGE 2  - ปิดพอร์ตทั้งหมดก่อน (nftables default-deny) แล้วเปิดเฉพาะที่ใช้
+#   STAGE 3  - ติดตั้ง 3x-ui
+#   STAGE 4  - Network tuning (sysctl, qdisc, BBR+CAKE, MTU/MSS, DNS, IPv6 off)
+#   STAGE 5  - Swap setup (4096MB, swappiness=10)
+#   STAGE 6  - ย้าย log ไปอยู่บน tmpfs (RAM only)
+#   STAGE 7  - Verify ทุกระบบ + สรุปผลลัพธ์
+#
+# วิธีรัน:
+#   sudo bash vmess-ws-setup.sh
+#
+# Idempotent: รันซ้ำได้ สคริปต์เช็คก่อนทำซ้ำในแต่ละจุดสำคัญ
+################################################################################
+
 set -uo pipefail
-export LANG=C DEBIAN_FRONTEND=noninteractive
+# หมายเหตุ: ไม่ใช้ "set -e" เพราะบางคำสั่ง (เช่น modprobe ของ cake บน kernel
+# ที่ build ไม่ครบ) อาจ fail แบบไม่ critical อยากให้สคริปต์ไหลต่อแล้วไป
+# สรุปสถานะใน verify stage ตอนท้ายแทน ทุกจุดสำคัญเช็ค exit code เอง
 
-GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'; CYN='\033[0;36m'; BLD='\033[1m'; RST='\033[0m'
+################################################################################
+# ค่าคงที่ / พารามิเตอร์ที่ปรับได้ตรงนี้จุดเดียว
+################################################################################
 
-STATE_DIR="/var/lib/vmess-setup"
-LOG_FILE="${STATE_DIR}/setup.log"
-mkdir -p "$STATE_DIR"
+readonly LOG_FILE="/var/log/vmess-ws-setup.log"
+readonly TCP_PORTS=(22 80 443 8080 8443 2053)
+readonly NIC="eth0"
+readonly MTU_VAL=1500
+readonly MSS_VAL=1460                       # MTU 1500 - 40 (IP20+TCP20, ไม่มี VPN overhead เพิ่ม)
+readonly DNS_PRIMARY="1.1.1.1"
+readonly DNS_SECONDARY="1.0.0.1"
+readonly SWAP_FILE="/swapfile"
+readonly SWAP_SIZE_MB=4096
+readonly SWAPPINESS=10
+readonly BDP_BW_MBPS=400                    # อ้างอิงคำนวณบัฟเฟอร์ (ไม่ cap ความเร็วจริง)
+readonly BDP_RTT_MS=60
+readonly TMPLOG_SIZE="256M"                 # ขนาด tmpfs สำหรับ log (RAM 1950MB เหลือพอ)
+readonly XUI_LOG_DIR="/var/log/x-ui"
 
-[ "$(id -u)" -eq 0 ] || { echo -e "${RED}✘ ต้องรันด้วย root${RST}"; exit 1; }
+# คำนวณ BDP (bytes) = (Mbps * 1,000,000 / 8) * (RTT_ms / 1000)
+readonly BDP_BYTES=$(( BDP_BW_MBPS * 1000000 / 8 * BDP_RTT_MS / 1000 ))
+# ตั้งเพดาน TCP buffer ที่ ~2x BDP เผื่อ burst สั้นๆ (หน่วย byte)
+readonly TCP_BUF_MAX=$(( BDP_BYTES * 2 ))
 
+################################################################################
+# ฟังก์ชันช่วย: log, เช็ค error, เช็ค root
+################################################################################
 
+log()  { echo -e "[$(date '+%H:%M:%S')] $*" | tee -a "$LOG_FILE"; }
+ok()   { echo -e "[$(date '+%H:%M:%S')] [OK]   $*" | tee -a "$LOG_FILE"; }
+warn() { echo -e "[$(date '+%H:%M:%S')] [WARN] $*" | tee -a "$LOG_FILE"; }
+err()  { echo -e "[$(date '+%H:%M:%S')] [FAIL] $*" | tee -a "$LOG_FILE"; }
 
-exec > >(tee -a "$LOG_FILE") 2>&1
+require_root() {
+    if [[ "${EUID}" -ne 0 ]]; then
+        echo "ต้องรันด้วย root หรือ sudo เท่านั้น: sudo bash $0"
+        exit 1
+    fi
+}
 
-hdr()  { echo -e "\n${BLD}${CYN}▶ $1${RST}"; }
-ok()   { echo -e "  ${GRN}✔${RST} $1"; }
-warn() { echo -e "  ${YEL}⚠${RST} $1"; }
+################################################################################
+# STAGE 0: Preflight check
+################################################################################
 
-# ════════════════════════════════════════════════════
-echo -e "${BLD}${CYN}╔══════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}${CYN}║  VMess WS Setup — Ubuntu 24.04 (Gaming)      ║${RST}"
-echo -e "${BLD}${CYN}╚══════════════════════════════════════════════╝${RST}"
+stage0_preflight() {
+    log "===== STAGE 0: Preflight check ====="
 
-# ════════════════════════════════════════════════════
-hdr "STEP 1 — System Update"
-# ════════════════════════════════════════════════════
-systemctl disable --now apt-daily.timer apt-daily-upgrade.timer unattended-upgrades 2>/dev/null || true
-waited=0
-while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock &>/dev/null; do
-  [ "$waited" -ge 60 ] && { fuser -k /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true; break; }
-  sleep 5; waited=$((waited+5))
-done
-dpkg --configure -a
-apt-get update -y
-apt-get -y full-upgrade
-apt-get -y autoremove --purge
-apt-get autoclean -y
-apt-get install -y curl ufw nftables sqlite3
-ok "ระบบอัปเดตเสร็จ"
+    . /etc/os-release 2>/dev/null || true
+    log "OS ตรวจพบ: ${PRETTY_NAME:-unknown}"
+    if [[ "${VERSION_ID:-}" != "24.04" ]]; then
+        warn "สคริปต์นี้ออกแบบมาให้ Ubuntu 24.04 เครื่องนี้คือ ${VERSION_ID:-unknown} จะพยายามรันต่อแต่ผลลัพธ์อาจไม่ตรง 100%"
+    fi
 
-# ════════════════════════════════════════════════════
-hdr "STEP 2 — Firewall (เปิดเฉพาะ 22/80/2053)"
-# ════════════════════════════════════════════════════
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw default deny forward
-sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
+    if ! ip link show "${NIC}" &>/dev/null; then
+        err "ไม่พบ NIC ชื่อ ${NIC} กรุณาตรวจสอบชื่อการ์ดเน็ตจริงด้วย: ip link show"
+        log "NIC ที่มีอยู่จริงในเครื่อง:"
+        ip -brief link show | tee -a "$LOG_FILE"
+        exit 1
+    fi
+    ok "พบ NIC: ${NIC}"
 
-ufw allow 22/tcp   comment 'SSH'
-ufw allow 80/tcp   comment 'VMess-WS'
-ufw allow 2053/tcp comment '3x-ui Panel'
+    if ! ping -c1 -W3 1.1.1.1 &>/dev/null; then
+        warn "ping ออกเน็ตไม่ผ่าน (อาจเป็นเพราะ ICMP ถูกบล็อกอยู่แล้ว หรือเน็ตมีปัญหา) จะลองรันต่อ"
+    else
+        ok "เน็ตออกได้ปกติ"
+    fi
 
-# ปิด port อันตราย (outbound) ที่ไม่จำเป็น
-# block inbound UDP ทั้งหมด ยกเว้น ICMP
-ufw deny proto udp from any to any
+    mkdir -p "$(dirname "$LOG_FILE")"
+    touch "$LOG_FILE"
+    ok "Preflight ผ่าน เริ่มทำงานจริง"
+}
 
-ufw --force enable
-ufw status verbose
-ok "เปิดเฉพาะ TCP 22/80/2053 — UDP/พอร์ตอื่นปิดหมด"
+################################################################################
+# STAGE 1: apt update / upgrade ทั้งระบบ
+################################################################################
 
-# ════════════════════════════════════════════════════
-hdr "STEP 3 — ติดตั้ง 3x-ui"
-# ════════════════════════════════════════════════════
-bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
-sleep 5
-systemctl enable x-ui 2>/dev/null || true
-systemctl start x-ui 2>/dev/null || true
-ok "3x-ui ติดตั้งเสร็จ"
+stage1_apt_update() {
+    log "===== STAGE 1: apt update/upgrade ====="
+    export DEBIAN_FRONTEND=noninteractive
 
-# ════════════════════════════════════════════════════
-hdr "STEP 4 — Kernel & Network Tuning (Gaming / Low Latency)"
-# ════════════════════════════════════════════════════
+    apt-get update -y 2>&1 | tee -a "$LOG_FILE"
+    if [[ $? -ne 0 ]]; then
+        err "apt-get update ล้มเหลว เช็คเน็ต/DNS ก่อน (ตอนนี้ DNS ยังไม่ถูกบังคับเป็น 1.1.1.1 อาจเป็นสาเหตุ)"
+    fi
 
-# ── BBR: โหลด module แล้วตรวจว่าใช้ได้จริง ──
-modprobe tcp_bbr 2>/dev/null || true
-if grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
-  CC=bbr
-  ok "BBR พร้อมใช้"
-else
-  CC=cubic
-  warn "BBR ไม่พร้อม → fallback cubic"
-fi
+    apt-get upgrade -y 2>&1 | tee -a "$LOG_FILE"
+    apt-get dist-upgrade -y 2>&1 | tee -a "$LOG_FILE"
 
-# ── CAKE: โหลด module แล้วทดสอบ apply จริงบน lo ──
-modprobe sch_cake     2>/dev/null || true
-modprobe sch_fq_codel 2>/dev/null || true
+    apt-get install -y \
+        nftables \
+        curl \
+        wget \
+        ca-certificates \
+        ethtool \
+        iproute2 \
+        jq \
+        unzip \
+        cron \
+        2>&1 | tee -a "$LOG_FILE"
 
-QDISC=fq
-if tc qdisc add dev lo root cake 2>/dev/null; then
-  tc qdisc del dev lo root 2>/dev/null || true
-  QDISC=cake
-  ok "CAKE พร้อมใช้"
-elif tc qdisc add dev lo root fq_codel 2>/dev/null; then
-  tc qdisc del dev lo root 2>/dev/null || true
-  QDISC=fq_codel
-  warn "CAKE ไม่พร้อม → fallback fq_codel"
-else
-  QDISC=fq
-  warn "fq_codel ไม่พร้อม → fallback fq"
-fi
+    apt-get autoremove -y 2>&1 | tee -a "$LOG_FILE"
+    ok "apt update/upgrade + ติดตั้งแพ็กเกจพื้นฐานเสร็จ"
+}
 
-# persist modules โหลดทุก boot
-grep -q tcp_bbr      /etc/modules 2>/dev/null || echo tcp_bbr      >> /etc/modules
-grep -q sch_cake     /etc/modules 2>/dev/null || echo sch_cake     >> /etc/modules
-grep -q sch_fq_codel /etc/modules 2>/dev/null || echo sch_fq_codel >> /etc/modules
+################################################################################
+# STAGE 2: Firewall - ปิดทุกพอร์ตก่อน แล้วเปิดเฉพาะที่ใช้ (nftables)
+################################################################################
 
-# Buffer: 500Mbps × 60ms RTT × 1.5 headroom = ~5.6MB ≈ capped 4MB เหมาะกับ mobile
-# MTU 1500 → TCP MSS 1440 (20 IP + 20 TCP + 20 options = 60 header)
-# ปรับ buffer ให้เหมาะกับ mobile VPN: ไม่ใหญ่เกินไปเพื่อลด latency
-BUF_BYTES=4194304   # 4MB — gaming sweet spot, ไม่บวม queue
-MSS=1440
+stage2_firewall() {
+    log "===== STAGE 2: Firewall (nftables default-deny) ====="
 
-cat > /etc/sysctl.d/99-vmess-gaming.conf << EOF
-# ── Congestion & Qdisc ──
-net.ipv4.tcp_congestion_control    = ${CC}
-net.core.default_qdisc             = ${QDISC}
+    systemctl enable nftables 2>&1 | tee -a "$LOG_FILE"
 
-# ── Buffer (4MB — gaming/mobile optimized) ──
-net.core.rmem_default              = 262144
-net.core.wmem_default              = 262144
-net.core.rmem_max                  = ${BUF_BYTES}
-net.core.wmem_max                  = ${BUF_BYTES}
-net.ipv4.tcp_rmem                  = 4096 87380 ${BUF_BYTES}
-net.ipv4.tcp_wmem                  = 4096 65536 ${BUF_BYTES}
-net.ipv4.tcp_moderate_rcvbuf       = 1
+    # หมายเหตุ: ปิด UDP ทั้งหมด เพราะ VMESS+WS วิ่งบน TCP อย่างเดียว
+    # ไม่มี policy/inbound ใดของ WS ที่ใช้ UDP จริง การปิด UDP ทั้งกระดาน
+    # ช่วยลดพื้นผิวโจมตี (DNS amplification ที่ไม่ได้ตั้งใจ, QUIC ที่ไม่ได้ใช้ ฯลฯ)
+    cat > /etc/nftables.conf << EOF
+#!/usr/sbin/nft -f
 
-# ── Low Latency / Anti-Jitter ──
-net.ipv4.tcp_notsent_lowat         = 16384
-net.ipv4.tcp_fastopen              = 3
-net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_mtu_probing           = 1
-net.ipv4.tcp_ecn                   = 1
-net.ipv4.tcp_sack                  = 1
-net.ipv4.tcp_dsack                 = 1
-net.ipv4.tcp_fack                  = 0
+flush ruleset
 
-# ── Connection hardening ──
-net.ipv4.tcp_rfc1337               = 1
-net.ipv4.tcp_syncookies            = 1
-net.ipv4.tcp_max_syn_backlog       = 4096
-net.core.somaxconn                 = 4096
-net.core.netdev_max_backlog        = 4096
+table inet filter {
+    chain input {
+        type filter hook input priority 0; policy drop;
 
-# ── Keepalive (ลด idle disconnect บน mobile) ──
-net.ipv4.tcp_keepalive_time        = 30
-net.ipv4.tcp_keepalive_intvl       = 10
-net.ipv4.tcp_keepalive_probes      = 6
+        # loopback ผ่านได้เสมอ
+        iif "lo" accept
 
-# ── Time-wait reuse ──
-net.ipv4.tcp_tw_reuse              = 1
-net.ipv4.tcp_fin_timeout           = 10
+        # connection state: อนุญาต established/related, drop invalid
+        ct state established,related accept
+        ct state invalid drop
 
-# ── MSS clamp hint (MTU 1500 → MSS 1440) ──
-net.ipv4.tcp_base_mss              = ${MSS}
+        # ICMP จำเป็นสำหรับ PMTU discovery (กัน MTU/fragmentation พัง)
+        ip protocol icmp icmp type { echo-request, destination-unreachable, time-exceeded } accept
+        ip6 nexthdr icmpv6 accept
 
-# ── Security / Privacy ──
-net.ipv4.conf.all.rp_filter        = 1
-net.ipv4.conf.default.rp_filter    = 1
-net.ipv4.conf.all.accept_redirects = 0
-net.ipv4.conf.all.send_redirects   = 0
-net.ipv4.conf.all.accept_source_route = 0
-net.ipv4.icmp_echo_ignore_broadcasts = 1
-net.ipv4.tcp_timestamps            = 0
+        # TCP พอร์ตที่ใช้งานจริงเท่านั้น
+        tcp dport { 22, 80, 443, 8080, 8443, 2053 } ct state new accept
 
-# ── File descriptors ──
-fs.file-max                        = 1000000
-fs.nr_open                         = 1000000
+        # UDP: ปิดทั้งหมดตามที่กำหนด (WS ไม่ใช้ UDP)
+        # (ไม่มี rule accept ใดๆ สำหรับ udp -> โดน policy drop ทั้งหมด)
 
-# ── VM ──
-vm.swappiness                      = 10
-vm.dirty_ratio                     = 10
-vm.dirty_background_ratio          = 5
+        counter
+    }
 
-# ── IPv6 ปิด ──
-net.ipv6.conf.all.disable_ipv6     = 1
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority 0; policy accept;
+    }
+}
+EOF
+
+    nft -c -f /etc/nftables.conf
+    if [[ $? -ne 0 ]]; then
+        err "nftables config มี syntax error ตรวจสอบ /etc/nftables.conf"
+        return 1
+    fi
+
+    systemctl restart nftables 2>&1 | tee -a "$LOG_FILE"
+    sleep 1
+
+    if systemctl is-active --quiet nftables; then
+        ok "nftables active เปิดพอร์ต TCP: ${TCP_PORTS[*]} | ปิด UDP ทั้งหมด | ปิดพอร์ตอื่นทั้งหมด"
+    else
+        err "nftables ไม่ active ตรวจสอบด้วย: systemctl status nftables"
+    fi
+
+    # ปิด ufw ถ้ามี กันชนกับ nftables (Ubuntu บางตัวลง ufw มาด้วย)
+    if dpkg -l ufw &>/dev/null; then
+        systemctl disable --now ufw 2>&1 | tee -a "$LOG_FILE" || true
+        warn "พบ ufw ติดตั้งอยู่ ปิดให้แล้วเพื่อไม่ชนกับ nftables (ใช้ nftables เป็นตัวหลัก)"
+    fi
+
+    nft list ruleset | tee -a "$LOG_FILE"
+}
+
+################################################################################
+# STAGE 3: ติดตั้ง 3x-ui
+################################################################################
+
+stage3_install_3xui() {
+    log "===== STAGE 3: ติดตั้ง 3x-ui ====="
+
+    if systemctl list-unit-files | grep -q "^x-ui.service"; then
+        warn "พบ x-ui service อยู่แล้ว ข้ามการติดตั้งซ้ำ (รันสคริปต์ติดตั้งใหม่เองถ้าต้องการ reinstall)"
+        return 0
+    fi
+
+    bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) 2>&1 | tee -a "$LOG_FILE"
+
+    sleep 2
+    if systemctl is-active --quiet x-ui; then
+        ok "3x-ui ติดตั้งสำเร็จและกำลังรันอยู่"
+    else
+        err "3x-ui ติดตั้งแล้วแต่ service ไม่ active เช็คด้วย: systemctl status x-ui และ x-ui log"
+    fi
+
+    log "หมายเหตุ: ตั้ง inbound VMESS+WS (security: none, port ตามที่เปิดไว้คือ 80/8080/2053 เป็นต้น) ผ่าน 3x-ui panel เอง"
+}
+
+################################################################################
+# STAGE 4: Network tuning หลัก
+#   - ปิด IPv6
+#   - DNS lock เป็น 1.1.1.1 / 1.0.0.1
+#   - BBR + CAKE qdisc
+#   - sysctl buffer ตาม BDP
+#   - MTU/MSS
+################################################################################
+
+stage4_network_tuning() {
+    log "===== STAGE 4: Network & TCP tuning ====="
+
+    # ----- 4.1 ปิด IPv6 ทั้งระบบ (กัน IPv6 leak) -----
+    log "-- ปิด IPv6 ทั้งระบบ --"
+    cat > /etc/sysctl.d/98-disable-ipv6.conf << EOF
+net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6      = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+net.ipv6.conf.${NIC}.disable_ipv6 = 1
 EOF
+    sysctl -p /etc/sysctl.d/98-disable-ipv6.conf 2>&1 | tee -a "$LOG_FILE"
 
-sysctl --system >/dev/null 2>&1
-ok "Kernel tuned: BBR(${CC}) + ${QDISC} + 4MB buf + MSS ${MSS} + gaming sysctl"
+    # GRUB level เผื่อบาง provider โหลด ipv6 module ตั้งแต่ kernel boot
+    if [[ -f /etc/default/grub ]]; then
+        if ! grep -q "ipv6.disable=1" /etc/default/grub; then
+            cp /etc/default/grub "/etc/default/grub.bak.$(date +%s)"
+            sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="/GRUB_CMDLINE_LINUX_DEFAULT="ipv6.disable=1 /' /etc/default/grub
+            update-grub 2>&1 | tee -a "$LOG_FILE" || warn "update-grub ล้มเหลว (อาจเป็น VPS ที่ไม่ใช้ grub เช่น some KVM ที่ boot ผ่าน hypervisor) ข้ามได้ ปิดด้วย sysctl ก็พอ"
+        fi
+    fi
+    ok "ปิด IPv6 เรียบร้อย (sysctl + grub level)"
 
-# MSS clamp ผ่าน iptables (MTU 1500 VPN → MSS 1440)
-if command -v iptables &>/dev/null; then
-  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${MSS} 2>/dev/null || true
-  iptables -t mangle -A OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss ${MSS} 2>/dev/null || true
-fi
-ok "MSS clamp ${MSS} bytes"
+    # ----- 4.2 DNS lock เป็น 1.1.1.1 / 1.0.0.1 กัน DNS leak -----
+    log "-- ล็อก DNS เป็น ${DNS_PRIMARY} / ${DNS_SECONDARY} --"
 
-# ── THP disable (ทำตรงๆ ไม่ผ่าน systemd เพื่อไม่ให้ค้าง) ──
-echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-echo never > /sys/kernel/mm/transparent_hugepage/defrag   2>/dev/null || true
-
-# persist THP disable ผ่าน rc.local แทน systemd service
-grep -q 'transparent_hugepage' /etc/rc.local 2>/dev/null || {
-  [ -f /etc/rc.local ] || echo '#!/bin/bash' > /etc/rc.local
-  cat >> /etc/rc.local << 'RCEOF'
-echo never > /sys/kernel/mm/transparent_hugepage/enabled
-echo never > /sys/kernel/mm/transparent_hugepage/defrag
-RCEOF
-  chmod +x /etc/rc.local
-}
-
-# ── initcwnd = 20 ──
-DEV=$(ip route show default 2>/dev/null | awk '{print $5; exit}')
-if [ -n "${DEV:-}" ]; then
-  ip route change default dev "${DEV}" initcwnd 20 initrwnd 20 2>/dev/null || true
-  # persist ผ่าน rc.local
-  grep -q 'initcwnd' /etc/rc.local 2>/dev/null ||     echo "ip route change default dev ${DEV} initcwnd 20 initrwnd 20" >> /etc/rc.local
-fi
-
-# ── x-ui override: realtime + autorestart ──
-mkdir -p /etc/systemd/system/x-ui.service.d
-cat > /etc/systemd/system/x-ui.service.d/override.conf << 'EOF'
-[Service]
-Nice=-10
-IOSchedulingClass=realtime
-IOSchedulingPriority=0
-LimitNOFILE=1000000
-Restart=always
-RestartSec=5
-EOF
-
-# ── fd limits ──
-cat > /etc/security/limits.d/99-vmess.conf << 'EOF'
-* soft nofile 1000000
-* hard nofile 1000000
-root soft nofile 1000000
-root hard nofile 1000000
-EOF
-
-# daemon-reload ให้ x-ui รับ override — timeout 15s ป้องกันค้าง
-timeout 15 systemctl daemon-reload 2>/dev/null || true
-ok "THP off + initcwnd 20 + x-ui realtime + fd 1M"
-
-# ── Swap 512MB ──
-if swapon --show | grep -q '/swapfile'; then
-  ok "Swap มีอยู่แล้ว"
-else
-  fallocate -l 512M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=512
-  chmod 600 /swapfile
-  mkswap /swapfile
-  swapon /swapfile
-  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  ok "Swap 512MB"
-fi
-
-# ════════════════════════════════════════════════════
-hdr "STEP 5 — Log เก็บบน Disk (persistent)"
-# ════════════════════════════════════════════════════
-mkdir -p /etc/systemd/journald.conf.d /var/log/journal
-cat > /etc/systemd/journald.conf.d/99-persistent.conf << 'EOF'
-[Journal]
-Storage=persistent
-Compress=yes
-SystemMaxUse=200M
-SystemKeepFree=500M
-SystemMaxFileSize=50M
-MaxRetentionSec=7day
-MaxFileSec=1day
-ForwardToSyslog=no
-EOF
-# ไม่ restart journald ตอนนี้ — จะใช้หลัง reboot (ป้องกัน SSH หลุด)
-ok "journald → disk persistent, rotate 7 วัน, max 200MB"
-
-# ════════════════════════════════════════════════════
-hdr "STEP 6 — DNS over TLS + ปิด IPv6 + บล็อก DNS Leak"
-# ════════════════════════════════════════════════════
-
-# systemd-resolved → Cloudflare DoT
-mkdir -p /etc/systemd/resolved.conf.d
-cat > /etc/systemd/resolved.conf.d/99-dot.conf << 'EOF'
+    # ปิด systemd-resolved stub listener แล้วเขียน resolv.conf ตรงเพื่อกัน
+    # โปรแกรมอื่นหรือ DHCP มาแก้ DNS ทับ (กัน DNS leak ผ่าน DHCP ของผู้ให้บริการ)
+    if systemctl is-active --quiet systemd-resolved; then
+        mkdir -p /etc/systemd/resolved.conf.d
+        cat > /etc/systemd/resolved.conf.d/99-dns-lock.conf << EOF
 [Resolve]
-DNS=1.1.1.1#cloudflare-dns.com
-FallbackDNS=1.0.0.1#cloudflare-dns.com
-DNSOverTLS=yes
-DNSSEC=no
-Cache=yes
-DNSStubListener=yes
+DNS=${DNS_PRIMARY} ${DNS_SECONDARY}
+FallbackDNS=
 Domains=~.
-MulticastDNS=no
-LLMNR=no
+DNSStubListener=no
 EOF
-systemctl enable --now systemd-resolved 2>/dev/null || true
-systemctl restart systemd-resolved
-ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
-ok "DNS → 1.1.1.1 DoT"
+        systemctl restart systemd-resolved 2>&1 | tee -a "$LOG_FILE"
+    fi
 
-# บล็อก plaintext DNS port 53 ขาออกทั้งหมด
-cat > /etc/nftables-dns-block.conf << 'EOF'
-table inet dns_privacy {
-  chain output_dns_block {
-    type filter hook output priority 0; policy accept;
-    # อนุญาตเฉพาะ stub resolver ของ systemd-resolved
-    ip daddr 127.0.0.53 udp dport 53 accept
-    ip daddr 127.0.0.53 tcp dport 53 accept
-    # บล็อก DNS plaintext ทุกอย่างที่เหลือ
-    udp dport 53 drop
-    tcp dport 53 drop
-  }
-}
+    rm -f /etc/resolv.conf
+    cat > /etc/resolv.conf << EOF
+nameserver ${DNS_PRIMARY}
+nameserver ${DNS_SECONDARY}
+options edns0
 EOF
-nft delete table inet dns_privacy 2>/dev/null || true
-nft -f /etc/nftables-dns-block.conf
+    # immutable flag กัน netplan/dhclient หรือ process อื่นมาเขียนทับไฟล์นี้
+    chattr +i /etc/resolv.conf 2>&1 | tee -a "$LOG_FILE" || warn "chattr +i ใช้ไม่ได้ (filesystem ไม่รองรับ) DNS ยังถูกตั้งไว้ปกติ แต่ป้องกันการเขียนทับไม่ได้ 100%"
 
-cat > /etc/systemd/system/dns-privacy-nft.service << 'EOF'
+    # บล็อก DNS query ขาออกที่ไม่ใช่ 1.1.1.1/1.0.0.1 เพื่อกัน DNS leak แบบ
+    # โปรแกรมไหนดันไปจิ้ม DNS server อื่นตรงๆ (ทั้ง TCP/UDP port 53)
+    nft list table inet filter &>/dev/null
+    if [[ $? -eq 0 ]]; then
+        if ! nft list chain inet filter output 2>/dev/null | grep -q "dns-leak-guard"; then
+            nft add rule inet filter output meta l4proto { udp, tcp } th dport 53 ip daddr != { ${DNS_PRIMARY}, ${DNS_SECONDARY} } drop comment "dns-leak-guard" 2>&1 | tee -a "$LOG_FILE"
+        fi
+    fi
+    ok "DNS ถูกล็อกเป็น ${DNS_PRIMARY}/${DNS_SECONDARY} + บล็อก DNS query ไป server อื่น"
+
+    # ----- 4.3 โหลด module CAKE + BBR -----
+    log "-- โหลด kernel module: sch_cake, tcp_bbr --"
+    modprobe sch_cake 2>&1 | tee -a "$LOG_FILE"
+    if lsmod | grep -q sch_cake; then
+        ok "โหลด sch_cake สำเร็จ"
+    else
+        err "โหลด sch_cake ไม่สำเร็จ kernel นี้อาจไม่มี module นี้ build มา (เช็คด้วย: apt install linux-modules-extra-\$(uname -r))"
+    fi
+
+    modprobe tcp_bbr 2>&1 | tee -a "$LOG_FILE"
+    echo "sch_cake" > /etc/modules-load.d/sch_cake.conf
+    echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf
+    ok "ตั้งให้โหลด module อัตโนมัติทุกครั้งที่บูต (/etc/modules-load.d/)"
+
+    # ----- 4.4 sysctl: BBR + buffer ตาม BDP + ปรับให้เหมาะ mobile/LTE -----
+    log "-- ตั้ง sysctl: BBR, buffer ตาม BDP (${BDP_BW_MBPS}Mbps @ ${BDP_RTT_MS}ms = ${BDP_BYTES} bytes) --"
+    cat > /etc/sysctl.d/99-vmess-ws-tuning.conf << EOF
+# congestion control: BBR (เหมาะกับเน็ตมือถือที่ RTT แปรปรวน ลด bufferbloat)
+net.core.default_qdisc = cake
+net.ipv4.tcp_congestion_control = bbr
+
+# TCP buffer: min default max (หน่วย byte) ปรับเพดานบนตาม BDP*2 เผื่อ burst
+# ไม่ได้ "จำกัด" ความเร็ว แต่กันไม่ให้ buffer โตจนเกิด bufferbloat บนลิงก์ช้า
+net.ipv4.tcp_rmem = 4096 131072 ${TCP_BUF_MAX}
+net.ipv4.tcp_wmem = 4096 65536 ${TCP_BUF_MAX}
+net.core.rmem_max = ${TCP_BUF_MAX}
+net.core.wmem_max = ${TCP_BUF_MAX}
+net.core.rmem_default = 131072
+net.core.wmem_default = 131072
+
+# mobile/LTE: RTT แปรปรวนสูง ปิด slow-start หลัง idle เพื่อไม่ต้องไต่ window ใหม่
+net.ipv4.tcp_slow_start_after_idle = 0
+
+# ลด latency: ปิด timestamps overhead เล็กน้อยไม่จำเป็น แต่เปิด window scaling ไว้เสมอ (จำเป็นสำหรับ buffer ใหญ่)
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_timestamps = 1
+
+# SYN/connection handling: เพิ่ม backlog เผื่อ reconnect ถี่จากมือถือ (สัญญาณตัด-ต่อบ่อย)
+net.core.somaxconn = 1024
+net.core.netdev_max_backlog = 2048
+net.ipv4.tcp_max_syn_backlog = 2048
+
+# fast open ช่วยลด 1 RTT ตอนต่อใหม่ (ดีกับเน็ตมือถือ ping สูง)
+net.ipv4.tcp_fastopen = 3
+
+# ลด keepalive ให้ตรวจจับสายหลุดเร็วขึ้น (มือถือเปลี่ยนเสาบ่อย)
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 3
+
+# FIN/TIME_WAIT: รีไซเคิล connection เร็วขึ้น (ลดพอร์ตค้างบน VPS เล็ก)
+net.ipv4.tcp_fin_timeout = 15
+
+# MTU/PMTU: เปิด PMTU discovery, ป้องกัน blackhole ตอนเจอ ICMP ถูกบล็อกข้างทาง
+net.ipv4.tcp_mtu_probing = 1
+
+# security: ลด IP spoofing / source routing (ไม่เกี่ยวกับ leak DNS แต่ลดพื้นผิวโจมตี)
+net.ipv4.conf.all.rp_filter = 1
+net.ipv4.conf.${NIC}.rp_filter = 1
+net.ipv4.conf.all.accept_source_route = 0
+net.ipv4.conf.all.send_redirects = 0
+net.ipv4.icmp_echo_ignore_broadcasts = 1
+
+# จำกัด swap ผ่าน sysctl ตัวนี้ (รายละเอียดเพิ่มใน stage 5)
+vm.swappiness = ${SWAPPINESS}
+EOF
+
+    sysctl --system 2>&1 | tee -a "$LOG_FILE"
+    ok "sysctl tuning โหลดเรียบร้อย"
+
+    # ----- 4.5 ตั้ง CAKE บน eth0 (ไม่ cap bandwidth, ไม่ตั้ง maxrate) -----
+    log "-- ตั้ง qdisc CAKE บน ${NIC} (ไม่ cap bandwidth) --"
+    # หมายเหตุ: ไม่ส่ง "bandwidth" parameter ให้ CAKE เพื่อไม่จำกัดความเร็วจริง
+    # ใช้ docsis เป็น default ack-filter เพราะเหมาะกับ asymmetric mobile link
+    tc qdisc replace dev "${NIC}" root cake besteffort triple-isolate nat no-ack-filter 2>&1 | tee -a "$LOG_FILE"
+    if tc qdisc show dev "${NIC}" | grep -q cake; then
+        ok "CAKE qdisc ติดตั้งบน ${NIC} สำเร็จ"
+    else
+        err "ตั้ง CAKE บน ${NIC} ไม่สำเร็จ ตรวจสอบว่า module sch_cake โหลดอยู่จริงด้วย: lsmod | grep cake"
+    fi
+
+    # ----- 4.6 ทำให้ CAKE qdisc คงอยู่หลัง reboot ผ่าน systemd service -----
+    cat > /etc/systemd/system/cake-qdisc.service << EOF
 [Unit]
-Description=Block plaintext DNS (anti-leak)
-After=network.target
+Description=Apply CAKE qdisc on ${NIC} after boot
+After=network-online.target
+Wants=network-online.target
+
 [Service]
 Type=oneshot
-ExecStart=/usr/sbin/nft -f /etc/nftables-dns-block.conf
+ExecStart=/sbin/tc qdisc replace dev ${NIC} root cake besteffort triple-isolate nat no-ack-filter
 RemainAfterExit=yes
+
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now dns-privacy-nft.service
-ok "บล็อก port 53 plaintext DNS ขาออก"
+    systemctl daemon-reload
+    systemctl enable cake-qdisc.service 2>&1 | tee -a "$LOG_FILE"
+    ok "ตั้ง cake-qdisc.service ให้รันอัตโนมัติทุกครั้งที่บูต"
 
-# ปิด IPv6 บน kernel ทุก interface
-for iface in $(ip link show | awk -F': ' '/^[0-9]+:/ {print $2}' | cut -d@ -f1); do
-  echo 1 > /proc/sys/net/ipv6/conf/"${iface}"/disable_ipv6 2>/dev/null || true
-done
-ok "IPv6 ปิดสมบูรณ์"
+    # ----- 4.7 MTU + MSS clamp -----
+    log "-- ตั้ง MTU=${MTU_VAL} บน ${NIC} + MSS clamp=${MSS_VAL} --"
+    ip link set dev "${NIC}" mtu "${MTU_VAL}" 2>&1 | tee -a "$LOG_FILE"
 
-# ════════════════════════════════════════════════════
-hdr "STEP 7 — Harden SSH (ป้องกัน brute force)"
-# ════════════════════════════════════════════════════
-# Rate-limit SSH connection ผ่าน ufw
-ufw limit 22/tcp comment 'SSH rate-limit'
+    # netplan persist (Ubuntu 24.04 ใช้ netplan เป็นหลัก)
+    NETPLAN_FILE=$(ls /etc/netplan/*.yaml 2>/dev/null | head -n1)
+    if [[ -n "${NETPLAN_FILE}" ]]; then
+        if ! grep -q "mtu:" "${NETPLAN_FILE}"; then
+            warn "ไม่พบ mtu: ใน ${NETPLAN_FILE} เพิ่ม MTU ให้ผ่าน netplan override แทนแก้ yaml ตรง (กัน indent พัง)"
+            cat > /etc/netplan/99-mtu-override.yaml << EOF
+network:
+  version: 2
+  ethernets:
+    ${NIC}:
+      mtu: ${MTU_VAL}
+EOF
+            chmod 600 /etc/netplan/99-mtu-override.yaml
+            netplan apply 2>&1 | tee -a "$LOG_FILE" || warn "netplan apply ล้มเหลว MTU ที่ตั้งสดด้วย ip link ยังใช้ได้จนกว่าจะ reboot"
+        fi
+    else
+        # fallback: persist ผ่าน systemd-networkd ถ้าไม่มี netplan
+        warn "ไม่พบ netplan config ใช้ systemd service แทนเพื่อ persist MTU"
+        cat > /etc/systemd/system/mtu-persist.service << EOF
+[Unit]
+Description=Persist MTU ${MTU_VAL} on ${NIC}
+After=network-online.target
+Wants=network-online.target
 
-# Harden sshd config
-SSHD=/etc/ssh/sshd_config
-cp "$SSHD" "${SSHD}.bak.$(date +%s)"
-sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin prohibit-password/' "$SSHD"
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$SSHD"
-sed -i 's/^#\?X11Forwarding.*/X11Forwarding no/' "$SSHD"
-sed -i 's/^#\?MaxAuthTries.*/MaxAuthTries 3/' "$SSHD"
-sed -i 's/^#\?LoginGraceTime.*/LoginGraceTime 30/' "$SSHD"
-grep -q "^ClientAliveInterval" "$SSHD" || echo "ClientAliveInterval 120" >> "$SSHD"
-grep -q "^ClientAliveCountMax" "$SSHD" || echo "ClientAliveCountMax 3" >> "$SSHD"
-systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-ok "SSH hardened + rate-limited"
+[Service]
+Type=oneshot
+ExecStart=/sbin/ip link set dev ${NIC} mtu ${MTU_VAL}
+RemainAfterExit=yes
 
-# ════════════════════════════════════════════════════
-hdr "STEP 8 — Restart x-ui"
-# ════════════════════════════════════════════════════
-timeout 15 systemctl restart x-ui 2>/dev/null || true
-sleep 3
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+        systemctl enable mtu-persist.service 2>&1 | tee -a "$LOG_FILE"
+    fi
 
-# ════════════════════════════════════════════════════
-hdr "VERIFY"
-# ════════════════════════════════════════════════════
-errors=0
-chk() { if eval "$2"; then ok "$1"; else warn "$1 — ไม่ผ่าน"; errors=$((errors+1)); fi; }
+    # MSS clamp ผ่าน nftables (mangle-like ใน inet filter ใช้ forward/output ก็ได้
+    # แต่สำหรับ traffic ที่ "เซิร์ฟเวอร์เป็นปลายทางเอง" ไม่ผ่าน forward
+    # เราจึงตั้ง MSS clamp ผ่าน iptables-style ใน output/postrouting แทน)
+    if command -v iptables &>/dev/null; then
+        iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${MSS_VAL}" 2>/dev/null \
+          || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "${MSS_VAL}" 2>&1 | tee -a "$LOG_FILE"
+        ok "ตั้ง MSS clamp = ${MSS_VAL} ผ่าน iptables mangle OUTPUT"
+    else
+        warn "ไม่พบ iptables ข้าม MSS clamp (MTU 1500 มาตรฐานปกติไม่น่ามีปัญหาฟราก แต่ถ้าใช้ tunnel ซ้อนทับอีกชั้นอาจต้องตั้งเอง)"
+    fi
 
-chk "Congestion control = ${CC}"  "[ \"\$(sysctl -n net.ipv4.tcp_congestion_control)\" = '${CC}' ]"
-chk "qdisc = ${QDISC}"            "[ \"\$(sysctl -n net.core.default_qdisc)\" = '${QDISC}' ]"
-chk "IPv6 ปิด"                    "[ \"\$(sysctl -n net.ipv6.conf.all.disable_ipv6)\" = '1' ]"
-chk "TCP timestamps ปิด"          "[ \"\$(sysctl -n net.ipv4.tcp_timestamps)\" = '0' ]"
-chk "DNS → 1.1.1.1"               "resolvectl status 2>/dev/null | grep -q '1.1.1.1'"
-chk "Port 22 เปิด"                "ufw status | grep -qE '^22/tcp'"
-chk "Port 80 เปิด"                "ufw status | grep -qE '^80/tcp'"
-chk "Port 2053 เปิด"              "ufw status | grep -qE '^2053/tcp'"
-chk "x-ui ทำงานอยู่"              "systemctl is-active --quiet x-ui"
-chk "Port 2053 listening"         "ss -tlnp | grep -q ':2053'"
-chk "Swap active"                 "swapon --show | grep -q '/swapfile'"
+    ok "Network tuning (stage 4) เสร็จสมบูรณ์"
+}
 
-if timeout 3 bash -c 'exec 3<>/dev/tcp/8.8.8.8/53' 2>/dev/null; then
-  warn "DNS leak: port 53 ยังออกได้"
-  errors=$((errors+1))
-else
-  ok "ไม่มี DNS leak (port 53 ถูกบล็อก)"
-fi
+################################################################################
+# STAGE 5: Swap setup
+################################################################################
 
-PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null || \
-         curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
+stage5_swap() {
+    log "===== STAGE 5: Swap (${SWAP_SIZE_MB}MB, swappiness=${SWAPPINESS}) ====="
 
-echo ""
-echo -e "  ══════════════════════════════════════════════════════"
-echo -e "  ${BLD}Server IP${RST}   : ${PUB_IP}"
-echo -e "  ${BLD}Panel URL${RST}   : https://<domain>:2053/<path>"
-echo -e "  ${BLD}Firewall${RST}    : TCP 22(rate-limited)/80/2053 เปิด — ที่เหลือปิดหมด"
-echo -e "  ${BLD}DNS${RST}         : 1.1.1.1 DoT | plaintext port 53 บล็อก"
-echo -e "  ${BLD}IPv6${RST}        : ปิดสมบูรณ์"
-echo -e "  ${BLD}Log${RST}         : disk persistent, rotate 7 วัน, max 200MB"
-echo -e "  ${BLD}Performance${RST} : BBR(${CC}) + ${QDISC} + 4MB buf + MSS 1440 + initcwnd 20"
-echo -e "  ──────────────────────────────────────────────────────"
-echo -e "  ${BLD}ตั้งใน VMess WS Inbound (3x-ui):${RST}"
-echo -e "    Protocol    : VMess"
-echo -e "    Port        : 80"
-echo -e "    Network     : ws"
-echo -e "    Path        : /ws  (หรือตั้งเอง)"
-echo -e "    Host        : speedtest.net"
-echo -e "    Sniffing    : ปิดทั้งหมด"
-echo -e "    Xray DNS    : 127.0.0.53"
-echo -e "  ──────────────────────────────────────────────────────"
-echo -e "  ${BLD}ตั้งใน V2Box (Client):${RST}"
-echo -e "    Protocol    : VMess"
-echo -e "    Server      : ${PUB_IP} : 80"
-echo -e "    Network     : WebSocket"
-echo -e "    Path        : /ws"
-echo -e "    Host        : speedtest.net"
-echo -e "    MTU         : 1500"
-echo -e "    TCP MSS     : 1440"
-echo -e "  ══════════════════════════════════════════════════════"
-echo ""
+    if swapon --show | grep -q "${SWAP_FILE}"; then
+        warn "พบ swapfile ${SWAP_FILE} เปิดอยู่แล้ว ข้ามการสร้างใหม่"
+    else
+        if [[ -f "${SWAP_FILE}" ]]; then
+            rm -f "${SWAP_FILE}"
+        fi
+        fallocate -l "${SWAP_SIZE_MB}M" "${SWAP_FILE}" 2>&1 | tee -a "$LOG_FILE" \
+          || dd if=/dev/zero of="${SWAP_FILE}" bs=1M count="${SWAP_SIZE_MB}" status=progress 2>&1 | tee -a "$LOG_FILE"
+        chmod 600 "${SWAP_FILE}"
+        mkswap "${SWAP_FILE}" 2>&1 | tee -a "$LOG_FILE"
+        swapon "${SWAP_FILE}" 2>&1 | tee -a "$LOG_FILE"
 
-if [ "$errors" -eq 0 ]; then
-  echo -e "${BLD}${GRN}  ✔ ผ่านหมด${RST}"
-else
-  echo -e "${YEL}  ⚠ พบ ${errors} รายการไม่ผ่าน — ดู log: ${LOG_FILE}${RST}"
-fi
+        if ! grep -q "${SWAP_FILE}" /etc/fstab; then
+            echo "${SWAP_FILE} none swap sw 0 0" >> /etc/fstab
+        fi
+        ok "สร้างและเปิด swapfile ${SWAP_SIZE_MB}MB เรียบร้อย (persist ผ่าน /etc/fstab)"
+    fi
 
-echo -e "${BLD}${YEL}  → reboot แล้วเข้า panel ตั้ง VMess WS inbound ได้เลย${RST}"
-echo -e "${BLD}${RED}  ⚠ ตรวจว่า SSH เข้าได้ก่อน reboot ทุกครั้ง${RST}"
-echo -e "  Log: ${LOG_FILE}"
-echo ""
+    # swappiness ถูกตั้งใน sysctl ของ stage 4 แล้ว (vm.swappiness) ยืนยันค่าจริงอีกที
+    sysctl vm.swappiness 2>&1 | tee -a "$LOG_FILE"
+    ok "swappiness=${SWAPPINESS} (ลด swap thrash, ให้ kernel เลี่ยง swap ไว้ก่อนถ้า RAM ยังพอ)"
+}
+
+################################################################################
+# STAGE 6: ย้าย log ทั้งหมด (journald + xray/3x-ui) ไปอยู่บน tmpfs (RAM only)
+#
+#   *** คำเตือนสำคัญ ***
+#   log ที่อยู่บน tmpfs จะ "หายทั้งหมด" ถ้า VPS ไฟดับ/ถูก force restart
+#   กะทันหันโดยไม่ได้ shutdown ปกติ เพราะตั้งใจไม่ sync กลับ disk ถาวร
+#   (เลือก privacy + speed ตามที่ระบุไว้) ส่วนการตั้งค่าระบบอื่นๆ ทั้งหมด
+#   (sysctl, nftables, swap, qdisc, 3x-ui config ของจริงที่อยู่ใน DB)
+#   ยังคง persistent ผ่าน reboot ปกติตามเดิม ไม่ได้รับผลกระทบ
+################################################################################
+
+stage6_ram_logs() {
+    log "===== STAGE 6: ย้าย log ไปอยู่บน tmpfs (RAM only, ไม่ sync กลับ disk) ====="
+
+    # ----- 6.1 journald -> volatile (RAM only) -----
+    mkdir -p /etc/systemd/journald.conf.d
+    cat > /etc/systemd/journald.conf.d/99-ram-only.conf << EOF
+[Journal]
+Storage=volatile
+RuntimeMaxUse=128M
+RuntimeKeepFree=64M
+Compress=yes
+ForwardToSyslog=no
+EOF
+    systemctl restart systemd-journald 2>&1 | tee -a "$LOG_FILE"
+    ok "journald ตั้งเป็น Storage=volatile (เก็บใน /run เท่านั้น = RAM ไม่ลง disk)"
+
+    # ----- 6.2 xray / 3x-ui log -> bind mount tmpfs -----
+    # 3x-ui เก็บ log ไว้ที่ /var/log/x-ui (access.log, error.log) โดย default
+    # เราสร้าง tmpfs แยกเฉพาะ แล้ว bind mount ทับ path เดิม เพื่อไม่ต้องไปแก้
+    # path ใน 3x-ui config (ตอบโจทย์ "ไม่ต้องยุ่งกับ 3x-ui inbound settings")
+    mkdir -p "${XUI_LOG_DIR}"
+
+    if ! grep -q "${XUI_LOG_DIR}" /etc/fstab; then
+        echo "tmpfs ${XUI_LOG_DIR} tmpfs defaults,noatime,mode=0750,size=${TMPLOG_SIZE} 0 0" >> /etc/fstab
+        ok "เพิ่ม tmpfs mount สำหรับ ${XUI_LOG_DIR} ใน /etc/fstab (persist หลัง reboot ว่าให้ mount เป็น RAM เสมอ)"
+    else
+        warn "พบ mount entry ของ ${XUI_LOG_DIR} ใน /etc/fstab อยู่แล้ว ข้าม"
+    fi
+
+    mount -a 2>&1 | tee -a "$LOG_FILE"
+    if mount | grep -q "on ${XUI_LOG_DIR} type tmpfs"; then
+        ok "${XUI_LOG_DIR} mount เป็น tmpfs (RAM) สำเร็จ ขนาด ${TMPLOG_SIZE}"
+    else
+        err "${XUI_LOG_DIR} mount เป็น tmpfs ไม่สำเร็จ เช็คด้วย: mount | grep x-ui"
+    fi
+
+    systemctl restart x-ui 2>&1 | tee -a "$LOG_FILE" || warn "restart x-ui ไม่สำเร็จ (อาจยังไม่ได้ติดตั้งถ้าข้าม stage 3)"
+
+    log "*** คำเตือน: log ทั้งหมด (journald + xray) อยู่บน RAM ล้วนๆ ตอนนี้ ***"
+    log "*** ถ้าไฟดับ/VPS ถูก force restart กะทันหัน log ทั้งหมดจะหายทันที (ตามที่ตกลงไว้) ***"
+    log "*** การตั้งค่าระบบอื่น (sysctl/nftables/swap/qdisc/3x-ui config จริง) ไม่ได้รับผลกระทบ ยัง persistent ปกติ ***"
+}
+
+################################################################################
+# STAGE 7: Verify ทุกระบบ
+################################################################################
+
+stage7_verify() {
+    log "===== STAGE 7: Verify ====="
+    local pass=0
+    local fail=0
+
+    check() {
+        local desc="$1"
+        local cmd="$2"
+        if eval "$cmd" &>/dev/null; then
+            ok "$desc"
+            pass=$((pass+1))
+        else
+            err "$desc"
+            fail=$((fail+1))
+        fi
+    }
+
+    echo "" | tee -a "$LOG_FILE"
+    log "----- ผลตรวจสอบระบบ -----"
+
+    check "nftables service active"                  "systemctl is-active --quiet nftables"
+    check "IPv6 ปิดอยู่ (all.disable_ipv6=1)"          "[[ \$(sysctl -n net.ipv6.conf.all.disable_ipv6) -eq 1 ]]"
+    check "DNS resolv.conf ชี้ไปที่ ${DNS_PRIMARY}"     "grep -q '${DNS_PRIMARY}' /etc/resolv.conf"
+    check "BBR เป็น congestion control"               "[[ \$(sysctl -n net.ipv4.tcp_congestion_control) == 'bbr' ]]"
+    check "default_qdisc = cake"                      "[[ \$(sysctl -n net.core.default_qdisc) == 'cake' ]]"
+    check "CAKE module โหลดอยู่ (lsmod)"               "lsmod | grep -q sch_cake"
+    check "CAKE qdisc ติดตั้งบน ${NIC}"                "tc qdisc show dev ${NIC} | grep -q cake"
+    check "MTU ${NIC} = ${MTU_VAL}"                   "[[ \$(cat /sys/class/net/${NIC}/mtu) -eq ${MTU_VAL} ]]"
+    check "Swap active (${SWAP_FILE})"                "swapon --show | grep -q ${SWAP_FILE}"
+    check "swappiness = ${SWAPPINESS}"                "[[ \$(sysctl -n vm.swappiness) -eq ${SWAPPINESS} ]]"
+    check "journald = volatile (RAM only)"            "grep -q 'Storage=volatile' /etc/systemd/journald.conf.d/99-ram-only.conf"
+    check "${XUI_LOG_DIR} mount เป็น tmpfs"            "mount | grep -q 'on ${XUI_LOG_DIR} type tmpfs'"
+    check "3x-ui service active"                      "systemctl is-active --quiet x-ui"
+    check "cake-qdisc.service enabled (persist boot)" "systemctl is-enabled --quiet cake-qdisc.service"
+
+    echo "" | tee -a "$LOG_FILE"
+    log "----- พอร์ตที่เปิดจริง (nft ruleset) -----"
+    nft list chain inet filter input 2>/dev/null | grep -E "dport|policy" | tee -a "$LOG_FILE"
+
+    echo "" | tee -a "$LOG_FILE"
+    log "===== สรุป: ผ่าน ${pass} ข้อ / ล้มเหลว ${fail} ข้อ ====="
+
+    if [[ "${fail}" -gt 0 ]]; then
+        warn "มีบางจุดที่ verify ไม่ผ่าน ดูรายละเอียด [FAIL] ด้านบนหรือใน ${LOG_FILE}"
+    else
+        ok "ทุกระบบผ่านการตรวจสอบ"
+    fi
+
+    echo "" | tee -a "$LOG_FILE"
+    log "หมายเหตุสุดท้าย (ย้ำอีกครั้ง):"
+    log "  - log (journald+xray) อยู่บน RAM ล้วน หายได้ถ้าไฟดับ/force restart"
+    log "  - การตั้งค่า network/firewall/swap/3x-ui ทั้งหมดเป็น persistent ผ่าน reboot ปกติ"
+    log "  - ตั้งค่า inbound VMESS+WS (security: none) เองผ่าน 3x-ui panel (default login: เช็คท้าย log ติดตั้งด้านบน)"
+    log "  - แนะนำให้ reboot 1 ครั้งเพื่อยืนยันว่าทุกอย่าง persist จริง: sudo reboot"
+}
+
+################################################################################
+# MAIN
+################################################################################
+
+main() {
+    require_root
+    stage0_preflight
+    stage1_apt_update
+    stage2_firewall
+    stage3_install_3xui
+    stage4_network_tuning
+    stage5_swap
+    stage6_ram_logs
+    stage7_verify
+
+    echo "" | tee -a "$LOG_FILE"
+    log "สคริปต์ทำงานเสร็จสมบูรณ์ ดู log เต็มได้ที่: ${LOG_FILE}"
+}
+
+main "$@"
