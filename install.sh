@@ -64,14 +64,9 @@ REALITY_SNI="speedtest.net"
 REALITY_FINGERPRINT="firefox"
 
 # UDP ports สำหรับเกมหลักๆที่รู้ port แน่นอน + Xray relay เอง
-# (ไม่เปิด ephemeral เต็ม 1024-65535 ตามที่ตกลง — แคบกว่านี้ ปลอดภัยกว่า)
+# (เปิด ephemeral เต็ม 1024-65535 ตามที่ตกลง)
 GAME_UDP_PORTS=(
-  "3478:3480"     # RoV / Garena (STUN-style voice/lobby)
-  "5055:5057"     # RoV เกมเพลย์
-  "10000:10100"   # PUBG Mobile
-  "7000:7999"     # Mobile Legends / Free Fire ช่วงที่ใช้บ่อย
-  "50000:50100"   # Valorant (เผื่อกรณีเล่นผ่าน PC tether)
-  "9000:9100"     # Roblox UDP
+  "1024:65535"     # for Game
 )
 
 ask "กรอก IP เครื่องที่จะใช้เข้า panel (เว้นว่างเพื่อเปิดให้ทุก IP — ไม่แนะนำ):"
