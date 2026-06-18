@@ -12,15 +12,7 @@ mkdir -p "$STATE_DIR"
 
 [ "$(id -u)" -eq 0 ] || { echo -e "${RED}✘ ต้องรันด้วย root${RST}"; exit 1; }
 
-# ── ป้องกัน session หลุด ด้วย tmux ──
-if [ -z "${TMUX:-}" ]; then
-  apt-get update -y -qq 2>/dev/null
-  apt-get install -y -qq tmux 2>/dev/null
-  echo -e "${YEL}เปิด tmux session เพื่อป้องกัน SSH หลุด...${RST}"
-  echo -e "${YEL}ถ้า SSH หลุด → reconnect แล้วพิมพ์: tmux attach -t vmess-setup${RST}"
-  sleep 2
-  exec tmux new-session -s vmess-setup bash "$0" "$@"
-fi
+
 
 exec > >(tee -a "$LOG_FILE") 2>&1
 
@@ -47,7 +39,7 @@ apt-get update -y
 apt-get -y full-upgrade
 apt-get -y autoremove --purge
 apt-get autoclean -y
-apt-get install -y curl ufw nftables sqlite3 tmux
+apt-get install -y curl ufw nftables sqlite3
 ok "ระบบอัปเดตเสร็จ"
 
 # ════════════════════════════════════════════════════
