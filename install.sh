@@ -122,14 +122,17 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw default deny forward
 
-# เปิดเฉพาะ TCP ที่จำเป็น (AIS บล็อก UDP หนัก)
+# เปิดเฉพาะ TCP ที่จำเป็น
 ufw limit   22/tcp      comment "SSH"
 ufw allow   80/tcp      comment "HTTP (bughost redirect)"
 ufw allow   443/tcp     comment "VLESS REALITY"
 ufw allow   ${PANEL_PORT}/tcp comment "3x-ui panel"
 
-# ปิด UDP ทั้งหมด (AIS บล็อก / ไม่ใช้)
-ufw deny    proto udp from any to any comment "Block UDP"
+# ⚠ หมายเหตุ UDP:
+# ไม่ block UDP ทั้งหมด เพราะ Xray ต้องใช้ relay UDP ให้ client ได้
+# (เกมอย่าง Roblox / RoV / เกมอื่นๆ ที่พึ่ง UDP จะเล่นไม่ได้ถ้า block)
+# DNS leak ถูกกันด้วยวิธีอื่นแทน: DoT (port 853) + nftables block port 53
+# ซึ่งแม่นยำกว่าการ block UDP ทั้งหมด
 
 # ปิด port อันตราย
 ufw deny    23/tcp
@@ -141,7 +144,7 @@ sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
 
 ufw --force enable
 ufw status verbose
-ok "UFW Firewall เปิดแล้ว: 22/80/443/${PANEL_PORT} TCP เท่านั้น"
+ok "UFW Firewall เปิดแล้ว: 22/80/443/${PANEL_PORT} TCP | UDP relay เปิด (เกม RoV/Roblox ใช้ได้)"
 
 # ── 1.5 Swap ────────────────────────────────────────────────────────
 info "1.5 สร้าง Swap ${SWAP_SIZE_MB}MB..."
@@ -555,6 +558,8 @@ systemctl restart systemd-resolved
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
 
 # Block outbound port 53 ด้วย nftables
+# ⚠ หมายเหตุ: block เฉพาะ port 53 (plain DNS) ไม่ใช่ UDP ทั้งหมด
+# เพื่อให้ Xray relay UDP ของ client ได้ปกติ (เกม RoV/Roblox ฯลฯ)
 cat > /etc/nftables-dns-block.conf << 'NFTEOF'
 #!/usr/sbin/nft -f
 table inet dns_privacy {
@@ -617,14 +622,6 @@ print(json.dumps(d, separators=(',',':')))
 else
   warn "ไม่เจอ x-ui.db — จะ patch Xray DNS หลัง reboot + สร้าง inbound"
 fi
-
-# (TCP-only lockdown step ถูกถอดออก — เกม RoV/Roblox/อื่นๆ พึ่ง UDP จริง
-#  สำหรับ traffic ระหว่างเล่น บล็อก UDP ขาออกทั้งหมดทำให้เกมพวกนี้เล่นไม่ได้
-#  เพราะ Xray relay UDP request ของ client ไม่ได้เลย — "TCP only 0% UDP"
-#  กับ "เล่นเกมที่พึ่ง UDP ผ่าน tunnel ได้" ขัดกันโดยธรรมชาติ เลือกอย่างใด
-#  อย่างหนึ่ง ในเมื่อต้องเล่นเกมได้ จึงถอด lockdown นี้ทิ้ง — DNS leak
-#  protection (DoT/Domains=~./Xray internal DNS) ที่ทำไว้ก่อนหน้านี้ไม่ถูก
-#  แตะต้องเลย เพราะนั่นบล็อกเฉพาะ "พอร์ต 53" ไม่ใช่ UDP ทั้งหมด)
 
 # ── 4.3 Kernel Security Hardening ──────────────────────────────────
 info "4.3 Kernel security hardening..."
@@ -907,6 +904,15 @@ else
 fi
 chk_val "resolved Domains=~." "$(resolvectl status 2>/dev/null | grep -m1 'DNS Domain')" "~."
 
+# ── ตรวจ UFW ว่าไม่มี rule block UDP ทั้งหมด (เกม RoV/Roblox ต้องใช้ UDP) ──
+info "ตรวจ UFW: ต้องไม่มี rule 'deny udp' ที่ block UDP ทั้งหมด..."
+if ufw status 2>/dev/null | grep -qE "^DENY.*Anywhere.*\(v6\)$|deny.*proto udp.*any.*any"; then
+  warn "⚠ พบ UFW rule ที่ block UDP ทั้งหมด! เกม RoV/Roblox จะใช้ไม่ได้ — ลบด้วย: ufw delete deny proto udp from any to any"
+  errors=$((errors+1))
+else
+  ok "UFW ไม่มี rule block UDP ทั้งหมด (เกมเล่นได้ปกติ)"
+fi
+
 # ── ตรวจงบ RAM จริง vs ค่าที่คำนวณบัฟเฟอร์ไว้ (สมมติฐาน ~2048MB) ────
 if [ "$RAM_MB" -lt 1800 ]; then
   warn "RAM จริง = ${RAM_MB}MB ต่ำกว่าที่คำนวณบัฟเฟอร์ไว้ (2048MB)"
@@ -924,7 +930,7 @@ echo -e "  ═══════════════════════
 echo -e "  ${BLD}Server IP    :${RST} ${PUB_IP}"
 echo -e "  ${BLD}Panel URL    :${RST} http://${PUB_IP}:${PANEL_PORT}/"
 echo -e "  ──────────────────────────────────────────────────────────"
-echo -e "  ${BLD}Protocol     :${RST} VLESS | Port: 443 | Network: TCP (UDP relay เปิดใช้งานได้ปกติ — เกมที่พึ่ง UDP เล่นได้)"
+echo -e "  ${BLD}Protocol     :${RST} VLESS | Port: 443 | Network: TCP + UDP relay"
 echo -e "  ${BLD}Security     :${RST} Reality"
 echo -e "  ${BLD}Flow         :${RST} xtls-rprx-vision"
 echo -e "  ${BLD}SNI          :${RST} ${TLS_SNI}"
@@ -940,6 +946,8 @@ echo -e "    ${GRN}✔${RST}  mDNS/LLMNR   : ปิด (ลด broadcast metadat
 echo -e "    ${GRN}✔${RST}  Xray log     : ปิด (none)"
 echo -e "    ${GRN}✔${RST}  journald     : RAM only (volatile)"
 echo -e "    ${GRN}✔${RST}  Fingerprint  : firefox"
+echo -e "    ${YEL}⚠${RST}  UDP          : เปิด (จำเป็นสำหรับ Xray relay เกม RoV/Roblox)"
+echo -e "                  DNS leak กันด้วย DoT + block port 53 แทน"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Performance  :${RST}"
 echo -e "    ${GRN}✔${RST}  BBR congestion control"
@@ -952,7 +960,7 @@ echo -e "  ${BLD}Security     :${RST}"
 echo -e "    ${GRN}✔${RST}  SSH: publickey only"
 echo -e "    ${GRN}✔${RST}  fail2ban: SSH ban 24h"
 echo -e "    ${GRN}✔${RST}  Kernel hardening (kptr/ptrace/BPF)"
-echo -e "    ${GRN}✔${RST}  UFW: 22/80/443/${PANEL_PORT} TCP เท่านั้น"
+echo -e "    ${GRN}✔${RST}  UFW: 22/80/443/${PANEL_PORT} TCP | UDP relay เปิด"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Logs & Debug :${RST}"
 echo -e "  systemctl status x-ui"
