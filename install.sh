@@ -12,11 +12,14 @@ mkdir -p "$STATE_DIR"
 
 [ "$(id -u)" -eq 0 ] || { echo -e "${RED}✘ ต้องรันด้วย root${RST}"; exit 1; }
 
-# ── รันใน screen ถ้ายังไม่ได้อยู่ใน session ──
-if [ -z "${STY:-}" ] && [ -z "${TMUX:-}" ]; then
-  apt-get update -y -qq && apt-get install -y -qq screen
-  echo -e "${YEL}กำลังรันใน screen เพื่อป้องกัน session หลุด...${RST}"
-  exec screen -S vmess-setup bash "$0" "$@"
+# ── ป้องกัน session หลุด ด้วย tmux ──
+if [ -z "${TMUX:-}" ]; then
+  apt-get update -y -qq 2>/dev/null
+  apt-get install -y -qq tmux 2>/dev/null
+  echo -e "${YEL}เปิด tmux session เพื่อป้องกัน SSH หลุด...${RST}"
+  echo -e "${YEL}ถ้า SSH หลุด → reconnect แล้วพิมพ์: tmux attach -t vmess-setup${RST}"
+  sleep 2
+  exec tmux new-session -s vmess-setup bash "$0" "$@"
 fi
 
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -44,7 +47,7 @@ apt-get update -y
 apt-get -y full-upgrade
 apt-get -y autoremove --purge
 apt-get autoclean -y
-apt-get install -y curl ufw nftables sqlite3 screen tmux
+apt-get install -y curl ufw nftables sqlite3 tmux
 ok "ระบบอัปเดตเสร็จ"
 
 # ════════════════════════════════════════════════════
@@ -409,7 +412,7 @@ echo -e "  ${BLD}Panel URL${RST}   : https://<domain>:2053/<path>"
 echo -e "  ${BLD}Firewall${RST}    : TCP 22(rate-limited)/80/2053 เปิด — ที่เหลือปิดหมด"
 echo -e "  ${BLD}DNS${RST}         : 1.1.1.1 DoT | plaintext port 53 บล็อก"
 echo -e "  ${BLD}IPv6${RST}        : ปิดสมบูรณ์"
-echo -e "  ${BLD}Log${RST}         : RAM only (volatile journald)"
+echo -e "  ${BLD}Log${RST}         : disk persistent, rotate 7 วัน, max 200MB"
 echo -e "  ${BLD}Performance${RST} : BBR(${CC}) + ${QDISC} + 4MB buf + MSS 1440 + initcwnd 20"
 echo -e "  ──────────────────────────────────────────────────────"
 echo -e "  ${BLD}ตั้งใน VMess WS Inbound (3x-ui):${RST}"
