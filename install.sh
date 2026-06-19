@@ -53,10 +53,12 @@ while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
   [ "$waited" -ge 60 ] && {
     fuser -k /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
              /var/cache/apt/archives/lock 2>/dev/null || true
+    sleep 3
     break
   }
   info "รอ apt lock... ${waited}s"; sleep 5; waited=$((waited+5))
 done
+dpkg --configure -a
 dpkg --configure -a
 
 apt-get update -y
@@ -102,6 +104,8 @@ if [ "$AUTH_KEYS_OK" -eq 1 ]; then
     done
   fi
 
+  mkdir -p /run/sshd
+  chmod 0755 /run/sshd
   sshd -t && {
     systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
     ok "บังคับใช้ SSH key เท่านั้น (ปิด password login แล้ว, สำรอง config เดิมไว้ที่ ${SSHD_CONF}.bak.*)"
