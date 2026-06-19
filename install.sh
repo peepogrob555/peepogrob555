@@ -247,7 +247,7 @@ fi
 mount -o remount /tmp 2>/dev/null || mount /tmp 2>/dev/null || true
 ok "/tmp → tmpfs 512MB (RAM)"
 
-hdr "STEP 5 — DNS + IP Leak Protection (1.1.1.1 DoT, ปิด IPv6)"
+hdr "STEP 5 — DNS + IP Leak Protection (8.8.8.8 DoT, ปิด IPv6)"
 
 cat > /etc/sysctl.d/99-disable-ipv6.conf << 'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
@@ -268,8 +268,8 @@ ok "ปิด IPv6 สมบูรณ์ (sysctl + grub)"
 mkdir -p /etc/systemd/resolved.conf.d
 cat > /etc/systemd/resolved.conf.d/99-dot.conf << 'EOF'
 [Resolve]
-DNS=1.1.1.1#cloudflare-dns.com
-FallbackDNS=1.0.0.1#cloudflare-dns.com
+DNS=8.8.8.8#dns.google
+FallbackDNS=8.8.4.4#dns.google
 DNSOverTLS=yes
 DNSSEC=no
 Cache=yes
@@ -281,7 +281,7 @@ EOF
 systemctl enable --now systemd-resolved 2>/dev/null || true
 systemctl restart systemd-resolved
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
-ok "DNS → 1.1.1.1 ผ่าน DoT + Domains=~. กัน leak จาก DHCP"
+ok "DNS → 8.8.8.8 ผ่าน DoT + Domains=~. กัน leak จาก DHCP"
 
 # ปิด DNS ที่ DHCP ดึงมาเอง (per-link) ไม่งั้นจะมี DNS server แถมเข้ามา (เช่น 8.8.8.8) ทับ global DNS
 NETPLAN_CHANGED=0
@@ -360,7 +360,7 @@ chk() {
 chk "BBR/${CC} congestion control"        "[ \"\$(sysctl -n net.ipv4.tcp_congestion_control)\" = '${CC}' ]"
 chk "Buffer ceiling = ${BUF_BYTES}"       "[ \"\$(sysctl -n net.core.rmem_max)\" = '${BUF_BYTES}' ]"
 chk "IPv6 ปิดสมบูรณ์"                      "[ \"\$(sysctl -n net.ipv6.conf.all.disable_ipv6)\" = '1' ]"
-chk "DNS ชี้ไป 1.1.1.1"                    "resolvectl status 2>/dev/null | grep -q '1.1.1.1'"
+chk "DNS ชี้ไป 8.8.8.8"                    "resolvectl status 2>/dev/null | grep -q '8.8.8.8'"
 chk "Port ${HTTP_PORT}/tcp เปิดใน UFW"     "ufw status | grep -qE '^${HTTP_PORT}/tcp'"
 chk "Port ${REALITY_PORT}/tcp เปิดใน UFW"  "ufw status | grep -qE '^${REALITY_PORT}/tcp'"
 chk "Port ${PANEL_PORT}/tcp เปิดใน UFW"    "ufw status | grep -qE '^${PANEL_PORT}/tcp'"
@@ -383,7 +383,7 @@ echo -e "  ═══════════════════════
 echo -e "  ${BLD}Server IP${RST}   : ${PUB_IP}"
 echo -e "  ${BLD}Panel URL${RST}   : http://${PUB_IP}:${PANEL_PORT}/"
 echo -e "  ${BLD}Firewall${RST}    : เปิด TCP ${SSH_PORT}/${HTTP_PORT}/${REALITY_PORT}/${PANEL_PORT} + Cloudflare ports (allow ล้วน) — ที่เหลือปิดด้วย default-deny (รวม UDP)"
-echo -e "  ${BLD}DNS${RST}         : 1.1.1.1 ผ่าน DoT — plaintext port 53 บล็อก"
+echo -e "  ${BLD}DNS${RST}         : 8.8.8.8 ผ่าน DoT — plaintext port 53 บล็อก"
 echo -e "  ${BLD}IPv6${RST}        : ปิดสมบูรณ์"
 echo -e "  ${BLD}RAM-backed${RST}  : journald (64MB) + /tmp (512MB tmpfs)"
 echo -e "  ${BLD}Performance${RST} : BBR(${CC}) + ${QDISC} + buffer ${BUF_MB}MB (BDP@${BW_MBPS}Mbps/${RTT_MS}ms) + THP off + swap 1GB"
