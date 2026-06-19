@@ -263,13 +263,7 @@ swapon --show
 ok "Swap พร้อม"
 
 ok "═══ STEP 1 เสร็จสมบูรณ์ ═══"
-
-# ═══════════════════════════════════════════════════════════════════
 hdr "STEP 2 — ติดตั้ง 3x-ui"
-# ═══════════════════════════════════════════════════════════════════
-# NOTE: ขั้นตอนนี้จะแสดง interactive prompt ของ 3x-ui ให้กรอกเองทุกอย่าง
-# ผมไม่ซ่อน ไม่ข้าม ไม่กรอกอัตโนมัติ
-# คุณจะเห็น: Username / Password / Panel Port / Web Path ให้กรอกตามต้องการ
 
 echo ""
 warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
@@ -283,28 +277,16 @@ echo ""
 ask "กด ENTER เพื่อเริ่มติดตั้ง 3x-ui (คุณจะเห็น prompt ทุกอย่าง)..."
 read -r
 
-installer=$(mktemp /tmp/3xui-XXXXXX.sh)
-for attempt in 1 2 3; do
-  if curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh -o "$installer"; then
-    break
-  fi
-  warn "download ล้มเหลว ครั้งที่ ${attempt}/3 รอ 5s..."
-  [ "$attempt" -ge 3 ] && { rm -f "$installer"; die "ดาวน์โหลด 3x-ui installer ไม่ได้"; }
-  sleep 5
-done
-chmod +x "$installer"
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) \
+  || die "ติดตั้ง 3x-ui ล้มเหลว — ตรวจ DNS/network แล้วรันสคริปต์ใหม่"
 
-# รัน installer ตรงๆ ให้คุณเห็นและกรอกเอง
-bash "$installer"
-rm -f "$installer"
-
-# รอให้ x-ui service ขึ้น
-info "รอ x-ui service..."
 for i in $(seq 1 30); do
   systemctl is-active x-ui &>/dev/null && break
   sleep 2
 done
-systemctl is-active x-ui &>/dev/null && ok "x-ui active" || warn "x-ui อาจยังไม่ active — ตรวจ: systemctl status x-ui"
+systemctl is-active x-ui &>/dev/null \
+  && ok "x-ui active" \
+  || warn "x-ui อาจยังไม่ active — ตรวจ: systemctl status x-ui"
 
 ok "═══ STEP 2 เสร็จสมบูรณ์ ═══"
 
