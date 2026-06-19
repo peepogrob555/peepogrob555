@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 # ═══════════════════════════════════════════════════════════════════
-#  VLESS REALITY SETUP — 4 STEPS — Ubuntu 22.04 LTS
-#  สร้างโดย: Claude | เป้าหมาย: ความปลอดภัยสูงสุด + รองรับเน็ตแรง (500Mbps@100ms)
-#  SNI: speedtest.net | Fingerprint: firefox | DNS: Cloudflare (1.1.1.1 DoT)
-#  เน้นใช้งานเกม/สตรีมหนัง/ดาวน์โหลด-อัพโหลดหนักได้จริง ไม่ใช่แค่ทฤษฎี
-#  รันเสร็จ → reboot 1 ครั้ง → ใช้งานได้เลย
-#
-#  [PATCH] เพิ่ม DNS preflight check + auto-fix ก่อนเริ่ม step ใดๆ
-#  [PATCH] เพิ่มฟังก์ชัน dl_retry สำหรับ curl/download ที่ retry อัตโนมัติ
-#  [PATCH] ใช้ dl_retry กับการโหลด 3x-ui installer และการเช็ค public IP
+#  VLESS REALITY SETUP — REORDERED — Ubuntu 22.04 LTS
+#  ลำดับใหม่:
+#   STEP 0  DNS fix ถาวร (ก่อนทำอะไรทั้งหมด)
+#   STEP 1  apt update/upgrade + dependencies (ไม่แตะ firewall/DNS/IPv6)
+#   STEP 2  Firewall ขั้นต่ำ: เปิดแค่ 22(limit) / 80 / 2053 — พอให้เข้า panel ได้
+#           (ไม่เปิด Cloudflare ports เพราะยังไม่มีโดเมน/cert)
+#   STEP 3  ติดตั้ง 3x-ui (เน็ตยังนิ่ง ยังไม่แตะ IPv6/DoT/NIC)
+#   STEP 4  Firewall เต็มรูปแบบ (Cloudflare ports + deny อันตราย) + Swap
+#   STEP 5  Optimize: Kernel/Network/TCP/NIC tuning
+#   STEP 6  Privacy & Security (IPv6 off, DoT, journald, SSH hardening ฯลฯ)
+#  เหตุผลของการย้าย: ของเดิมเปลี่ยน DNS เป็น DoT / ปิด IPv6 / ปรับ NIC
+#  ก่อนติดตั้ง 3x-ui ถ้าขั้นไหนทำเน็ตสะดุดจะดึง 3x-ui ไม่ติดตั้งไปด้วย
+#  ฉบับนี้ติดตั้ง panel ให้เสร็จและใช้งานได้ก่อน แล้วค่อยทำของที่เสี่ยงทีหลัง
 # ═══════════════════════════════════════════════════════════════════
 set -uo pipefail
 export LANG=C
 
-# ── สี ──────────────────────────────────────────────────────────────
 GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'
 CYN='\033[0;36m'; BLD='\033[1m'; DIM='\033[2m'; RST='\033[0m'
 
-# ── log ─────────────────────────────────────────────────────────────
 STATE_DIR="/var/lib/vless-setup"
 LOG_FILE="${STATE_DIR}/setup.log"
 mkdir -p "$STATE_DIR"
@@ -32,9 +34,6 @@ die()  { echo -e "\n${RED}${BLD}✘  $1${RST}\n"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root (sudo bash install.sh)"
 
-# ── [PATCH] ฟังก์ชัน download แบบ retry ──────────────────────────────
-# ลอง curl สูงสุด N ครั้ง, รอเพิ่มขึ้นทุกครั้ง (backoff), ใช้ -4 บังคับ IPv4
-# คืนค่า 0 = สำเร็จ, อื่นๆ = ล้มเหลว
 dl_retry() {
   local url="$1" out="${2:-}" tries=5 wait=2 i
   for ((i=1; i<=tries; i++)); do
@@ -50,54 +49,46 @@ dl_retry() {
   return 1
 }
 
-# ── [PATCH] DNS preflight: เช็ค + ซ่อม DNS resolution ก่อนเริ่มทุกอย่าง ──
-hdr "PRE-CHECK — ตรวจสอบ DNS resolution"
 _dns_ok() {
   getent hosts raw.githubusercontent.com &>/dev/null \
     || curl -4 -fsS --connect-timeout 5 --max-time 8 -o /dev/null https://raw.githubusercontent.com 2>/dev/null
 }
 
+# ═══════════════════════════════════════════════════════════════════
+hdr "STEP 0 — DNS Fix (ถาวร ก่อนเริ่มทุกอย่าง)"
+# ═══════════════════════════════════════════════════════════════════
+# ตั้ง resolved ให้ใช้ public DNS แบบ plain (ยังไม่ DoT) ผ่าน drop-in
+# ถาวรตั้งแต่ต้น แทนการแก้ /etc/resolv.conf มือซึ่งโดน resolved เขียนทับ
+mkdir -p /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/00-bootstrap-dns.conf << 'EOF'
+[Resolve]
+DNS=1.1.1.1 8.8.8.8
+FallbackDNS=1.0.0.1 8.8.4.4
+DNSOverTLS=no
+Cache=yes
+EOF
+systemctl enable --now systemd-resolved 2>/dev/null || true
+systemctl restart systemd-resolved
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+sleep 1
+
+waited=0
+until _dns_ok || [ "$waited" -ge 20 ]; do
+  info "DNS ยังไม่นิ่ง รอ... (${waited}s/20s)"
+  sleep 2; waited=$((waited+2))
+done
+
 if _dns_ok; then
-  ok "DNS resolution ใช้งานได้ปกติ"
+  ok "DNS ใช้งานได้ (1.1.1.1 / 8.8.8.8 แบบ plain — DoT จะเปิดทีหลังใน STEP 6)"
 else
-  warn "DNS resolution ใช้งานไม่ได้ — กำลังพยายามซ่อม..."
-
-  # 1) restart systemd-resolved เผื่อมันค้าง
-  if systemctl is-active systemd-resolved &>/dev/null; then
-    info "ลอง restart systemd-resolved..."
-    systemctl restart systemd-resolved 2>/dev/null || true
-    sleep 2
+  if ping -c1 -W3 1.1.1.1 &>/dev/null; then
+    warn "ping IP ได้ปกติ แต่ resolve โดเมนไม่ได้ — อาจเป็นปัญหา DNS server ฝั่ง provider"
+  else
+    warn "ping IP ก็ไม่ได้ — เครื่องอาจไม่มี outbound network เลย"
   fi
-  _dns_ok && ok "ซ่อมสำเร็จหลัง restart systemd-resolved" || true
-
-  # 2) ลองตั้ง resolv.conf ชี้ public DNS ตรงๆ ชั่วคราว (ไม่ symlink ทับถาวร)
-  if ! _dns_ok; then
-    info "ลอง fallback ไปใช้ public DNS (1.1.1.1 / 8.8.8.8) ชั่วคราว..."
-    if [ -L /etc/resolv.conf ] || [ -f /etc/resolv.conf ]; then
-      cp -L /etc/resolv.conf /etc/resolv.conf.bak.$(date +%s) 2>/dev/null || true
-    fi
-    rm -f /etc/resolv.conf
-    cat > /etc/resolv.conf << 'DNSFALLBACK'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-options timeout:2 attempts:2
-DNSFALLBACK
-    sleep 1
-    _dns_ok && ok "ซ่อมสำเร็จด้วย fallback DNS ตรงๆ (จะถูกตั้งใหม่เป็น DoT ใน step 4)" || true
-  fi
-
-  # 3) เช็คเน็ตทั่วไปว่าใช้งานได้ไหม (เผื่อปัญหาไม่ใช่ DNS แต่เป็น routing/firewall)
-  if ! _dns_ok; then
-    if ping -c1 -W3 1.1.1.1 &>/dev/null; then
-      warn "ping IP ได้ปกติ แต่ resolve โดเมนไม่ได้ — อาจเป็นปัญหา DNS server ฝั่ง provider"
-    else
-      warn "ping IP ก็ไม่ได้ — เครื่องอาจไม่มี outbound network เลย ตรวจสอบ network/routing ของ VPS ก่อน"
-    fi
-    die "DNS/Network ยังใช้งานไม่ได้หลังพยายามซ่อม — กรุณาตรวจสอบเครือข่ายของ VPS (เช่น ติดต่อ provider) แล้วรันสคริปต์ใหม่"
-  fi
+  die "DNS/Network ใช้งานไม่ได้แม้ตั้ง public DNS แล้ว — ตรวจสอบเครือข่ายของ VPS (ติดต่อ provider) แล้วรันสคริปต์ใหม่"
 fi
 
-# ── ตรวจ Ubuntu version (non-fatal — แค่เตือน) ───────────────────────
 OS_ID=""; OS_VER=""
 if [ -f /etc/os-release ]; then
   # shellcheck disable=SC1091
@@ -106,20 +97,16 @@ if [ -f /etc/os-release ]; then
 fi
 if [ "$OS_ID" != "ubuntu" ] || [ "$OS_VER" != "22.04" ]; then
   warn "สคริปต์นี้ปรับสำหรับ Ubuntu 22.04 — ตรวจพบระบบ: ${OS_ID:-unknown} ${OS_VER:-?}"
-  warn "ยังรันต่อได้ แต่บางคำสั่ง (GRUB path / เวอร์ชัน package) อาจต่างจากที่ทดสอบไว้"
 else
   ok "ตรวจพบ Ubuntu 22.04 ตรงตามที่สคริปต์ออกแบบไว้"
 fi
 
-# ── ตั้งค่าหลัก ──────────────────────────────────────────────────────
 PANEL_PORT=2053
 TLS_FINGERPRINT="firefox"
 TLS_SNI="speedtest.net"
 SWAP_SIZE_MB=4096
 
-_detect_nic() {
-  ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}'
-}
+_detect_nic() { ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}'; }
 NIC=$(_detect_nic)
 [ -z "$NIC" ] && NIC=$(ip link show | awk -F': ' '/^[0-9]+: / && !/lo:/ {print $2}' | head -1 | cut -d@ -f1)
 [ -z "$NIC" ] && NIC="eth0"
@@ -130,9 +117,9 @@ PUB_IP=$(dl_retry https://ifconfig.me - 2>/dev/null || dl_retry https://api.ipif
 
 echo ""
 echo -e "${BLD}${CYN}╔══════════════════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}${CYN}║  VLESS REALITY SETUP — 4 STEPS (Ubuntu 22.04)            ║${RST}"
+echo -e "${BLD}${CYN}║  VLESS REALITY SETUP — REORDERED (Ubuntu 22.04)          ║${RST}"
 echo -e "${BLD}${CYN}║  SNI: speedtest.net | Fingerprint: firefox               ║${RST}"
-echo -e "${BLD}${CYN}║  Port 443 (VLESS) | Panel: ${PANEL_PORT} | IPv6: OFF          ║${RST}"
+echo -e "${BLD}${CYN}║  Port 443 (VLESS) | Panel: ${PANEL_PORT}                          ║${RST}"
 echo -e "${BLD}${CYN}╚══════════════════════════════════════════════════════════╝${RST}"
 echo ""
 info "Server IP : ${PUB_IP}"
@@ -141,10 +128,8 @@ info "RAM       : ${RAM_MB}MB  vCPU: ${VCPU}"
 echo ""
 
 # ═══════════════════════════════════════════════════════════════════
-hdr "STEP 1 — อัปเดตระบบ + ติดตั้งแพ็กเกจ + ตั้ง Firewall"
+hdr "STEP 1 — อัปเดตระบบ + ติดตั้งแพ็กเกจ"
 # ═══════════════════════════════════════════════════════════════════
-
-# ── 1.1 รอ lock apt ─────────────────────────────────────────────────
 info "1.1 หยุด unattended-upgrades + รอ apt lock..."
 systemctl stop    unattended-upgrades 2>/dev/null || true
 systemctl disable unattended-upgrades 2>/dev/null || true
@@ -163,13 +148,11 @@ done
 dpkg --configure -a
 ok "apt พร้อมแล้ว"
 
-# ── 1.2 Update + Upgrade ────────────────────────────────────────────
 info "1.2 apt update + upgrade..."
 apt-get update -y
 DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
 ok "update + upgrade เสร็จ"
 
-# ── 1.3 ติดตั้งแพ็กเกจที่จำเป็น ─────────────────────────────────────
 info "1.3 ติดตั้ง dependencies..."
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   curl ufw nftables iptables sqlite3 ethtool iproute2 \
@@ -184,20 +167,48 @@ if apt-cache show "${EXTRA_MOD_PKG}" &>/dev/null; then
     && ok "ติดตั้ง ${EXTRA_MOD_PKG} เสร็จ (รองรับ sch_cake)" \
     || warn "ติดตั้ง ${EXTRA_MOD_PKG} ล้มเหลว (non-fatal)"
 else
-  warn "ไม่พบแพ็กเกจ ${EXTRA_MOD_PKG} — จะตรวจจริงใน step 3.1"
+  warn "ไม่พบแพ็กเกจ ${EXTRA_MOD_PKG} — จะตรวจจริงใน step optimize"
 fi
+ok "═══ STEP 1 เสร็จสมบูรณ์ ═══"
 
-# ── 1.4 Firewall (UFW) ──────────────────────────────────────────────
-info "1.4 ตั้ง UFW Firewall..."
+# ═══════════════════════════════════════════════════════════════════
+hdr "STEP 2 — Firewall ขั้นต่ำ (เปิดแค่ 22 / 80 / ${PANEL_PORT} ก่อน — ยังไม่มีโดเมน/cert)"
+# ═══════════════════════════════════════════════════════════════════
+# เปิดเฉพาะพอร์ตที่จำเป็นต่อการเข้าถึง panel ตอนนี้: SSH + HTTP (ACME ในอนาคต) + panel
+# ยังไม่เปิด Cloudflare ports / 443 เพราะยังไม่ได้ตั้งโดเมน/cert จริง
+# พอร์ตเต็มรูปแบบ (Cloudflare + deny อันตราย) จะมาเปิดใน STEP 4 หลังติดตั้ง 3x-ui เสร็จ
 ufw --force reset
 ufw default deny incoming
 ufw default allow outgoing
 ufw default deny forward
 
-ufw limit   22/tcp      comment "SSH"
-ufw allow   80/tcp      comment "HTTP (bughost redirect / ACME)"
-ufw allow   443/tcp     comment "VLESS REALITY (หลัก)"
-ufw allow   ${PANEL_PORT}/tcp comment "3x-ui panel"
+ufw limit 22/tcp           comment "SSH"
+ufw allow 80/tcp            comment "HTTP (bughost redirect / ACME)"
+ufw allow ${PANEL_PORT}/tcp comment "3x-ui panel"
+
+ufw --force enable
+ufw status verbose
+ok "Firewall ขั้นต่ำเปิดแล้ว — TCP allow เฉพาะ: 22 (limit) / 80 / ${PANEL_PORT}"
+ok "═══ STEP 2 เสร็จสมบูรณ์ ═══"
+
+# ═══════════════════════════════════════════════════════════════════
+hdr "STEP 3 — ติดตั้ง 3x-ui"
+# ═══════════════════════════════════════════════════════════════════
+_3xui_installer=$(mktemp /tmp/3xui-XXXXXX.sh)
+if ! dl_retry https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh "$_3xui_installer"; then
+  die "ดาวน์โหลด 3x-ui installer ไม่ได้ (ลองแล้วหลายครั้ง) — ตรวจสอบเครือข่าย/DNS ของ VPS แล้วรันสคริปต์ใหม่อีกครั้ง"
+fi
+[ -s "$_3xui_installer" ] || die "ดาวน์โหลด 3x-ui installer ได้ไฟล์ว่างเปล่า — ลองรันสคริปต์ใหม่อีกครั้ง"
+chmod +x "$_3xui_installer"
+bash "$_3xui_installer" < /dev/tty
+rm -f "$_3xui_installer"
+ok "═══ STEP 3 เสร็จสมบูรณ์ — panel ควรเข้าถึงได้แล้วที่ port ${PANEL_PORT} ═══"
+
+# ═══════════════════════════════════════════════════════════════════
+hdr "STEP 4 — Firewall เต็มรูปแบบ + Swap"
+# ═══════════════════════════════════════════════════════════════════
+info "4.1 เปิดพอร์ตเพิ่ม (443 + Cloudflare) และตั้ง deny พอร์ตอันตราย..."
+ufw allow 443/tcp     comment "VLESS REALITY (หลัก)"
 
 ufw allow 2052/tcp comment "Cloudflare HTTP"
 ufw allow 2082/tcp comment "Cloudflare HTTP"
@@ -228,8 +239,6 @@ ufw deny 5900/tcp  comment "VNC"
 ufw deny 6379/tcp  comment "Redis"
 ufw deny 8291/tcp  comment "Mikrotik Winbox"
 ufw deny 11211/tcp comment "Memcached"
-
-ufw default deny incoming
 
 cat > /etc/nftables-udp-inbound.conf << 'UDPINEOF'
 #!/usr/sbin/nft -f
@@ -264,13 +273,10 @@ systemctl daemon-reload
 systemctl enable --now udp-inbound-nft.service
 
 sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
-
-ufw --force enable
 ufw status verbose
-ok "UFW Firewall เปิดแล้ว — TCP allow: 22/80/443/${PANEL_PORT} + Cloudflare ports | UDP inbound ใหม่: drop | outbound: ปกติ"
+ok "Firewall เต็มรูปแบบเปิดแล้ว — TCP allow: 22/80/443/${PANEL_PORT} + Cloudflare ports | UDP inbound ใหม่: drop"
 
-# ── 1.5 Swap ────────────────────────────────────────────────────────
-info "1.5 สร้าง Swap ${SWAP_SIZE_MB}MB..."
+info "4.2 สร้าง Swap ${SWAP_SIZE_MB}MB..."
 AVAIL_DISK_MB=$(df -m --output=avail / 2>/dev/null | tail -1 | tr -d ' ')
 if [ -n "${AVAIL_DISK_MB:-}" ] && [ "$AVAIL_DISK_MB" -lt $((SWAP_SIZE_MB + 1024)) ]; then
   warn "เหลือพื้นที่ดิสก์ ${AVAIL_DISK_MB}MB — น้อยกว่า swap ${SWAP_SIZE_MB}MB + เผื่อ 1GB"
@@ -288,33 +294,12 @@ else
 fi
 swapon --show
 ok "Swap พร้อม"
-
-ok "═══ STEP 1 เสร็จสมบูรณ์ ═══"
-
-# ═══════════════════════════════════════════════════════════════════
-hdr "STEP 2 — ติดตั้ง 3x-ui"
-# ═══════════════════════════════════════════════════════════════════
-# [PATCH] ใช้ dl_retry แทน curl ตรงๆ เพื่อกัน DNS/network กระตุกชั่วคราว
-# download ไฟล์ลงดิสก์ก่อน แล้วรันด้วย stdin=/dev/tty
-# เพื่อให้ interactive prompt (username/password/port) ทำงานได้จริง
-# แม้จะรันสคริปต์นี้ด้วย bash <(curl ...) ก็ตาม
-_3xui_installer=$(mktemp /tmp/3xui-XXXXXX.sh)
-if ! dl_retry https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh "$_3xui_installer"; then
-  die "ดาวน์โหลด 3x-ui installer ไม่ได้ (ลองแล้วหลายครั้ง) — ตรวจสอบเครือข่าย/DNS ของ VPS แล้วรันสคริปต์ใหม่อีกครั้ง"
-fi
-[ -s "$_3xui_installer" ] || die "ดาวน์โหลด 3x-ui installer ได้ไฟล์ว่างเปล่า — ลองรันสคริปต์ใหม่อีกครั้ง"
-chmod +x "$_3xui_installer"
-bash "$_3xui_installer" < /dev/tty
-rm -f "$_3xui_installer"
-
-ok "═══ STEP 2 เสร็จสมบูรณ์ ═══"
+ok "═══ STEP 4 เสร็จสมบูรณ์ ═══"
 
 # ═══════════════════════════════════════════════════════════════════
-hdr "STEP 3 — Optimize: Kernel / Network / TCP (ปิงต่ำ + throughput สูง)"
+hdr "STEP 5 — Optimize: Kernel / Network / TCP (ปิงต่ำ + throughput สูง)"
 # ═══════════════════════════════════════════════════════════════════
-
-# ── 3.1 BBR + CAKE Tune ─────────────────────────────────────────────
-info "3.1 โหลด BBR + CAKE + ตั้งค่า TCP/network..."
+info "5.1 โหลด BBR + CAKE + ตั้งค่า TCP/network..."
 modprobe tcp_bbr     2>/dev/null || true
 modprobe nf_conntrack 2>/dev/null || true
 
@@ -344,11 +329,9 @@ RMEM_MIN=2097152
 WMEM_MIN=2097152
 
 cat > /etc/sysctl.d/99-vless-perf.conf << EOF
-# ── BBR + CAKE ────────────────────────────────────────────────────
 net.ipv4.tcp_congestion_control        = ${CC}
 net.core.default_qdisc                 = ${QDISC}
 
-# ── Buffer (floor 2MB / default 4MB / ceiling 8MB — BDP 500Mbps@100ms) ──
 net.core.rmem_max                      = ${RMEM_MAX}
 net.core.wmem_max                      = ${WMEM_MAX}
 net.core.rmem_default                  = ${RMEM_DEF}
@@ -360,12 +343,10 @@ net.ipv4.tcp_moderate_rcvbuf           = 1
 net.ipv4.tcp_adv_win_scale             = 1
 net.ipv4.tcp_notsent_lowat             = 131072
 
-# ── Loss recovery ─────────────────────────────────────────────────
 net.ipv4.tcp_reordering                = 6
 net.ipv4.tcp_frto                      = 2
 net.ipv4.tcp_recovery                  = 1
 
-# ── TCP Fast ──────────────────────────────────────────────────────
 net.ipv4.tcp_fastopen                  = 3
 net.ipv4.tcp_window_scaling            = 1
 net.ipv4.tcp_timestamps                = 1
@@ -380,7 +361,6 @@ net.ipv4.tcp_thin_linear_timeouts      = 1
 net.ipv4.tcp_early_retrans             = 3
 net.ipv4.tcp_no_metrics_save           = 1
 
-# ── Keepalive / Timeout ───────────────────────────────────────────
 net.ipv4.tcp_keepalive_time            = 35
 net.ipv4.tcp_keepalive_intvl           = 5
 net.ipv4.tcp_keepalive_probes          = 5
@@ -391,7 +371,6 @@ net.ipv4.tcp_retries2                  = 8
 net.ipv4.tcp_orphan_retries            = 2
 net.ipv4.tcp_max_orphans               = 32768
 
-# ── Queue / Backlog ───────────────────────────────────────────────
 net.core.somaxconn                     = 32768
 net.ipv4.tcp_max_syn_backlog           = 32768
 net.core.netdev_max_backlog            = 32768
@@ -399,26 +378,21 @@ net.core.netdev_budget                 = 600
 net.core.netdev_budget_usecs           = 4000
 net.ipv4.ip_local_port_range           = 1024 65535
 
-# ── Busy poll ─────────────────────────────────────────────────────
 net.core.busy_poll                     = 50
 net.core.busy_read                     = 50
 
-# ── TIME_WAIT ─────────────────────────────────────────────────────
 net.ipv4.tcp_tw_reuse                  = 1
 net.ipv4.tcp_max_tw_buckets            = 1440000
 
-# ── Forward ───────────────────────────────────────────────────────
 net.ipv4.ip_forward                    = 1
 net.ipv4.conf.all.forwarding           = 1
 net.ipv4.conf.default.forwarding       = 1
 net.ipv6.conf.all.forwarding           = 0
 
-# ── SYN Protect ──────────────────────────────────────────────────
 net.ipv4.tcp_syncookies                = 1
 net.ipv4.tcp_rfc1337                   = 1
 net.ipv4.tcp_challenge_ack_limit       = 1000
 
-# ── VM / Swap ─────────────────────────────────────────────────────
 vm.swappiness                          = 10
 vm.dirty_ratio                         = 10
 vm.dirty_background_ratio              = 3
@@ -428,7 +402,6 @@ vm.min_free_kbytes                     = 98304
 vm.vfs_cache_pressure                  = 50
 vm.overcommit_memory                   = 1
 
-# ── File descriptors ──────────────────────────────────────────────
 fs.file-max                            = 1048576
 fs.nr_open                             = 1048576
 EOF
@@ -436,8 +409,7 @@ EOF
 sysctl -p /etc/sysctl.d/99-vless-perf.conf
 ok "TCP/network tune เสร็จ (qdisc=${QDISC}, cc=${CC})"
 
-# ── 3.2 Conntrack ───────────────────────────────────────────────────
-info "3.2 ตั้ง nf_conntrack..."
+info "5.2 ตั้ง nf_conntrack..."
 echo 262144 > /proc/sys/net/netfilter/nf_conntrack_max                     2>/dev/null || true
 echo 600    > /proc/sys/net/netfilter/nf_conntrack_tcp_timeout_established 2>/dev/null || true
 echo 1      > /proc/sys/net/netfilter/nf_conntrack_tcp_be_liberal          2>/dev/null || true
@@ -448,8 +420,7 @@ net.netfilter.nf_conntrack_tcp_be_liberal          = 1
 EOF2
 ok "conntrack tune เสร็จ (262144 entries ~80MB)"
 
-# ── 3.2b NIC Tune ───────────────────────────────────────────────────
-info "3.2b Tune NIC: ${NIC}..."
+info "5.3 Tune NIC: ${NIC}... (ทำตอนนี้ — หลัง 3x-ui ติดตั้งเสร็จแล้ว ปลอดภัยกว่าทำระหว่างดาวน์โหลด)"
 ethtool -K "${NIC}" gro on gso on tso on 2>/dev/null || true
 
 RX_MAX=$(ethtool -g "${NIC}" 2>/dev/null \
@@ -488,8 +459,7 @@ systemctl daemon-reload
 systemctl enable --now nic-tune.service
 ok "NIC tune เสร็จ (GRO/GSO/TSO on, ring buffer max, qdisc ${QDISC})"
 
-# ── 3.3 Transparent Huge Pages OFF ──────────────────────────────────
-info "3.3 ปิด THP..."
+info "5.4 ปิด THP..."
 echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
 echo never > /sys/kernel/mm/transparent_hugepage/defrag   2>/dev/null || true
 cat > /etc/systemd/system/thp-disable.service << 'THPEOF'
@@ -510,8 +480,7 @@ systemctl daemon-reload
 systemctl enable --now thp-disable.service
 ok "THP ปิดแล้ว"
 
-# ── 3.4 System Limits ───────────────────────────────────────────────
-info "3.4 ตั้ง system limits..."
+info "5.5 ตั้ง system limits..."
 cat > /etc/security/limits.d/99-vless.conf << 'LIMEOF'
 *    soft nofile   2097152
 *    hard nofile   2097152
@@ -529,8 +498,7 @@ for pam in /etc/pam.d/common-session /etc/pam.d/common-session-noninteractive; d
 done
 ok "limits เสร็จ"
 
-# ── 3.5 x-ui systemd override ───────────────────────────────────────
-info "3.5 x-ui systemd override..."
+info "5.6 x-ui systemd override..."
 xui_bin=$(command -v x-ui 2>/dev/null || echo "/usr/local/x-ui/x-ui")
 if [ -x "$xui_bin" ]; then
   ram_avail=$(free -m | awk '/^Mem:/ {print $7}')
@@ -558,8 +526,7 @@ else
   warn "ไม่เจอ x-ui binary — ข้ามขั้นตอนนี้"
 fi
 
-# ── 3.6 SQLite WAL ──────────────────────────────────────────────────
-info "3.6 SQLite WAL optimize..."
+info "5.7 SQLite WAL optimize..."
 DB="/etc/x-ui/x-ui.db"
 if [ -f "$DB" ]; then
   sqlite3 "$DB" "PRAGMA journal_mode=WAL;"    2>/dev/null || true
@@ -594,19 +561,15 @@ else
   warn "ไม่เจอ x-ui.db — SQLite จะ optimize หลัง reboot เมื่อสร้าง inbound แล้ว"
 fi
 
-# ── 3.7 irqbalance ──────────────────────────────────────────────────
-info "3.7 irqbalance..."
+info "5.8 irqbalance..."
 systemctl enable --now irqbalance 2>/dev/null || true
 ok "irqbalance เสร็จ"
-
-ok "═══ STEP 3 เสร็จสมบูรณ์ ═══"
+ok "═══ STEP 5 เสร็จสมบูรณ์ ═══"
 
 # ═══════════════════════════════════════════════════════════════════
-hdr "STEP 4 — Privacy & Security (ไม่เก็บ log / ไม่ leak IP / ลบตัวตน)"
+hdr "STEP 6 — Privacy & Security (ไม่เก็บ log / ไม่ leak IP / ลบตัวตน)"
 # ═══════════════════════════════════════════════════════════════════
-
-# ── 4.1 ปิด IPv6 ────────────────────────────────────────────────────
-info "4.1 ปิด IPv6 ทั้งระบบ..."
+info "6.1 ปิด IPv6 ทั้งระบบ..."
 cat > /etc/sysctl.d/99-disable-ipv6.conf << 'V6EOF'
 net.ipv6.conf.all.disable_ipv6     = 1
 net.ipv6.conf.default.disable_ipv6 = 1
@@ -635,9 +598,9 @@ if [ -f /etc/default/grub ]; then
 fi
 ok "IPv6 ปิดแล้ว: sysctl + ip6tables + grub"
 
-# ── 4.2 DNS over TLS ────────────────────────────────────────────────
-info "4.2 DNS over TLS (Cloudflare 1.1.1.1) ..."
+info "6.2 DNS over TLS (Cloudflare 1.1.1.1)..."
 mkdir -p /etc/systemd/resolved.conf.d
+rm -f /etc/systemd/resolved.conf.d/00-bootstrap-dns.conf
 cat > /etc/systemd/resolved.conf.d/99-dot.conf << 'DOTEOF'
 [Resolve]
 DNS=1.1.1.1#cloudflare-dns.com
@@ -651,7 +614,6 @@ Domains=~.
 MulticastDNS=no
 LLMNR=no
 DOTEOF
-systemctl enable --now systemd-resolved 2>/dev/null || true
 systemctl restart systemd-resolved
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
 
@@ -686,8 +648,7 @@ systemctl daemon-reload
 systemctl enable --now dns-privacy-nft.service
 ok "DNS over TLS เสร็จ | plain DNS port 53 ถูก block"
 
-# ── [PATCH] ตรวจ DNS resolution ใหม่อีกครั้งหลังเปลี่ยนเป็น DoT ──────
-info "4.2c ตรวจสอบ DNS resolution หลังเปลี่ยนเป็น DoT..."
+info "6.2c ตรวจสอบ DNS resolution หลังเปลี่ยนเป็น DoT..."
 sleep 2
 if _dns_ok; then
   ok "DNS over TLS resolve โดเมนได้ปกติ"
@@ -699,8 +660,7 @@ else
   warn "ปิด DNS-block ไปแล้ว — แนะนำเช็ค resolvectl status ด้วยตัวเองหลัง reboot แล้วเปิดใหม่: systemctl enable --now dns-privacy-nft.service"
 fi
 
-# ── 4.2b Patch Xray internal DNS ────────────────────────────────────
-info "4.2b Patch Xray internal DNS → บังคับผ่าน local DoT stub..."
+info "6.2b Patch Xray internal DNS → บังคับผ่าน local DoT stub..."
 DB="/etc/x-ui/x-ui.db"
 if [ -f "$DB" ] && command -v sqlite3 &>/dev/null && command -v python3 &>/dev/null; then
   template=$(sqlite3 "$DB" "SELECT value FROM settings WHERE key='xrayTemplateConfig';" 2>/dev/null || true)
@@ -726,8 +686,7 @@ else
   warn "ไม่เจอ x-ui.db — จะ patch Xray DNS หลัง reboot + สร้าง inbound"
 fi
 
-# ── 4.3 Kernel Security Hardening ──────────────────────────────────
-info "4.3 Kernel security hardening..."
+info "6.3 Kernel security hardening..."
 cat > /etc/sysctl.d/99-security.conf << 'SECEOF'
 kernel.kptr_restrict                       = 2
 kernel.dmesg_restrict                      = 1
@@ -753,8 +712,7 @@ SECEOF
 sysctl -p /etc/sysctl.d/99-security.conf
 ok "kernel hardening เสร็จ"
 
-# ── 4.4 Xray: ปิด log ───────────────────────────────────────────────
-info "4.4 ปิด xray log..."
+info "6.4 ปิด xray log..."
 DB="/etc/x-ui/x-ui.db"
 if [ -f "$DB" ] && command -v sqlite3 &>/dev/null && command -v python3 &>/dev/null; then
   template=$(sqlite3 "$DB" "SELECT value FROM settings WHERE key='xrayTemplateConfig';" 2>/dev/null || true)
@@ -777,8 +735,7 @@ else
   warn "ไม่เจอ x-ui.db — จะ patch log หลัง reboot + สร้าง inbound"
 fi
 
-# ── 4.5 Patch sockopt + Firefox fingerprint + SNI ───────────────────
-info "4.5 Patch fingerprint=firefox + SNI=speedtest.net บน VLESS port 443..."
+info "6.5 Patch fingerprint=firefox + SNI=speedtest.net บน VLESS port 443..."
 DB="/etc/x-ui/x-ui.db"
 SOCKOPT='{"acceptProxyProtocol":false,"tcpFastOpen":true,"mark":0,"tproxy":"off","tcpcongestion":"bbr","tcpNoDelay":true,"tcpKeepAliveInterval":35,"tcpKeepAliveIdle":35,"tcpUserTimeout":30000,"V6Only":false,"domainStrategy":"AsIs"}'
 if [ -f "$DB" ] && command -v sqlite3 &>/dev/null && command -v python3 &>/dev/null; then
@@ -808,8 +765,7 @@ print(json.dumps(d, separators=(',',':')))
   fi
 fi
 
-# ── 4.6 Journald: RAM only ───────────────────────────────────────────
-info "4.6 journald → RAM only (volatile)..."
+info "6.6 journald → RAM only (volatile)..."
 mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/99-volatile.conf << 'JEOF'
 [Journal]
@@ -828,16 +784,14 @@ find /var/log/journal -type f -name "*.journal" -delete 2>/dev/null || true
 systemctl restart systemd-journald
 ok "journald: RAM เท่านั้น ไม่เขียน disk"
 
-# ── 4.7 /tmp → tmpfs ────────────────────────────────────────────────
-info "4.7 /tmp → tmpfs (RAM)..."
+info "6.7 /tmp → tmpfs (RAM)..."
 if ! grep -q "tmpfs /tmp" /etc/fstab 2>/dev/null; then
   echo "tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,size=256m 0 0" >> /etc/fstab
 fi
 mount -o remount /tmp 2>/dev/null || true
 ok "/tmp → tmpfs 256MB"
 
-# ── 4.8 SSH Hardening ───────────────────────────────────────────────
-info "4.8 SSH hardening..."
+info "6.8 SSH hardening..."
 mkdir -p /etc/ssh/sshd_config.d
 cat > /etc/ssh/sshd_config.d/99-hardened.conf << 'SSHEOF'
 Protocol 2
@@ -860,7 +814,6 @@ Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512
 SSHEOF
-# ── [PATCH] เช็ค authorized_keys ก่อนล็อก password auth ──────────────
 _has_authorized_key=0
 for keyfile in /root/.ssh/authorized_keys $(find /home -maxdepth 3 -path '*/.ssh/authorized_keys' 2>/dev/null); do
   [ -s "$keyfile" ] && _has_authorized_key=1 && break
@@ -894,8 +847,7 @@ else
   warn "sshd config test failed — ไม่ reload"
 fi
 
-# ── 4.9 Fail2ban ────────────────────────────────────────────────────
-info "4.9 fail2ban..."
+info "6.9 fail2ban..."
 mkdir -p /etc/fail2ban/jail.d
 cat > /etc/fail2ban/jail.d/99-vless.conf << FBEOF
 [DEFAULT]
@@ -916,8 +868,7 @@ systemctl enable --now fail2ban
 systemctl restart fail2ban
 ok "fail2ban: SSH ban 24h/3 tries"
 
-# ── 4.10 Auto security updates ──────────────────────────────────────
-info "4.10 auto security updates..."
+info "6.10 auto security updates..."
 cat > /etc/apt/apt.conf.d/50unattended-upgrades-security << 'AUTEOF'
 Unattended-Upgrade::Allowed-Origins {
   "${distro_id}:${distro_codename}-security";
@@ -934,8 +885,7 @@ AUTEOF2
 systemctl enable --now unattended-upgrades
 ok "auto security updates เสร็จ"
 
-# ── 4.11 DB Backup (daily, เก็บ 7 วัน) ─────────────────────────────
-info "4.11 DB backup..."
+info "6.11 DB backup (daily, เก็บ 7 วัน)..."
 BACKUP_DIR="/var/lib/vless-setup/backups"
 mkdir -p "$BACKUP_DIR"
 chmod 700 "$BACKUP_DIR"
@@ -974,8 +924,7 @@ systemctl enable --now xui-backup.timer
 /usr/local/bin/xui-backup.sh 2>/dev/null || true
 ok "DB backup: ${BACKUP_DIR} (เก็บ 7 วัน)"
 
-# ── 4.12 Persist ip6tables ──────────────────────────────────────────
-info "4.12 persist ip6tables rules on reboot..."
+info "6.12 persist ip6tables rules on reboot..."
 cat > /etc/systemd/system/ip6tables-restore.service << 'IP6EOF'
 [Unit]
 Description=Restore ip6tables rules
@@ -990,8 +939,7 @@ IP6EOF
 systemctl daemon-reload
 systemctl enable ip6tables-restore.service
 ok "ip6tables persist เสร็จ"
-
-ok "═══ STEP 4 เสร็จสมบูรณ์ ═══"
+ok "═══ STEP 6 เสร็จสมบูรณ์ ═══"
 
 # ═══════════════════════════════════════════════════════════════════
 hdr "ติดตั้งคำสั่ง vless-verify"
