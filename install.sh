@@ -190,8 +190,8 @@ net.ipv4.tcp_fin_timeout = 10
 vm.swappiness = 10
 vm.vfs_cache_pressure = 50
 
-fs.file-max = 131072
-fs.nr_open  = 131072
+fs.file-max = 2097152
+fs.nr_open  = 1048576
 EOF
 sysctl -p /etc/sysctl.d/99-reality-perf.conf
 ok "BBR(${CC}) + qdisc ${QDISC} + buffer ${BUF_MB}MB + backlog 8192 (ปรับสเกลสำหรับ RAM 2GB)"
@@ -251,7 +251,7 @@ fi
 mount -o remount /tmp 2>/dev/null || mount /tmp 2>/dev/null || true
 ok "/tmp → tmpfs 512MB (RAM)"
 
-hdr "STEP 5 — DNS + IP Leak Protection (8.8.8.8 DoT, ปิด IPv6)"
+hdr "STEP 5 — DNS + IP Leak Protection (1.1.1.1 DoT, ปิด IPv6)"
 
 cat > /etc/sysctl.d/99-disable-ipv6.conf << 'EOF'
 net.ipv6.conf.all.disable_ipv6 = 1
@@ -272,8 +272,8 @@ ok "ปิด IPv6 สมบูรณ์ (sysctl + grub)"
 mkdir -p /etc/systemd/resolved.conf.d
 cat > /etc/systemd/resolved.conf.d/99-dot.conf << 'EOF'
 [Resolve]
-DNS=8.8.8.8#dns.google
-FallbackDNS=8.8.4.4#dns.google
+DNS=1.1.1.1#cloudflare-dns.com
+FallbackDNS=1.0.0.1#cloudflare-dns.com
 DNSOverTLS=yes
 DNSSEC=no
 Cache=yes
@@ -285,9 +285,9 @@ EOF
 systemctl enable --now systemd-resolved 2>/dev/null || true
 systemctl restart systemd-resolved
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
-ok "DNS → 8.8.8.8 ผ่าน DoT + Domains=~. กัน leak จาก DHCP"
+ok "DNS → 1.1.1.1 ผ่าน DoT + Domains=~. กัน leak จาก DHCP"
 
-# ปิด DNS ที่ DHCP ดึงมาเอง (per-link) ไม่งั้นจะมี DNS server แถมเข้ามา (เช่น 8.8.8.8) ทับ global DNS
+# ปิด DNS ที่ DHCP ดึงมาเอง (per-link) ไม่งั้นจะมี DNS server แถมเข้ามา (เช่น 8.8.8.8) ทับ global DNS (1.1.1.1)
 NETPLAN_CHANGED=0
 for f in /etc/netplan/*.yaml; do
   [ -f "$f" ] || continue
@@ -313,7 +313,7 @@ PYEOF
 done
 if [ "$NETPLAN_CHANGED" -eq 1 ]; then
   netplan apply 2>/dev/null || true
-  ok "ปิด DNS จาก DHCP (per-link) แล้ว — กัน 8.8.8.8 หรือ DNS ของ provider แอบเข้ามาทับ"
+  ok "ปิด DNS จาก DHCP (per-link) แล้ว — กัน DNS ของ provider แอบเข้ามาทับ global (1.1.1.1)"
 else
   info "ไม่พบ netplan config ที่ต้องแก้ หรือปิด use-dns ไว้แล้ว"
 fi
@@ -355,6 +355,7 @@ warn "  Sniffing → ปิดทั้งหมด | Log → access=none, logle
 echo ""
 
 hdr "VERIFY"
+sleep 2
 errors=0
 chk() {
   local label="$1"; local cond="$2"
@@ -364,16 +365,16 @@ chk() {
 chk "BBR/${CC} congestion control"        "[ \"\$(sysctl -n net.ipv4.tcp_congestion_control)\" = '${CC}' ]"
 chk "Buffer ceiling = ${BUF_BYTES}"       "[ \"\$(sysctl -n net.core.rmem_max)\" = '${BUF_BYTES}' ]"
 chk "IPv6 ปิดสมบูรณ์"                      "[ \"\$(sysctl -n net.ipv6.conf.all.disable_ipv6)\" = '1' ]"
-chk "DNS ชี้ไป 8.8.8.8"                    "resolvectl status 2>/dev/null | grep -q '8.8.8.8'"
+chk "DNS ชี้ไป 1.1.1.1"                    "resolvectl status 2>/dev/null | grep -q '1.1.1.1'"
 chk "Port ${HTTP_PORT}/tcp เปิดใน UFW"     "ufw status | grep -qE '^${HTTP_PORT}/tcp'"
 chk "Port ${REALITY_PORT}/tcp เปิดใน UFW"  "ufw status | grep -qE '^${REALITY_PORT}/tcp'"
 chk "Port ${PANEL_PORT}/tcp เปิดใน UFW"    "ufw status | grep -qE '^${PANEL_PORT}/tcp'"
 chk "journald = volatile (RAM)"            "grep -q 'Storage=volatile' /etc/systemd/journald.conf.d/99-volatile.conf"
 chk "/tmp = tmpfs (RAM)"                   "grep -q 'tmpfs /tmp' /etc/fstab"
 
-info "ทดสอบ DNS leak: ลอง TCP:53 ตรงไป 8.8.8.8 (ควรถูกบล็อก)..."
-if timeout 3 bash -c 'exec 3<>/dev/tcp/8.8.8.8/53' 2>/dev/null; then
-  warn "เชื่อมต่อ TCP:53 ไป 8.8.8.8 ได้ — DNS block ไม่ทำงานจริง!"
+info "ทดสอบ DNS leak: ลอง TCP:53 ตรงไป 1.1.1.1 (ควรถูกบล็อก เพราะต้องผ่าน DoT เท่านั้น)..."
+if timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' 2>/dev/null; then
+  warn "เชื่อมต่อ TCP:53 ไป 1.1.1.1 ได้ — DNS block ไม่ทำงานจริง!"
   errors=$((errors+1))
 else
   ok "Plaintext DNS (port 53) ถูกบล็อกแล้ว — ไม่มี DNS leak"
@@ -387,7 +388,7 @@ echo -e "  ═══════════════════════
 echo -e "  ${BLD}Server IP${RST}   : ${PUB_IP}"
 echo -e "  ${BLD}Panel URL${RST}   : http://${PUB_IP}:${PANEL_PORT}/"
 echo -e "  ${BLD}Firewall${RST}    : เปิด TCP ${SSH_PORT}/${HTTP_PORT}/${REALITY_PORT}/${PANEL_PORT} + Cloudflare ports (allow ล้วน) — ที่เหลือปิดด้วย default-deny (รวม UDP)"
-echo -e "  ${BLD}DNS${RST}         : 8.8.8.8 ผ่าน DoT — plaintext port 53 บล็อก"
+echo -e "  ${BLD}DNS${RST}         : 1.1.1.1 ผ่าน DoT — plaintext port 53 บล็อก"
 echo -e "  ${BLD}IPv6${RST}        : ปิดสมบูรณ์"
 echo -e "  ${BLD}RAM-backed${RST}  : journald (64MB) + /tmp (512MB tmpfs)"
 echo -e "  ${BLD}Performance${RST} : BBR(${CC}) + ${QDISC} + buffer ${BUF_MB}MB (BDP@${BW_MBPS}Mbps/${RTT_MS}ms) + THP off + swap 1GB"
