@@ -64,7 +64,7 @@ DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
 DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge
 apt-get autoclean -y
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  curl ufw nftables sqlite3 unattended-upgrades
+  curl ufw nftables sqlite3 unattended-upgrades python3-yaml
 ok "อัปเดตระบบ + แพ็กเกจพื้นฐานเสร็จ"
 
 hdr "STEP 1.5 — SSH: บังคับใช้ Key เท่านั้น (ปิด Password Authentication)"
@@ -282,6 +282,37 @@ systemctl enable --now systemd-resolved 2>/dev/null || true
 systemctl restart systemd-resolved
 ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
 ok "DNS → 1.1.1.1 ผ่าน DoT + Domains=~. กัน leak จาก DHCP"
+
+# ปิด DNS ที่ DHCP ดึงมาเอง (per-link) ไม่งั้นจะมี DNS server แถมเข้ามา (เช่น 8.8.8.8) ทับ global DNS
+NETPLAN_CHANGED=0
+for f in /etc/netplan/*.yaml; do
+  [ -f "$f" ] || continue
+  if ! grep -q "use-dns" "$f"; then
+    cp -an "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
+    python3 - "$f" << 'PYEOF'
+import sys, yaml
+path = sys.argv[1]
+with open(path) as fh:
+    data = yaml.safe_load(fh)
+net = data.get("network", {})
+for kind in ("ethernets", "wifis"):
+    for iface, cfg in (net.get(kind) or {}).items():
+        if cfg and cfg.get("dhcp4"):
+            cfg["dhcp4-overrides"] = {"use-dns": False}
+        if cfg and cfg.get("dhcp6"):
+            cfg["dhcp6-overrides"] = {"use-dns": False}
+with open(path, "w") as fh:
+    yaml.dump(data, fh, default_flow_style=False)
+PYEOF
+    NETPLAN_CHANGED=1
+  fi
+done
+if [ "$NETPLAN_CHANGED" -eq 1 ]; then
+  netplan apply 2>/dev/null || true
+  ok "ปิด DNS จาก DHCP (per-link) แล้ว — กัน 8.8.8.8 หรือ DNS ของ provider แอบเข้ามาทับ"
+else
+  info "ไม่พบ netplan config ที่ต้องแก้ หรือปิด use-dns ไว้แล้ว"
+fi
 
 cat > /etc/nftables-dns-block.conf << 'EOF'
 table inet dns_privacy {
