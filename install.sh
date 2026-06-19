@@ -2,235 +2,258 @@
 set -uo pipefail
 export LANG=C
 
-main() {
 GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'; CYN='\033[0;36m'; BLD='\033[1m'; RST='\033[0m'
 
-STATE_DIR="/var/lib/vless-reality-setup"
-LOG_FILE="${STATE_DIR}/setup.log"
-mkdir -p "$STATE_DIR"
+RUN_DIR="/run/vmess-cake-setup"
+mkdir -p "$RUN_DIR"
+LOG_FILE="${RUN_DIR}/install.log"
+STATE_FILE="${RUN_DIR}/steps.done"
+: > "$STATE_FILE"
 exec > >(tee -a "$LOG_FILE") 2>&1
 
-hdr()  { echo -e "\n${BLD}${CYN}▶ $1${RST}"; }
-ok()   { echo -e "  ${GRN}✔${RST} $1"; }
-warn() { echo -e "  ${YEL}⚠${RST} $1"; }
-info() { echo -e "  ${CYN}ℹ${RST} $1"; }
-die()  { echo -e "\n${RED}${BLD}✘ $1${RST}\n"; exit 1; }
+sep(){ echo -e "${CYN}────────────────────────────────────────────────────${RST}"; }
+hdr(){ echo -e "\n${BLD}${CYN}▶ $1${RST}"; sep; }
+ok(){ echo -e "  ${GRN}✔${RST} $1"; }
+warn(){ echo -e "  ${YEL}⚠${RST} $1"; }
+die(){ echo -e "\n${RED}${BLD}✘ $1${RST}\n"; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root — รันใหม่ด้วย: sudo bash <(curl -Ls 'https://raw.githubusercontent.com/peepogrob555/peepogrob555/refs/heads/main/install.sh')"
+[ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root"
 
-SSH_PORT=22
-HTTP_PORT=80
-REALITY_PORT=443
-PANEL_PORT=2053
-CF_PORTS=(2052 2082 2086 2095 8080 8880 2083 2087 2096 8443)
+. /etc/os-release 2>/dev/null || true
+if [ "${VERSION_ID:-}" != "24.04" ]; then
+  warn "ตรวจพบ ${PRETTY_NAME:-unknown OS} — สคริปต์นี้ทำมาเพื่อ Ubuntu 24.04 โดยเฉพาะ จะรันต่อแต่บางคำสั่งอาจต้องปรับ"
+fi
 
-REALITY_DEST="speedtest.net:443"
-REALITY_SNI="speedtest.net"
-REALITY_FP="firefox"
+NIC=$(ip route show default 2>/dev/null | awk '/^default/ {print $5; exit}')
+NIC="${NIC:-eth0}"
 
-BW_MBPS=1000
-RTT_MS=80
-HEADROOM=1.2
-MIN_BUF=2097152
-MAX_BUF=16777216
+FLOOR_BUF=2097152
+DEFAULT_BUF=4194304
+MAX_BUF=8388608
 
-BDP_BYTES=$(awk -v bw="$BW_MBPS" -v rtt="$RTT_MS" 'BEGIN{printf "%.0f", bw*1000000*rtt/1000/8}')
-BUF_BYTES=$(awk -v b="$BDP_BYTES" -v h="$HEADROOM" 'BEGIN{printf "%.0f", b*h}')
-[ "$BUF_BYTES" -lt "$MIN_BUF" ] && BUF_BYTES=$MIN_BUF
-[ "$BUF_BYTES" -gt "$MAX_BUF" ] && BUF_BYTES=$MAX_BUF
-BUF_MB=$(awk -v b="$BUF_BYTES" 'BEGIN{printf "%.2f", b/1048576}')
+ALLOWED_TCP=(22 80 443 2053 2052 2082 2086 2095 8080 8443)
 
-echo -e "${BLD}${CYN}╔══════════════════════════════════════════════╗${RST}"
-echo -e "${BLD}${CYN}║  VLESS Reality — Remaster v2 (Ubuntu 24.04)   ║${RST}"
-echo -e "${BLD}${CYN}╚══════════════════════════════════════════════╝${RST}"
-info "BDP @ ${BW_MBPS}Mbps/${RTT_MS}ms = ${BDP_BYTES} bytes → buffer หลัง headroom+clamp = ${BUF_BYTES} bytes (~${BUF_MB}MB)"
+echo ""
+echo -e "${BLD}${CYN}╔══════════════════════════════════════════════════════════╗${RST}"
+echo -e "${BLD}${CYN}║  VMESS-WS / CAKE+BBR — Ubuntu 24.04 hardened setup        ║${RST}"
+echo -e "${BLD}${CYN}║  Logs: RAM-only (${RUN_DIR})                ║${RST}"
+echo -e "${BLD}${CYN}╚══════════════════════════════════════════════════════════╝${RST}"
+echo ""
 
-hdr "STEP 1 — System Update"
+hdr "STEP 1 — UPDATE ทั้งระบบ"
 systemctl stop unattended-upgrades 2>/dev/null || true
 waited=0
-while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
-            /var/cache/apt/archives/lock &>/dev/null; do
-  [ "$waited" -ge 60 ] && {
-    fuser -k /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock \
-             /var/cache/apt/archives/lock 2>/dev/null || true
-    sleep 3
-    break
-  }
-  info "รอ apt lock... ${waited}s"; sleep 5; waited=$((waited+5))
+while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock &>/dev/null; do
+  [ "$waited" -ge 90 ] && { fuser -k /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock 2>/dev/null || true; break; }
+  sleep 3; waited=$((waited+3))
 done
 dpkg --configure -a
-dpkg --configure -a
-
 apt-get update -y
-DEBIAN_FRONTEND=noninteractive apt-get -y full-upgrade
-DEBIAN_FRONTEND=noninteractive apt-get -y autoremove --purge
-apt-get autoclean -y
+DEBIAN_FRONTEND=noninteractive apt-get -y -o Dpkg::Options::="--force-confold" upgrade
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
-  curl ufw nftables sqlite3 unattended-upgrades python3-yaml
-ok "อัปเดตระบบ + แพ็กเกจพื้นฐานเสร็จ"
+  curl ufw ethtool sqlite3 iproute2 iputils-ping nftables ca-certificates
+apt-get autoremove -y
+echo "step1_update" >> "$STATE_FILE"
+ok "ระบบอัพเดตครบ"
 
-hdr "STEP 1.5 — SSH: บังคับใช้ Key เท่านั้น (ปิด Password Authentication)"
-SSHD_CONF="/etc/ssh/sshd_config"
-cp -an "$SSHD_CONF" "${SSHD_CONF}.bak.$(date +%s)" 2>/dev/null || true
-
-AUTH_KEYS_OK=0
-for home in /root /home/*; do
-  if [ -s "${home}/.ssh/authorized_keys" ]; then
-    AUTH_KEYS_OK=1
-    break
-  fi
-done
-
-set_sshd_opt() {
-  local key="$1" val="$2"
-  if grep -qiE "^[#[:space:]]*${key}[[:space:]]" "$SSHD_CONF"; then
-    sed -i -E "s|^[#[:space:]]*${key}[[:space:]].*|${key} ${val}|I" "$SSHD_CONF"
-  else
-    echo "${key} ${val}" >> "$SSHD_CONF"
-  fi
-}
-
-if [ "$AUTH_KEYS_OK" -eq 1 ]; then
-  set_sshd_opt "PubkeyAuthentication" "yes"
-  set_sshd_opt "PasswordAuthentication" "no"
-  set_sshd_opt "KbdInteractiveAuthentication" "no"
-  set_sshd_opt "PermitRootLogin" "prohibit-password"
-
-  if [ -d /etc/ssh/sshd_config.d ]; then
-    for f in /etc/ssh/sshd_config.d/*.conf; do
-      [ -f "$f" ] || continue
-      sed -i -E 's|^[#[:space:]]*PasswordAuthentication[[:space:]].*|PasswordAuthentication no|I' "$f"
-      sed -i -E 's|^[#[:space:]]*KbdInteractiveAuthentication[[:space:]].*|KbdInteractiveAuthentication no|I' "$f"
-    done
-  fi
-
-  mkdir -p /run/sshd
-  chmod 0755 /run/sshd
-  sshd -t && {
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
-    ok "บังคับใช้ SSH key เท่านั้น (ปิด password login แล้ว, สำรอง config เดิมไว้ที่ ${SSHD_CONF}.bak.*)"
-  } || warn "sshd_config มีปัญหา syntax — ไม่ restart sshd (เช็คด้วยมือ: sshd -t)"
-else
-  warn "ไม่พบ authorized_keys ในเครื่องนี้เลย — ข้ามการปิด password auth (กันตัวเองล็อกตัวเองออกจาก SSH)"
-  warn "เพิ่ม public key ก่อนด้วย: mkdir -p ~/.ssh && echo 'ssh-ed25519 AAAA...' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
-  warn "แล้วรันสคริปต์นี้ใหม่ทีหลังเพื่อปิด password auth จริง"
-fi
-
-hdr "STEP 2 — Firewall: เปิดพอร์ตที่ใช้จริง (ไม่ไล่ deny ทีละพอร์ต — default-deny ครอบคลุมส่วนที่เหลืออยู่แล้ว)"
+hdr "STEP 2 — FIREWALL: เปิดเฉพาะพอตที่ใช้ / ปิดพอตอันตรายทั้งหมด (TCP+UDP)"
 ufw --force reset
 ufw default deny incoming
-ufw default allow outgoing
+ufw default deny outgoing
 ufw default deny forward
 
-ufw allow ${SSH_PORT}/tcp
-ufw allow ${HTTP_PORT}/tcp
-ufw allow ${REALITY_PORT}/tcp
-ufw allow ${PANEL_PORT}/tcp
+for p in "${ALLOWED_TCP[@]}"; do ufw allow "${p}/tcp"; done
+ufw allow out 53
+ufw allow out 80/tcp
+ufw allow out 443/tcp
+ufw allow out 123/udp
+ufw --force enable
 
-for p in "${CF_PORTS[@]}"; do
-  ufw allow ${p}/tcp
+for svc in telnet.socket rpcbind rpcbind.socket nfs-server smbd nmbd avahi-daemon \
+           avahi-daemon.socket cups cups-browsed vsftpd proftpd xinetd; do
+  systemctl list-unit-files "$svc" 2>/dev/null | grep -q "$svc" && {
+    systemctl stop "$svc" 2>/dev/null || true
+    systemctl disable "$svc" 2>/dev/null || true
+    systemctl mask "$svc" 2>/dev/null || true
+  }
 done
 
-sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
-ufw --force enable
 ufw status verbose
-ok "เปิด TCP: ${SSH_PORT} ${HTTP_PORT} ${REALITY_PORT} ${PANEL_PORT} + Cloudflare ports (allow ล้วน ไม่มี limit/deny รายพอร์ต) — ที่เหลือปิดด้วย default-deny policy"
+echo "step2_firewall" >> "$STATE_FILE"
+ok "เปิดเฉพาะ TCP: ${ALLOWED_TCP[*]} — ที่เหลือปิดหมดทั้ง TCP/UDP, บริการเสี่ยงถูก mask"
 
-hdr "STEP 3 — ติดตั้ง 3x-ui (interactive — กรอก username/password/port เอง)"
-if command -v x-ui &>/dev/null || [ -x /usr/local/x-ui/x-ui ]; then
-  ok "พบ 3x-ui ติดตั้งอยู่แล้ว — ข้าม"
+hdr "STEP 3 — ติดตั้ง 3x-ui"
+if command -v x-ui &>/dev/null; then
+  ok "3x-ui ติดตั้งอยู่แล้ว — ข้าม"
 else
-  info "เริ่ม installer จริง — กรอก username/password/port ของคุณเองตามที่ถาม..."
-  bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
+  bash <(curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
 fi
-if command -v x-ui &>/dev/null || [ -x /usr/local/x-ui/x-ui ]; then
-  ok "3x-ui ติดตั้งสำเร็จ"
-else
-  warn "ไม่พบ x-ui หลังติดตั้ง — เช็ค output ด้านบนว่า error หรือไม่"
-fi
+echo "step3_3xui" >> "$STATE_FILE"
+ok "3x-ui พร้อมใช้งาน"
 
-hdr "STEP 4 — Optimize/Tune (BBR + Buffer ${BUF_MB}MB) + ย้ายทุกอย่างที่ปลอดภัยไป RAM"
+hdr "STEP 4 — โหลด kernel module: BBR + CAKE"
+modprobe tcp_bbr 2>/dev/null || warn "โหลด tcp_bbr ไม่ได้"
+modprobe sch_cake 2>/dev/null || warn "โหลด sch_cake ไม่ได้"
+echo "tcp_bbr"  > /etc/modules-load.d/bbr.conf
+echo "sch_cake" > /etc/modules-load.d/cake.conf
+grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control && ok "bbr พร้อมใช้" || warn "bbr ไม่พร้อม"
+lsmod | grep -q sch_cake && ok "cake พร้อมใช้" || warn "cake ไม่พร้อม"
+echo "step4_modules" >> "$STATE_FILE"
 
-modprobe tcp_bbr 2>/dev/null || true
-modprobe sch_cake 2>/dev/null || true
-CC="bbr"
-grep -q bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null \
-  || { warn "BBR ไม่มีในเคอร์เนลนี้ — ใช้ cubic แทน"; CC="cubic"; }
-QDISC="cake"
-modinfo sch_cake &>/dev/null \
-  || { warn "cake module ไม่มีในเคอร์เนลนี้ — fallback ไป fq_codel"; QDISC="fq_codel"; }
+hdr "STEP 5 — SYSCTL TUNE ขั้นสูง (BBR + CAKE, low-latency, buffer 2-8MiB)"
+cat > /etc/sysctl.d/99-vmess-cake.conf << EOF
+net.ipv4.tcp_congestion_control     = bbr
+net.core.default_qdisc              = cake
 
-cat > /etc/modules-load.d/99-reality-net.conf << 'EOF'
-tcp_bbr
-sch_cake
+net.core.rmem_max                   = ${MAX_BUF}
+net.core.wmem_max                   = ${MAX_BUF}
+net.core.rmem_default               = ${DEFAULT_BUF}
+net.core.wmem_default               = ${DEFAULT_BUF}
+net.ipv4.tcp_rmem                   = ${FLOOR_BUF} ${DEFAULT_BUF} ${MAX_BUF}
+net.ipv4.tcp_wmem                   = ${FLOOR_BUF} ${DEFAULT_BUF} ${MAX_BUF}
+net.ipv4.tcp_moderate_rcvbuf        = 1
+net.ipv4.tcp_notsent_lowat          = 131072
+net.core.optmem_max                 = 131072
+
+net.ipv4.tcp_low_latency            = 1
+net.ipv4.tcp_autocorking            = 0
+net.ipv4.tcp_slow_start_after_idle  = 0
+net.ipv4.tcp_fastopen               = 3
+net.ipv4.tcp_mtu_probing             = 1
+net.ipv4.tcp_base_mss               = 1440
+net.ipv4.tcp_no_metrics_save        = 1
+net.ipv4.tcp_keepalive_time         = 35
+net.ipv4.tcp_keepalive_intvl        = 5
+net.ipv4.tcp_keepalive_probes       = 5
+net.ipv4.tcp_fin_timeout            = 10
+net.ipv4.tcp_tw_reuse               = 1
+net.ipv4.tcp_syncookies              = 1
+net.ipv4.tcp_window_scaling          = 1
+net.ipv4.tcp_timestamps              = 1
+net.ipv4.tcp_sack                    = 1
+net.ipv4.tcp_early_retrans           = 3
+net.ipv4.tcp_thin_linear_timeouts    = 1
+net.ipv4.tcp_thin_dupack             = 1
+
+net.core.netdev_max_backlog          = 65536
+net.core.somaxconn                   = 65535
+net.ipv4.tcp_max_syn_backlog         = 65535
+net.ipv4.ip_local_port_range         = 1024 65535
+net.ipv4.tcp_max_tw_buckets          = 1440000
+
+net.ipv4.ip_forward                  = 1
+net.ipv4.conf.all.forwarding         = 1
+net.ipv6.conf.all.forwarding         = 1
+
+net.ipv4.conf.all.accept_redirects   = 0
+net.ipv4.conf.all.send_redirects     = 0
+net.ipv4.conf.all.rp_filter          = 1
+net.ipv4.icmp_echo_ignore_broadcasts = 1
 EOF
-ok "โหลดโมดูล tcp_bbr + sch_cake แล้ว (และตั้งให้โหลดอัตโนมัติทุก reboot)"
+sysctl -p /etc/sysctl.d/99-vmess-cake.conf
+echo "step5_sysctl" >> "$STATE_FILE"
+ok "sysctl tuned: bbr+cake, buffer 2/4/8 MiB, mss=1440, low-latency flags ครบ"
 
-cat > /etc/sysctl.d/99-reality-perf.conf << EOF
-net.ipv4.tcp_congestion_control = ${CC}
-net.core.default_qdisc          = ${QDISC}
+hdr "STEP 6 — ผูก CAKE เข้า NIC (${NIC}) — ไม่จำกัด bandwidth, เป็น AQM/fairness ล้วน"
+bind_cake() {
+  tc qdisc del dev "$1" root 2>/dev/null || true
+  tc qdisc add dev "$1" root cake memlimit ${MAX_BUF}b diffserv4 nat dual-srchost ack-filter 2>/dev/null \
+    || tc qdisc add dev "$1" root cake 2>/dev/null \
+    || return 1
+}
+bind_cake "$NIC" && ok "cake ผูกกับ ${NIC} แล้ว" || warn "ผูก cake บน ${NIC} ไม่สำเร็จ"
+tc qdisc show dev "$NIC"
 
-net.core.rmem_max        = ${BUF_BYTES}
-net.core.wmem_max        = ${BUF_BYTES}
-net.ipv4.tcp_rmem        = 4096 87380 ${BUF_BYTES}
-net.ipv4.tcp_wmem        = 4096 65536 ${BUF_BYTES}
-net.ipv4.tcp_moderate_rcvbuf = 1
-net.ipv4.tcp_notsent_lowat = 16384
-net.ipv4.tcp_fastopen    = 3
-net.ipv4.tcp_mtu_probing = 1
-net.ipv4.tcp_slow_start_after_idle = 0
-
-net.core.somaxconn           = 8192
-net.ipv4.tcp_max_syn_backlog = 8192
-net.core.netdev_max_backlog  = 8192
-
-net.ipv4.tcp_tw_reuse    = 1
-net.ipv4.tcp_fin_timeout = 10
-
-vm.swappiness = 10
-vm.vfs_cache_pressure = 50
-
-fs.file-max = 2097152
-fs.nr_open  = 1048576
+mkdir -p /etc/networkd-dispatcher/routable.d
+cat > /etc/networkd-dispatcher/routable.d/50-cake.sh << EOF
+#!/usr/bin/env bash
+NIC="${NIC}"
+ip link show "\$NIC" &>/dev/null || exit 0
+tc qdisc del dev "\$NIC" root 2>/dev/null || true
+tc qdisc add dev "\$NIC" root cake memlimit ${MAX_BUF}b diffserv4 nat dual-srchost ack-filter 2>/dev/null \\
+  || tc qdisc add dev "\$NIC" root cake 2>/dev/null || true
 EOF
-sysctl -p /etc/sysctl.d/99-reality-perf.conf
-ok "BBR(${CC}) + qdisc ${QDISC} + buffer ${BUF_MB}MB + backlog 8192 (ปรับสเกลสำหรับ RAM 2GB)"
+chmod +x /etc/networkd-dispatcher/routable.d/50-cake.sh
 
-echo never > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-echo never > /sys/kernel/mm/transparent_hugepage/defrag   2>/dev/null || true
-cat > /etc/systemd/system/thp-disable.service << 'EOF'
+cat > /etc/systemd/system/cake-qdisc.service << EOF
 [Unit]
-Description=Disable Transparent Huge Pages
-DefaultDependencies=no
-After=sysinit.target local-fs.target
-Before=x-ui.service
+Description=Bind CAKE qdisc on ${NIC} (no bandwidth cap, AQM only)
+After=network-online.target
+Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/enabled'
-ExecStart=/bin/sh -c 'echo never > /sys/kernel/mm/transparent_hugepage/defrag'
+ExecStart=/etc/networkd-dispatcher/routable.d/50-cake.sh
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
 systemctl daemon-reload
-systemctl enable --now thp-disable.service
-ok "THP ปิดแล้ว"
+systemctl enable --now cake-qdisc.service
+echo "step6_cake" >> "$STATE_FILE"
+ok "cake-qdisc.service enabled — รอด reboot แน่นอน"
 
-cat > /etc/security/limits.d/99-reality.conf << 'EOF'
-* soft nofile 131072
-* hard nofile 131072
-EOF
-ok "fd limit = 131072"
+hdr "STEP 6.5 — SOCKET-LEVEL TUNE (xray sockopt): TCP_MAXSEG=1440 + buffer ตรงกับ kernel"
+patch_xray_sockopt() {
+  local db="/etc/x-ui/x-ui.db"
+  [ -f "$db" ] || { warn "x-ui.db ยังไม่มี — ยังไม่ได้สร้าง inbound ใน panel ข้ามขั้นนี้ไปก่อน"; return 0; }
+  command -v sqlite3 &>/dev/null || { warn "ไม่มี sqlite3"; return 1; }
+  command -v python3 &>/dev/null || { warn "ไม่มี python3"; return 1; }
 
-if ! swapon --show | grep -q '/swapfile'; then
-  fallocate -l 1024M /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=1024
-  chmod 600 /swapfile
-  mkswap /swapfile
-  swapon /swapfile
-  grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-fi
-ok "Swap 1GB พร้อม"
+  local sockopt
+  sockopt=$(python3 -c "
+import json
+print(json.dumps({
+  'acceptProxyProtocol': False,
+  'tcpFastOpen': True,
+  'mark': 0,
+  'tproxy': 'off',
+  'tcpMptcp': False,
+  'domainStrategy': 'AsIs',
+  'tcpMaxSeg': 1440,
+  'dialerProxy': '',
+  'tcpKeepAliveInterval': 35,
+  'tcpKeepAliveIdle': 35,
+  'tcpUserTimeout': 30000,
+  'tcpcongestion': 'bbr',
+  'V6Only': False,
+  'tcpWindowClamp': ${MAX_BUF},
+  'interface': '',
+  'tcpNoDelay': True,
+  'customSockopt': [
+    {'system':'', 'network':'tcp', 'level':'sol_socket', 'opt':'SO_RCVBUF', 'value':'${DEFAULT_BUF}', 'type':'int'},
+    {'system':'', 'network':'tcp', 'level':'sol_socket', 'opt':'SO_SNDBUF', 'value':'${DEFAULT_BUF}', 'type':'int'}
+  ]
+}, separators=(',',':')))
+")
 
+  local count
+  count=$(sqlite3 "$db" "SELECT COUNT(*) FROM inbounds WHERE port=80 AND protocol='vmess';" 2>/dev/null || echo 0)
+  if [ "$count" -gt 0 ]; then
+    local stream new_stream
+    stream=$(sqlite3 "$db" "SELECT stream_settings FROM inbounds WHERE port=80 AND protocol='vmess' LIMIT 1;")
+    new_stream=$(echo "$stream" | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+d['sockopt'] = json.loads(sys.argv[1])
+print(json.dumps(d, separators=(',',':')))
+" "$sockopt" 2>/dev/null || echo "")
+    if [ -n "$new_stream" ]; then
+      local esc="${new_stream//\'/\'\'}"
+      sqlite3 "$db" "UPDATE inbounds SET stream_settings='${esc}' WHERE port=80 AND protocol='vmess';"
+      systemctl restart x-ui 2>/dev/null || true
+      ok "patch sockopt สำเร็จ: tcpMaxSeg=1440, SO_RCVBUF/SO_SNDBUF=${DEFAULT_BUF}B, tcpWindowClamp=${MAX_BUF}B"
+    else
+      warn "parse stream_settings ไม่สำเร็จ — ข้าม patch"
+    fi
+  else
+    warn "ยังไม่พบ inbound vmess port 80 — สร้างใน panel ก่อนแล้วรันสคริปต์นี้ซ้ำเพื่อ patch sockopt"
+    warn "ค่า sockopt ที่ต้อง apply เองถ้าจำเป็น: ${sockopt}"
+  fi
+}
+patch_xray_sockopt
+echo "step6_5_sockopt" >> "$STATE_FILE"
+
+hdr "STEP 7 — LOG ทั้งหมดอยู่บน RAM เท่านั้น (ไม่เหลือร่องรอยบนดิสก์)"
 mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/99-volatile.conf << 'EOF'
 [Journal]
@@ -238,241 +261,71 @@ Storage=volatile
 Compress=no
 SystemMaxUse=64M
 RuntimeMaxUse=64M
+RateLimitIntervalSec=0
+RateLimitBurst=0
+Seal=no
+ForwardToSyslog=no
 EOF
-journalctl --rotate 2>/dev/null || true
-journalctl --vacuum-time=1s 2>/dev/null || true
-find /var/log/journal -type f -name "*.journal" -delete 2>/dev/null || true
 systemctl restart systemd-journald
-ok "journald → RAM only (volatile, จำกัด 64MB, ไม่เขียน disk)"
 
+systemctl disable --now rsyslog 2>/dev/null || true
+systemctl mask rsyslog 2>/dev/null || true
+
+[ -d /var/log/journal ] && rm -rf /var/log/journal
 if ! grep -q "tmpfs /tmp" /etc/fstab 2>/dev/null; then
-  echo "tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,size=512m 0 0" >> /etc/fstab
-fi
-mount -o remount /tmp 2>/dev/null || mount /tmp 2>/dev/null || true
-ok "/tmp → tmpfs 512MB (RAM)"
-
-hdr "STEP 5 — DNS + IP Leak Protection (1.1.1.1 DoT, ปิด IPv6)"
-
-cat > /etc/sysctl.d/99-disable-ipv6.conf << 'EOF'
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-EOF
-sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
-for iface in $(ip link show | awk -F': ' '/^[0-9]+:/ {print $2}' | cut -d@ -f1); do
-  echo 1 > /proc/sys/net/ipv6/conf/"${iface}"/disable_ipv6 2>/dev/null || true
-done
-if [ -f /etc/default/grub ]; then
-  grep -q "ipv6.disable=1" /etc/default/grub || \
-    sed -i 's/GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"/GRUB_CMDLINE_LINUX_DEFAULT="\1 ipv6.disable=1"/' /etc/default/grub
-  update-grub 2>/dev/null || true
-fi
-ok "ปิด IPv6 สมบูรณ์ (sysctl + grub)"
-
-mkdir -p /etc/systemd/resolved.conf.d
-cat > /etc/systemd/resolved.conf.d/99-dot.conf << 'EOF'
-[Resolve]
-DNS=1.1.1.1#cloudflare-dns.com
-FallbackDNS=1.0.0.1#cloudflare-dns.com
-DNSOverTLS=yes
-DNSSEC=no
-Cache=yes
-DNSStubListener=yes
-Domains=~.
-MulticastDNS=no
-LLMNR=no
-EOF
-systemctl enable --now systemd-resolved 2>/dev/null || true
-systemctl restart systemd-resolved
-sleep 2
-
-# บังคับ resolv.conf ให้ชี้ไป stub ของ resolved จริง ๆ — ถ้ามี immutable attr หรือไฟล์เดิมเป็น hard target ให้ลบทิ้งก่อนแล้วค่อย symlink ใหม่
-chattr -i /etc/resolv.conf 2>/dev/null || true
-rm -f /etc/resolv.conf
-ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
-if [ ! -L /etc/resolv.conf ] || [ "$(readlink /etc/resolv.conf)" != "/run/systemd/resolve/stub-resolv.conf" ]; then
-  warn "symlink /etc/resolv.conf ไม่สำเร็จ — บางระบบ (cloud-init/NetworkManager) คุม resolv.conf เอง"
-fi
-ok "DNS → 1.1.1.1 ผ่าน DoT + Domains=~. กัน leak จาก DHCP"
-
-# ปิด DNS ที่ DHCP ดึงมาเอง (per-link) ไม่งั้นจะมี DNS server แถมเข้ามา (เช่น 8.8.8.8) ทับ global DNS (1.1.1.1)
-NETPLAN_CHANGED=0
-for f in /etc/netplan/*.yaml; do
-  [ -f "$f" ] || continue
-  if ! grep -q "use-dns" "$f"; then
-    cp -an "$f" "${f}.bak.$(date +%s)" 2>/dev/null || true
-    python3 - "$f" << 'PYEOF'
-import sys, yaml
-path = sys.argv[1]
-with open(path) as fh:
-    data = yaml.safe_load(fh)
-net = data.get("network", {})
-for kind in ("ethernets", "wifis"):
-    for iface, cfg in (net.get(kind) or {}).items():
-        if cfg and cfg.get("dhcp4"):
-            cfg["dhcp4-overrides"] = {"use-dns": False}
-        if cfg and cfg.get("dhcp6"):
-            cfg["dhcp6-overrides"] = {"use-dns": False}
-with open(path, "w") as fh:
-    yaml.dump(data, fh, default_flow_style=False)
-PYEOF
-    NETPLAN_CHANGED=1
-  fi
-done
-if [ "$NETPLAN_CHANGED" -eq 1 ]; then
-  netplan apply 2>/dev/null || true
-  ok "ปิด DNS จาก DHCP (per-link) แล้ว — กัน DNS ของ provider แอบเข้ามาทับ global (1.1.1.1)"
-else
-  info "ไม่พบ netplan config ที่ต้องแก้ หรือปิด use-dns ไว้แล้ว"
+  echo "tmpfs /tmp tmpfs defaults,noatime,nosuid,nodev,size=256m 0 0" >> /etc/fstab
 fi
 
-# ชั้นป้องกันเพิ่ม: บางเครื่อง (renderer ไม่ใช่ networkd, หรือ provider ดัน DNS ผ่าน DHCP แบบที่ netplan
-# use-dns ไม่ครอบ) จะมี per-link DNS (เช่น 8.8.8.8 จาก ISP) โผล่ใน `resolvectl status` แข่งกับ global
-# เคลียร์ DNS/domain ระดับ link ออกตรง ๆ ด้วย resolvectl ทุกครั้งที่ boot/network เปลี่ยน เพื่อบังคับให้ใช้ global (1.1.1.1) เท่านั้น
-cat > /usr/local/sbin/clear-link-dns.sh << 'CLEAREOF'
-#!/usr/bin/env bash
-for link in $(networkctl list --no-legend 2>/dev/null | awk '{print $2}'); do
-  [ "$link" = "lo" ] && continue
-  resolvectl dns "$link" "" 2>/dev/null
-  resolvectl domain "$link" "" 2>/dev/null
-done
-CLEAREOF
-chmod +x /usr/local/sbin/clear-link-dns.sh
-/usr/local/sbin/clear-link-dns.sh
+echo "step7_ramlogs" >> "$STATE_FILE"
+ok "journald=volatile (RAM only), rsyslog ปิด, /tmp เป็น tmpfs, /var/log/journal ลบแล้ว"
 
-cat > /etc/systemd/system/clear-link-dns.service << 'EOF'
-[Unit]
-Description=Clear per-link DNS to force global DoT resolver only
-After=network-online.target systemd-resolved.service
-Wants=network-online.target
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/clear-link-dns.sh
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable --now clear-link-dns.service
-
-# NetworkManager dispatcher hook (เผื่อ renderer เป็น NetworkManager แทน networkd — DNS จะถูก DHCP เซ็ตใหม่ทุกครั้งที่ renew)
-if command -v nmcli &>/dev/null && [ -d /etc/NetworkManager/dispatcher.d ]; then
-  cat > /etc/NetworkManager/dispatcher.d/99-clear-dns << 'EOF'
-#!/usr/bin/env bash
-/usr/local/sbin/clear-link-dns.sh
-EOF
-  chmod +x /etc/NetworkManager/dispatcher.d/99-clear-dns
-  ok "ติดตั้ง NetworkManager dispatcher hook กัน DNS leak ตอน renew DHCP"
-fi
-ok "เคลียร์ per-link DNS แล้ว (กัน DNS อื่นเช่น 8.8.8.8 จาก ISP แข่งกับ global 1.1.1.1) + ตั้งให้รันซ้ำทุก boot/renew"
-
-cat > /etc/nftables-dns-block.conf << 'EOF'
-table inet dns_privacy {
-  chain output_dns_block {
-    type filter hook output priority 0; policy accept;
-    ip daddr 127.0.0.53 udp dport 53 accept
-    ip daddr 127.0.0.53 tcp dport 53 accept
-    udp dport 53 drop
-    tcp dport 53 drop
-  }
-}
-EOF
-nft -f /etc/nftables-dns-block.conf 2>/dev/null \
-  && ok "บล็อก plaintext DNS port 53 ขาออกแล้ว" \
-  || warn "nftables DNS block ล้มเหลว (non-fatal)"
-
-cat > /etc/systemd/system/dns-privacy-nft.service << 'EOF'
-[Unit]
-Description=Block plaintext DNS (force DoT)
-After=network.target
-[Service]
-Type=oneshot
-ExecStart=/usr/sbin/nft -f /etc/nftables-dns-block.conf
-RemainAfterExit=yes
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable --now dns-privacy-nft.service
-
-echo ""
-warn "ไปตั้งเองในหน้า 3x-ui panel (Xray Configs) หลังติดตั้ง:"
-warn "  DNS object ของ Xray → ชี้ 127.0.0.53 (สำคัญมาก ไม่งั้น Xray resolve โดเมนไม่ได้"
-warn "  เพราะ DNS ขาออกตรงถูก nftables บล็อกไว้แล้ว — ค้างโหลดได้ถ้าลืมตั้งจุดนี้)"
-warn "  Sniffing → ปิดทั้งหมด | Log → access=none, loglevel=none, dnsLog=false"
-echo ""
-
-hdr "VERIFY"
-sleep 2
+hdr "STEP 8 — VERIFY (reboot-safe check)"
 errors=0
-chk() {
-  local label="$1"; local cond="$2"
-  if eval "$cond"; then ok "$label"; else warn "$label — ไม่ผ่าน"; errors=$((errors+1)); fi
+chk_enabled(){ systemctl is-enabled "$1" &>/dev/null || { warn "$1 ไม่ enable"; errors=$((errors+1)); }; }
+chk_val(){
+  if echo "$2" | grep -qF "$3"; then ok "  $1: $2"; else warn "  $1: got='$2' expect~'$3'"; errors=$((errors+1)); fi
 }
 
-chk "BBR/${CC} congestion control"        "[ \"\$(sysctl -n net.ipv4.tcp_congestion_control)\" = '${CC}' ]"
-chk "Buffer ceiling = ${BUF_BYTES}"       "[ \"\$(sysctl -n net.core.rmem_max)\" = '${BUF_BYTES}' ]"
-chk "IPv6 ปิดสมบูรณ์"                      "[ \"\$(sysctl -n net.ipv6.conf.all.disable_ipv6)\" = '1' ]"
-check_dns_global() {
-  for i in 1 2 3 4 5; do
-    if resolvectl status 2>/dev/null | grep -q '1\.1\.1\.1'; then return 0; fi
-    if grep -q '1\.1\.1\.1\|127\.0\.0\.53' /etc/resolv.conf 2>/dev/null; then return 0; fi
-    sleep 1
-  done
-  return 1
-}
-chk "DNS ชี้ไป 1.1.1.1"                    "check_dns_global"
-chk "ไม่มี per-link DNS แข่งกับ global"      "! resolvectl status 2>/dev/null | grep -A2 '^Link' | grep -qE 'DNS Servers:.*[0-9]' "
-chk "Port ${HTTP_PORT}/tcp เปิดใน UFW"     "ufw status | grep -qE '^${HTTP_PORT}/tcp'"
-chk "Port ${REALITY_PORT}/tcp เปิดใน UFW"  "ufw status | grep -qE '^${REALITY_PORT}/tcp'"
-chk "Port ${PANEL_PORT}/tcp เปิดใน UFW"    "ufw status | grep -qE '^${PANEL_PORT}/tcp'"
-chk "journald = volatile (RAM)"            "grep -q 'Storage=volatile' /etc/systemd/journald.conf.d/99-volatile.conf"
-chk "/tmp = tmpfs (RAM)"                   "grep -q 'tmpfs /tmp' /etc/fstab"
+chk_enabled cake-qdisc.service
+chk_enabled x-ui
+[ -f /etc/sysctl.d/99-vmess-cake.conf ] || { warn "sysctl conf หาย"; errors=$((errors+1)); }
+[ -f /etc/modules-load.d/bbr.conf ]     || { warn "bbr modules-load หาย"; errors=$((errors+1)); }
+[ -f /etc/modules-load.d/cake.conf ]    || { warn "cake modules-load หาย"; errors=$((errors+1)); }
 
-info "ทดสอบ DNS leak: ลอง TCP:53 ตรงไป 1.1.1.1 (ควรถูกบล็อก เพราะต้องผ่าน DoT เท่านั้น)..."
-if timeout 3 bash -c 'exec 3<>/dev/tcp/1.1.1.1/53' 2>/dev/null; then
-  warn "เชื่อมต่อ TCP:53 ไป 1.1.1.1 ได้ — DNS block ไม่ทำงานจริง!"
-  errors=$((errors+1))
-else
-  ok "Plaintext DNS (port 53) ถูกบล็อกแล้ว — ไม่มี DNS leak"
+chk_val "CC"             "$(sysctl -n net.ipv4.tcp_congestion_control)"  "bbr"
+chk_val "qdisc default"  "$(sysctl -n net.core.default_qdisc)"          "cake"
+chk_val "qdisc on NIC"   "$(tc qdisc show dev "$NIC" | head -1)"        "cake"
+chk_val "ip_forward"     "$(sysctl -n net.ipv4.ip_forward)"             "1"
+chk_val "x-ui active"    "$(systemctl is-active x-ui 2>/dev/null)"      "active"
+chk_val "journald conf"  "$(grep -h Storage /etc/systemd/journald.conf.d/99-volatile.conf)" "volatile"
+
+ufw status | grep -q "Status: active" && ok "  ufw: active" || { warn "  ufw ไม่ active"; errors=$((errors+1)); }
+
+if [ -f /etc/x-ui/x-ui.db ] && command -v sqlite3 &>/dev/null; then
+  ss_check=$(sqlite3 /etc/x-ui/x-ui.db "SELECT stream_settings FROM inbounds WHERE port=80 AND protocol='vmess' LIMIT 1;" 2>/dev/null || echo "")
+  chk_val "xray tcpMaxSeg" "$ss_check" "\"tcpMaxSeg\":1440"
 fi
 
-PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
-       || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
-
 echo ""
-echo -e "  ══════════════════════════════════════════════════════"
-echo -e "  ${BLD}Server IP${RST}   : ${PUB_IP}"
-echo -e "  ${BLD}Panel URL${RST}   : http://${PUB_IP}:${PANEL_PORT}/"
-echo -e "  ${BLD}Firewall${RST}    : เปิด TCP ${SSH_PORT}/${HTTP_PORT}/${REALITY_PORT}/${PANEL_PORT} + Cloudflare ports (allow ล้วน) — ที่เหลือปิดด้วย default-deny (รวม UDP)"
-echo -e "  ${BLD}DNS${RST}         : 1.1.1.1 ผ่าน DoT — plaintext port 53 บล็อก"
-echo -e "  ${BLD}IPv6${RST}        : ปิดสมบูรณ์"
-echo -e "  ${BLD}RAM-backed${RST}  : journald (64MB) + /tmp (512MB tmpfs)"
-echo -e "  ${BLD}Performance${RST} : BBR(${CC}) + ${QDISC} + buffer ${BUF_MB}MB (BDP@${BW_MBPS}Mbps/${RTT_MS}ms) + THP off + swap 1GB"
-echo -e "  ──────────────────────────────────────────────────────"
-echo -e "  ${BLD}ค่าที่ต้องกรอกเองใน VLESS Reality Inbound (panel):${RST}"
-echo -e "    Protocol     : VLESS"
-echo -e "    Network      : tcp (raw)"
-echo -e "    Port         : ${REALITY_PORT}"
-echo -e "    Security     : reality"
-echo -e "    Dest         : ${REALITY_DEST}"
-echo -e "    Server Name  : ${REALITY_SNI}"
-echo -e "    Fingerprint  : ${REALITY_FP}"
-echo -e "    Sniffing     : ปิดทั้งหมด"
-echo -e "    Xray DNS     : ชี้ไป 127.0.0.53"
-echo -e "  ══════════════════════════════════════════════════════"
-echo ""
-
 if [ "$errors" -eq 0 ]; then
-  echo -e "${BLD}${GRN}  ✔ ทุก step ผ่านหมด — reboot แล้วเข้า panel ตั้ง inbound ได้เลย${RST}"
+  ok "ALL CHECKS PASSED — reboot ได้เลย ทุก config persistent"
 else
-  echo -e "${YEL}  ⚠ พบ ${errors} รายการที่ไม่ผ่าน — ตรวจสอบด้านบน${RST}"
+  warn "${errors} จุดที่ต้องดูเพิ่ม (ดู log ด้านบน — log นี้อยู่บน RAM เท่านั้น จะหายเมื่อ reboot/ปิดเครื่อง)"
 fi
-echo ""
-echo -e "${RED}${BLD}  ⚠ ตรวจการเข้าถึง SSH ของคุณให้แน่ใจก่อน reboot${RST}"
-echo -e "  Install log: ${LOG_FILE}"
-echo ""
+echo "step8_verify" >> "$STATE_FILE"
 
-}
-
-main "$@"
+PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null || echo "N/A")
+echo ""
+echo -e "${BLD}${GRN}== SUMMARY ==${RST}"
+echo "  Panel URL        : http://${PUB_IP}:2053"
+echo "  Inbound ที่ต้องสร้างในพาเนล : VMESS / WS / port 80 / Security: none"
+echo "  Host/SNI header  : speedtest.net"
+echo "  TCP เปิด         : ${ALLOWED_TCP[*]}"
+echo "  CC / qdisc       : $(sysctl -n net.ipv4.tcp_congestion_control) / $(tc qdisc show dev "$NIC" | head -1)"
+echo "  Buffer rmem/wmem : floor=2MiB default=4MiB max=8MiB (kernel + cake memlimit + xray sockopt ตรงกันหมด)"
+echo "  TCP_MAXSEG       : 1440 (kernel tcp_base_mss + xray sockopt.tcpMaxSeg)"
+echo "  MTU              : server NIC 1500 / V2Box client MTU 1500 (MSS 1440 เผื่อ WS overhead)"
+echo "  Log              : ${LOG_FILE}  (RAM เท่านั้น — หายอัตโนมัติเมื่อ reboot)"
+echo ""
+echo -e "${YEL}→ แนะนำ reboot 1 ครั้งเพื่อ confirm ทุก setting persistent (จะไม่มีอะไรหาย)${RST}"
+echo ""
