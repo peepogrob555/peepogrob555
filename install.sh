@@ -206,14 +206,19 @@ cat > /etc/nftables-udp-inbound.conf << 'UDPINEOF'
 table inet udp_inbound {
   chain input_udp {
     type filter hook input priority -1; policy accept;
-    udp dport { 1:65535 } ct state established,related accept
-    udp dport { 1:65535 } ct state new drop
+    udp ct state established,related accept
+    udp ct state new drop
   }
 }
 UDPINEOF
-nft -f /etc/nftables-udp-inbound.conf 2>/dev/null \
-  && info "nftables: inbound UDP ใหม่ทุกพอร์ตถูก drop (เหลือแค่ reply ของ request ที่เครื่องเริ่มเอง) — outbound UDP ไม่ถูกแตะ" \
-  || warn "nftables UDP inbound rule ล้มเหลว (non-fatal) — ufw default deny incoming ยังกันพื้นฐานอยู่"
+nft_udp_err=$(nft -f /etc/nftables-udp-inbound.conf 2>&1)
+nft_udp_rc=$?
+if [ "$nft_udp_rc" -eq 0 ]; then
+  info "nftables: inbound UDP ใหม่ทุกพอร์ตถูก drop (เหลือแค่ reply ของ request ที่เครื่องเริ่มเอง) — outbound UDP ไม่ถูกแตะ"
+else
+  warn "nftables UDP inbound rule ล้มเหลว (non-fatal) — ufw default deny incoming ยังกันพื้นฐานอยู่"
+  warn "nft error: ${nft_udp_err}"
+fi
 
 cat > /etc/systemd/system/udp-inbound-nft.service << 'UDPSEOF'
 [Unit]
@@ -510,7 +515,7 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 NSEOF
 systemctl daemon-reload
-systemctl enable nic-tune.service
+systemctl enable --now nic-tune.service
 ok "NIC tune เสร็จ (GRO/GSO/TSO on, ring buffer max, qdisc ${QDISC})"
 
 # ── 3.3 Transparent Huge Pages OFF ──────────────────────────────────
@@ -1126,7 +1131,10 @@ fi
 hdr "FIREWALL — TCP"
 if command -v ufw &>/dev/null; then
   ufw_out=\$(ufw status 2>/dev/null)
-  for p in 22 80 443 "\${PANEL_PORT}"; do
+  echo "\$ufw_out" | grep -qE "^22/tcp.*(LIMIT|ALLOW)" \
+    && ok "พอร์ต 22/tcp: เปิดอยู่ (LIMIT/ALLOW — ตามแผน)" \
+    || { warn "พอร์ต 22/tcp: ไม่พบ LIMIT/ALLOW rule"; errors=\$((errors+1)); }
+  for p in 80 443 "\${PANEL_PORT}"; do
     echo "\$ufw_out" | grep -qE "^\${p}/tcp.*ALLOW" \
       && ok "พอร์ต \${p}/tcp: ALLOW (ตามแผน)" \
       || { warn "พอร์ต \${p}/tcp: ไม่พบ ALLOW rule"; errors=\$((errors+1)); }
