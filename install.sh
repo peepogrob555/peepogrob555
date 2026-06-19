@@ -263,31 +263,10 @@ swapon --show
 ok "Swap พร้อม"
 
 ok "═══ STEP 1 เสร็จสมบูรณ์ ═══"
+# ═══════════════════════════════════════════════════════════════════
 hdr "STEP 2 — ติดตั้ง 3x-ui"
-
-echo ""
-warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-warn "  3x-ui installer จะถามข้อมูลให้คุณกรอกเอง:"
-warn "  - Username (admin ก็ได้)"
-warn "  - Password (ตั้งให้แข็งแกร่ง)"
-warn "  - Panel Port (แนะนำ: ${PANEL_PORT})"
-warn "  - Web Base Path (แนะนำ: ตั้งเองหรือกด Enter ข้าม)"
-warn "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo ""
-ask "กด ENTER เพื่อเริ่มติดตั้ง 3x-ui (คุณจะเห็น prompt ทุกอย่าง)..."
-read -r
-
-bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh) \
-  || die "ติดตั้ง 3x-ui ล้มเหลว — ตรวจ DNS/network แล้วรันสคริปต์ใหม่"
-
-for i in $(seq 1 30); do
-  systemctl is-active x-ui &>/dev/null && break
-  sleep 2
-done
-systemctl is-active x-ui &>/dev/null \
-  && ok "x-ui active" \
-  || warn "x-ui อาจยังไม่ active — ตรวจ: systemctl status x-ui"
-
+# ═══════════════════════════════════════════════════════════════════
+bash <(curl -Ls https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh)
 ok "═══ STEP 2 เสร็จสมบูรณ์ ═══"
 
 # ═══════════════════════════════════════════════════════════════════
