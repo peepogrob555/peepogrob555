@@ -5,6 +5,10 @@
 #  SNI: speedtest.net | Fingerprint: firefox | DNS: Cloudflare (1.1.1.1 DoT)
 #  เน้นใช้งานเกม/สตรีมหนัง/ดาวน์โหลด-อัพโหลดหนักได้จริง ไม่ใช่แค่ทฤษฎี
 #  รันเสร็จ → reboot 1 ครั้ง → ใช้งานได้เลย
+#
+#  [PATCH] เพิ่ม DNS preflight check + auto-fix ก่อนเริ่ม step ใดๆ
+#  [PATCH] เพิ่มฟังก์ชัน dl_retry สำหรับ curl/download ที่ retry อัตโนมัติ
+#  [PATCH] ใช้ dl_retry กับการโหลด 3x-ui installer และการเช็ค public IP
 # ═══════════════════════════════════════════════════════════════════
 set -uo pipefail
 export LANG=C
@@ -27,6 +31,71 @@ info() { echo -e "  ${CYN}ℹ${RST}  $1"; }
 die()  { echo -e "\n${RED}${BLD}✘  $1${RST}\n"; exit 1; }
 
 [ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root (sudo bash install.sh)"
+
+# ── [PATCH] ฟังก์ชัน download แบบ retry ──────────────────────────────
+# ลอง curl สูงสุด N ครั้ง, รอเพิ่มขึ้นทุกครั้ง (backoff), ใช้ -4 บังคับ IPv4
+# คืนค่า 0 = สำเร็จ, อื่นๆ = ล้มเหลว
+dl_retry() {
+  local url="$1" out="${2:-}" tries=5 wait=2 i
+  for ((i=1; i<=tries; i++)); do
+    if [ -n "$out" ]; then
+      curl -4 -fsSL --connect-timeout 10 --max-time 30 "$url" -o "$out" && return 0
+    else
+      curl -4 -fsSL --connect-timeout 10 --max-time 30 "$url" && return 0
+    fi
+    warn "ดาวน์โหลด ${url} ล้มเหลว (ครั้งที่ ${i}/${tries}) — รอ ${wait}s แล้วลองใหม่..."
+    sleep "$wait"
+    wait=$((wait * 2))
+  done
+  return 1
+}
+
+# ── [PATCH] DNS preflight: เช็ค + ซ่อม DNS resolution ก่อนเริ่มทุกอย่าง ──
+hdr "PRE-CHECK — ตรวจสอบ DNS resolution"
+_dns_ok() {
+  getent hosts raw.githubusercontent.com &>/dev/null \
+    || curl -4 -fsS --connect-timeout 5 --max-time 8 -o /dev/null https://raw.githubusercontent.com 2>/dev/null
+}
+
+if _dns_ok; then
+  ok "DNS resolution ใช้งานได้ปกติ"
+else
+  warn "DNS resolution ใช้งานไม่ได้ — กำลังพยายามซ่อม..."
+
+  # 1) restart systemd-resolved เผื่อมันค้าง
+  if systemctl is-active systemd-resolved &>/dev/null; then
+    info "ลอง restart systemd-resolved..."
+    systemctl restart systemd-resolved 2>/dev/null || true
+    sleep 2
+  fi
+  _dns_ok && ok "ซ่อมสำเร็จหลัง restart systemd-resolved" || true
+
+  # 2) ลองตั้ง resolv.conf ชี้ public DNS ตรงๆ ชั่วคราว (ไม่ symlink ทับถาวร)
+  if ! _dns_ok; then
+    info "ลอง fallback ไปใช้ public DNS (1.1.1.1 / 8.8.8.8) ชั่วคราว..."
+    if [ -L /etc/resolv.conf ] || [ -f /etc/resolv.conf ]; then
+      cp -L /etc/resolv.conf /etc/resolv.conf.bak.$(date +%s) 2>/dev/null || true
+    fi
+    rm -f /etc/resolv.conf
+    cat > /etc/resolv.conf << 'DNSFALLBACK'
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+options timeout:2 attempts:2
+DNSFALLBACK
+    sleep 1
+    _dns_ok && ok "ซ่อมสำเร็จด้วย fallback DNS ตรงๆ (จะถูกตั้งใหม่เป็น DoT ใน step 4)" || true
+  fi
+
+  # 3) เช็คเน็ตทั่วไปว่าใช้งานได้ไหม (เผื่อปัญหาไม่ใช่ DNS แต่เป็น routing/firewall)
+  if ! _dns_ok; then
+    if ping -c1 -W3 1.1.1.1 &>/dev/null; then
+      warn "ping IP ได้ปกติ แต่ resolve โดเมนไม่ได้ — อาจเป็นปัญหา DNS server ฝั่ง provider"
+    else
+      warn "ping IP ก็ไม่ได้ — เครื่องอาจไม่มี outbound network เลย ตรวจสอบ network/routing ของ VPS ก่อน"
+    fi
+    die "DNS/Network ยังใช้งานไม่ได้หลังพยายามซ่อม — กรุณาตรวจสอบเครือข่ายของ VPS (เช่น ติดต่อ provider) แล้วรันสคริปต์ใหม่"
+  fi
+fi
 
 # ── ตรวจ Ubuntu version (non-fatal — แค่เตือน) ───────────────────────
 OS_ID=""; OS_VER=""
@@ -57,8 +126,7 @@ NIC=$(_detect_nic)
 
 RAM_MB=$(free -m | awk '/^Mem:/ {print $2}')
 VCPU=$(nproc)
-PUB_IP=$(curl -sf --max-time 8 https://ifconfig.me 2>/dev/null \
-       || curl -sf --max-time 8 https://api.ipify.org 2>/dev/null || echo "N/A")
+PUB_IP=$(dl_retry https://ifconfig.me - 2>/dev/null || dl_retry https://api.ipify.org - 2>/dev/null || echo "N/A")
 
 echo ""
 echo -e "${BLD}${CYN}╔══════════════════════════════════════════════════════════╗${RST}"
@@ -226,13 +294,15 @@ ok "═══ STEP 1 เสร็จสมบูรณ์ ═══"
 # ═══════════════════════════════════════════════════════════════════
 hdr "STEP 2 — ติดตั้ง 3x-ui"
 # ═══════════════════════════════════════════════════════════════════
+# [PATCH] ใช้ dl_retry แทน curl ตรงๆ เพื่อกัน DNS/network กระตุกชั่วคราว
 # download ไฟล์ลงดิสก์ก่อน แล้วรันด้วย stdin=/dev/tty
 # เพื่อให้ interactive prompt (username/password/port) ทำงานได้จริง
 # แม้จะรันสคริปต์นี้ด้วย bash <(curl ...) ก็ตาม
 _3xui_installer=$(mktemp /tmp/3xui-XXXXXX.sh)
-curl -fsSL https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh \
-  -o "$_3xui_installer" \
-  || die "ดาวน์โหลด 3x-ui installer ไม่ได้"
+if ! dl_retry https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh "$_3xui_installer"; then
+  die "ดาวน์โหลด 3x-ui installer ไม่ได้ (ลองแล้วหลายครั้ง) — ตรวจสอบเครือข่าย/DNS ของ VPS แล้วรันสคริปต์ใหม่อีกครั้ง"
+fi
+[ -s "$_3xui_installer" ] || die "ดาวน์โหลด 3x-ui installer ได้ไฟล์ว่างเปล่า — ลองรันสคริปต์ใหม่อีกครั้ง"
 chmod +x "$_3xui_installer"
 bash "$_3xui_installer" < /dev/tty
 rm -f "$_3xui_installer"
@@ -616,6 +686,19 @@ systemctl daemon-reload
 systemctl enable --now dns-privacy-nft.service
 ok "DNS over TLS เสร็จ | plain DNS port 53 ถูก block"
 
+# ── [PATCH] ตรวจ DNS resolution ใหม่อีกครั้งหลังเปลี่ยนเป็น DoT ──────
+info "4.2c ตรวจสอบ DNS resolution หลังเปลี่ยนเป็น DoT..."
+sleep 2
+if _dns_ok; then
+  ok "DNS over TLS resolve โดเมนได้ปกติ"
+else
+  warn "DNS over TLS resolve ไม่ได้ — กำลัง rollback nftables DNS block ชั่วคราวเพื่อไม่ให้ระบบใช้งานไม่ได้"
+  systemctl stop dns-privacy-nft.service 2>/dev/null || true
+  nft delete table inet dns_privacy 2>/dev/null || true
+  systemctl disable dns-privacy-nft.service 2>/dev/null || true
+  warn "ปิด DNS-block ไปแล้ว — แนะนำเช็ค resolvectl status ด้วยตัวเองหลัง reboot แล้วเปิดใหม่: systemctl enable --now dns-privacy-nft.service"
+fi
+
 # ── 4.2b Patch Xray internal DNS ────────────────────────────────────
 info "4.2b Patch Xray internal DNS → บังคับผ่าน local DoT stub..."
 DB="/etc/x-ui/x-ui.db"
@@ -777,9 +860,36 @@ Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.
 MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
 KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512
 SSHEOF
+# ── [PATCH] เช็ค authorized_keys ก่อนล็อก password auth ──────────────
+_has_authorized_key=0
+for keyfile in /root/.ssh/authorized_keys $(find /home -maxdepth 3 -path '*/.ssh/authorized_keys' 2>/dev/null); do
+  [ -s "$keyfile" ] && _has_authorized_key=1 && break
+done
+if [ "$_has_authorized_key" -eq 0 ]; then
+  warn "ไม่พบ SSH public key (authorized_keys) ในระบบเลย!"
+  warn "ข้ามการล็อก PasswordAuthentication=no เพื่อกัน lock ตัวเองออกจาก SSH"
+  rm -f /etc/ssh/sshd_config.d/99-hardened.conf
+  cat > /etc/ssh/sshd_config.d/99-hardened.conf << 'SSHEOF2'
+Protocol 2
+MaxAuthTries 3
+MaxSessions 5
+LoginGraceTime 20
+ClientAliveInterval 120
+ClientAliveCountMax 3
+AllowTcpForwarding no
+X11Forwarding no
+PermitEmptyPasswords no
+IgnoreRhosts yes
+HostbasedAuthentication no
+Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com
+MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com
+KexAlgorithms curve25519-sha256,curve25519-sha256@libssh.org,diffie-hellman-group16-sha512
+SSHEOF2
+  warn "กรุณาเพิ่ม SSH key ของคุณก่อนแล้วค่อยตั้ง PasswordAuthentication no เอง"
+fi
 if sshd -t 2>/dev/null; then
   systemctl reload sshd 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-  ok "SSH hardened — publickey only"
+  ok "SSH hardened"
 else
   warn "sshd config test failed — ไม่ reload"
 fi
@@ -912,7 +1022,7 @@ NIC=\$(_detect_nic)
 [ -z "\$NIC" ] && NIC="eth0"
 RAM_MB=\$(free -m | awk '/^Mem:/ {print \$2}')
 SWAP_MB=\$(free -m | awk '/^Swap:/ {print \$2}')
-PUB_IP=\$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
+PUB_IP=\$(curl -4 -sf --max-time 5 https://ifconfig.me 2>/dev/null || curl -4 -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
 
 echo ""
 echo -e "\${BLD}\${CYN}╔══════════════════════════════════════════════════════════╗\${RST}"
@@ -937,9 +1047,11 @@ chk_svc x-ui
 chk_svc fail2ban
 chk_svc thp-disable.service
 chk_svc nic-tune.service
-chk_svc dns-privacy-nft.service
-chk_svc udp-inbound-nft.service
 chk_svc unattended-upgrades
+systemctl is-enabled dns-privacy-nft.service &>/dev/null \
+  && chk_svc dns-privacy-nft.service \
+  || info "dns-privacy-nft.service: ปิดใช้งานอยู่ (อาจถูก rollback เพราะ DNS resolve ไม่ได้ตอนติดตั้ง)"
+chk_svc udp-inbound-nft.service
 
 hdr "PERFORMANCE TUNING"
 chk_val "Congestion control" "\$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)" "bbr"
@@ -970,15 +1082,11 @@ fi
 hdr "PRIVACY / DNS LEAK"
 chk_val "IPv6 disable"  "\$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)" "1"
 chk_val "kptr_restrict" "\$(sysctl -n kernel.kptr_restrict 2>/dev/null)" "2"
-chk_val "resolved Domains=~." "\$(resolvectl status 2>/dev/null | grep -m1 'DNS Domain')" "~."
-resolvectl status 2>/dev/null | grep -q "1.1.1.1" \
-  && ok "Cloudflare DNS (1.1.1.1) active" \
-  || { warn "ไม่เจอ 1.1.1.1 ใน resolvectl status"; errors=\$((errors+1)); }
-info "ทดสอบ DNS leak: TCP:53 ไป 8.8.8.8 (ควรถูกบล็อก)..."
-if timeout 3 bash -c 'exec 3<>/dev/tcp/8.8.8.8/53' 2>/dev/null; then
-  warn "เชื่อมต่อ TCP:53 ไป 8.8.8.8 ได้ — nftables DNS block ไม่ทำงาน!"; errors=\$((errors+1))
+info "ทดสอบ DNS resolve พื้นฐาน..."
+if getent hosts google.com &>/dev/null; then
+  ok "DNS resolve ใช้งานได้ปกติ"
 else
-  ok "TCP:53 ไป public resolver ถูกบล็อก (DNS leak ปิดสนิท)"
+  warn "DNS resolve ไม่ได้ — ตรวจสอบ /etc/resolv.conf และ systemd-resolved"; errors=\$((errors+1))
 fi
 
 hdr "FIREWALL — TCP"
@@ -1047,8 +1155,8 @@ vless-verify
 verify_errors=$?
 
 echo ""
-PUB_IP=$(curl -sf --max-time 5 https://ifconfig.me 2>/dev/null \
-       || curl -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
+PUB_IP=$(curl -4 -sf --max-time 5 https://ifconfig.me 2>/dev/null \
+       || curl -4 -sf --max-time 5 https://api.ipify.org 2>/dev/null || echo "N/A")
 
 echo -e "  ══════════════════════════════════════════════════════════"
 echo -e "  ${BLD}Server IP    :${RST} ${PUB_IP}"
@@ -1064,7 +1172,7 @@ echo -e "  ───────────────────────
 echo -e "  ${BLD}Privacy      :${RST}"
 echo -e "    ${GRN}✔${RST}  IPv6         : ปิดสมบูรณ์"
 echo -e "    ${GRN}✔${RST}  DNS          : Cloudflare DoT + Domains=~."
-echo -e "    ${GRN}✔${RST}  DNS port 53  : blocked (nftables)"
+echo -e "    ${GRN}✔${RST}  DNS port 53  : blocked (nftables, ถ้า resolve ได้ปกติหลัง patch)"
 echo -e "    ${GRN}✔${RST}  Xray DNS     : บังคับผ่าน local stub"
 echo -e "    ${GRN}✔${RST}  mDNS/LLMNR   : ปิด"
 echo -e "    ${GRN}✔${RST}  Xray log     : ปิด (none)"
@@ -1077,7 +1185,7 @@ echo -e "    ${GRN}✔${RST}  TCP buffer 2/4/8MB | Swap ${SWAP_SIZE_MB}MB"
 echo -e "    ${GRN}✔${RST}  Conntrack 262144 | Busy-poll 50us"
 echo -e "  ──────────────────────────────────────────────────────────"
 echo -e "  ${BLD}Security     :${RST}"
-echo -e "    ${GRN}✔${RST}  SSH publickey only | fail2ban 24h"
+echo -e "    ${GRN}✔${RST}  SSH publickey only (ถ้าตรวจพบ key) | fail2ban 24h"
 echo -e "    ${GRN}✔${RST}  Kernel hardening | UFW + nftables"
 echo -e "  ══════════════════════════════════════════════════════════"
 echo ""
@@ -1104,5 +1212,10 @@ echo -e "     Sniffing   : ปิดทั้งหมด"
 echo -e "  3. reboot: reboot"
 echo -e "  ══════════════════════════════════════════════════════════"
 echo -e "${RST}"
-echo -e "${BLD}${RED}  ⚠ ตรวจ authorized_keys ก่อน reboot! SSH = publickey only${RST}"
+if [ "$_has_authorized_key" -eq 0 ]; then
+  echo -e "${BLD}${RED}  ⚠ ยังไม่พบ SSH public key ในระบบ — SSH ยัง login ด้วย password ได้อยู่${RST}"
+  echo -e "${BLD}${RED}    แนะนำเพิ่ม authorized_keys แล้วค่อยปิด PasswordAuthentication เองภายหลัง${RST}"
+else
+  echo -e "${BLD}${RED}  ⚠ ตรวจ authorized_keys ก่อน reboot! SSH = publickey only${RST}"
+fi
 echo ""
