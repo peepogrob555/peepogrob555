@@ -2,6 +2,7 @@
 set -uo pipefail
 export LANG=C
 
+main() {
 GRN='\033[0;32m'; YEL='\033[1;33m'; RED='\033[0;31m'; CYN='\033[0;36m'; BLD='\033[1m'; RST='\033[0m'
 
 STATE_DIR="/var/lib/vless-reality-setup"
@@ -15,7 +16,7 @@ warn() { echo -e "  ${YEL}⚠${RST} $1"; }
 info() { echo -e "  ${CYN}ℹ${RST} $1"; }
 die()  { echo -e "\n${RED}${BLD}✘ $1${RST}\n"; exit 1; }
 
-[ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root (sudo bash $0)"
+[ "$(id -u)" -eq 0 ] || die "ต้องรันด้วย root — รันใหม่ด้วย: sudo bash <(curl -Ls 'https://raw.githubusercontent.com/peepogrob555/peepogrob555/refs/heads/main/install.sh')"
 
 SSH_PORT=22
 HTTP_PORT=80
@@ -28,10 +29,10 @@ REALITY_SNI="speedtest.net"
 REALITY_FP="firefox"
 
 BW_MBPS=1000
-RTT_MS=400
-HEADROOM=1.5
-MIN_BUF=1048576
-MAX_BUF=104857600
+RTT_MS=80
+HEADROOM=1.2
+MIN_BUF=2097152
+MAX_BUF=16777216
 
 BDP_BYTES=$(awk -v bw="$BW_MBPS" -v rtt="$RTT_MS" 'BEGIN{printf "%.0f", bw*1000000*rtt/1000/8}')
 BUF_BYTES=$(awk -v b="$BDP_BYTES" -v h="$HEADROOM" 'BEGIN{printf "%.0f", b*h}')
@@ -65,6 +66,51 @@ apt-get autoclean -y
 DEBIAN_FRONTEND=noninteractive apt-get install -y \
   curl ufw nftables sqlite3 unattended-upgrades
 ok "อัปเดตระบบ + แพ็กเกจพื้นฐานเสร็จ"
+
+hdr "STEP 1.5 — SSH: บังคับใช้ Key เท่านั้น (ปิด Password Authentication)"
+SSHD_CONF="/etc/ssh/sshd_config"
+cp -an "$SSHD_CONF" "${SSHD_CONF}.bak.$(date +%s)" 2>/dev/null || true
+
+AUTH_KEYS_OK=0
+for home in /root /home/*; do
+  if [ -s "${home}/.ssh/authorized_keys" ]; then
+    AUTH_KEYS_OK=1
+    break
+  fi
+done
+
+set_sshd_opt() {
+  local key="$1" val="$2"
+  if grep -qiE "^[#[:space:]]*${key}[[:space:]]" "$SSHD_CONF"; then
+    sed -i -E "s|^[#[:space:]]*${key}[[:space:]].*|${key} ${val}|I" "$SSHD_CONF"
+  else
+    echo "${key} ${val}" >> "$SSHD_CONF"
+  fi
+}
+
+if [ "$AUTH_KEYS_OK" -eq 1 ]; then
+  set_sshd_opt "PubkeyAuthentication" "yes"
+  set_sshd_opt "PasswordAuthentication" "no"
+  set_sshd_opt "KbdInteractiveAuthentication" "no"
+  set_sshd_opt "PermitRootLogin" "prohibit-password"
+
+  if [ -d /etc/ssh/sshd_config.d ]; then
+    for f in /etc/ssh/sshd_config.d/*.conf; do
+      [ -f "$f" ] || continue
+      sed -i -E 's|^[#[:space:]]*PasswordAuthentication[[:space:]].*|PasswordAuthentication no|I' "$f"
+      sed -i -E 's|^[#[:space:]]*KbdInteractiveAuthentication[[:space:]].*|KbdInteractiveAuthentication no|I' "$f"
+    done
+  fi
+
+  sshd -t && {
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    ok "บังคับใช้ SSH key เท่านั้น (ปิด password login แล้ว, สำรอง config เดิมไว้ที่ ${SSHD_CONF}.bak.*)"
+  } || warn "sshd_config มีปัญหา syntax — ไม่ restart sshd (เช็คด้วยมือ: sshd -t)"
+else
+  warn "ไม่พบ authorized_keys ในเครื่องนี้เลย — ข้ามการปิด password auth (กันตัวเองล็อกตัวเองออกจาก SSH)"
+  warn "เพิ่ม public key ก่อนด้วย: mkdir -p ~/.ssh && echo 'ssh-ed25519 AAAA...' >> ~/.ssh/authorized_keys && chmod 700 ~/.ssh && chmod 600 ~/.ssh/authorized_keys"
+  warn "แล้วรันสคริปต์นี้ใหม่ทีหลังเพื่อปิด password auth จริง"
+fi
 
 hdr "STEP 2 — Firewall: เปิดพอร์ตที่ใช้จริง (ไม่ไล่ deny ทีละพอร์ต — default-deny ครอบคลุมส่วนที่เหลืออยู่แล้ว)"
 ufw --force reset
@@ -125,6 +171,7 @@ net.core.wmem_max        = ${BUF_BYTES}
 net.ipv4.tcp_rmem        = 4096 87380 ${BUF_BYTES}
 net.ipv4.tcp_wmem        = 4096 65536 ${BUF_BYTES}
 net.ipv4.tcp_moderate_rcvbuf = 1
+net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_fastopen    = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_slow_start_after_idle = 0
@@ -332,3 +379,7 @@ echo ""
 echo -e "${RED}${BLD}  ⚠ ตรวจการเข้าถึง SSH ของคุณให้แน่ใจก่อน reboot${RST}"
 echo -e "  Install log: ${LOG_FILE}"
 echo ""
+
+}
+
+main "$@"
