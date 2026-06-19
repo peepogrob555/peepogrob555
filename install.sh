@@ -206,8 +206,8 @@ cat > /etc/nftables-udp-inbound.conf << 'UDPINEOF'
 table inet udp_inbound {
   chain input_udp {
     type filter hook input priority -1; policy accept;
-    udp ct state established,related accept
-    udp ct state new drop
+    meta l4proto udp ct state established,related accept
+    meta l4proto udp ct state new drop
   }
 }
 UDPINEOF
