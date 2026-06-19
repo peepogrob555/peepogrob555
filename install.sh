@@ -284,7 +284,15 @@ LLMNR=no
 EOF
 systemctl enable --now systemd-resolved 2>/dev/null || true
 systemctl restart systemd-resolved
-ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null || true
+sleep 2
+
+# บังคับ resolv.conf ให้ชี้ไป stub ของ resolved จริง ๆ — ถ้ามี immutable attr หรือไฟล์เดิมเป็น hard target ให้ลบทิ้งก่อนแล้วค่อย symlink ใหม่
+chattr -i /etc/resolv.conf 2>/dev/null || true
+rm -f /etc/resolv.conf
+ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf
+if [ ! -L /etc/resolv.conf ] || [ "$(readlink /etc/resolv.conf)" != "/run/systemd/resolve/stub-resolv.conf" ]; then
+  warn "symlink /etc/resolv.conf ไม่สำเร็จ — บางระบบ (cloud-init/NetworkManager) คุม resolv.conf เอง"
+fi
 ok "DNS → 1.1.1.1 ผ่าน DoT + Domains=~. กัน leak จาก DHCP"
 
 # ปิด DNS ที่ DHCP ดึงมาเอง (per-link) ไม่งั้นจะมี DNS server แถมเข้ามา (เช่น 8.8.8.8) ทับ global DNS (1.1.1.1)
@@ -317,6 +325,46 @@ if [ "$NETPLAN_CHANGED" -eq 1 ]; then
 else
   info "ไม่พบ netplan config ที่ต้องแก้ หรือปิด use-dns ไว้แล้ว"
 fi
+
+# ชั้นป้องกันเพิ่ม: บางเครื่อง (renderer ไม่ใช่ networkd, หรือ provider ดัน DNS ผ่าน DHCP แบบที่ netplan
+# use-dns ไม่ครอบ) จะมี per-link DNS (เช่น 8.8.8.8 จาก ISP) โผล่ใน `resolvectl status` แข่งกับ global
+# เคลียร์ DNS/domain ระดับ link ออกตรง ๆ ด้วย resolvectl ทุกครั้งที่ boot/network เปลี่ยน เพื่อบังคับให้ใช้ global (1.1.1.1) เท่านั้น
+cat > /usr/local/sbin/clear-link-dns.sh << 'CLEAREOF'
+#!/usr/bin/env bash
+for link in $(networkctl list --no-legend 2>/dev/null | awk '{print $2}'); do
+  [ "$link" = "lo" ] && continue
+  resolvectl dns "$link" "" 2>/dev/null
+  resolvectl domain "$link" "" 2>/dev/null
+done
+CLEAREOF
+chmod +x /usr/local/sbin/clear-link-dns.sh
+/usr/local/sbin/clear-link-dns.sh
+
+cat > /etc/systemd/system/clear-link-dns.service << 'EOF'
+[Unit]
+Description=Clear per-link DNS to force global DoT resolver only
+After=network-online.target systemd-resolved.service
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/clear-link-dns.sh
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now clear-link-dns.service
+
+# NetworkManager dispatcher hook (เผื่อ renderer เป็น NetworkManager แทน networkd — DNS จะถูก DHCP เซ็ตใหม่ทุกครั้งที่ renew)
+if command -v nmcli &>/dev/null && [ -d /etc/NetworkManager/dispatcher.d ]; then
+  cat > /etc/NetworkManager/dispatcher.d/99-clear-dns << 'EOF'
+#!/usr/bin/env bash
+/usr/local/sbin/clear-link-dns.sh
+EOF
+  chmod +x /etc/NetworkManager/dispatcher.d/99-clear-dns
+  ok "ติดตั้ง NetworkManager dispatcher hook กัน DNS leak ตอน renew DHCP"
+fi
+ok "เคลียร์ per-link DNS แล้ว (กัน DNS อื่นเช่น 8.8.8.8 จาก ISP แข่งกับ global 1.1.1.1) + ตั้งให้รันซ้ำทุก boot/renew"
 
 cat > /etc/nftables-dns-block.conf << 'EOF'
 table inet dns_privacy {
@@ -365,7 +413,16 @@ chk() {
 chk "BBR/${CC} congestion control"        "[ \"\$(sysctl -n net.ipv4.tcp_congestion_control)\" = '${CC}' ]"
 chk "Buffer ceiling = ${BUF_BYTES}"       "[ \"\$(sysctl -n net.core.rmem_max)\" = '${BUF_BYTES}' ]"
 chk "IPv6 ปิดสมบูรณ์"                      "[ \"\$(sysctl -n net.ipv6.conf.all.disable_ipv6)\" = '1' ]"
-chk "DNS ชี้ไป 1.1.1.1"                    "resolvectl status 2>/dev/null | grep -q '1.1.1.1'"
+check_dns_global() {
+  for i in 1 2 3 4 5; do
+    if resolvectl status 2>/dev/null | grep -q '1\.1\.1\.1'; then return 0; fi
+    if grep -q '1\.1\.1\.1\|127\.0\.0\.53' /etc/resolv.conf 2>/dev/null; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+chk "DNS ชี้ไป 1.1.1.1"                    "check_dns_global"
+chk "ไม่มี per-link DNS แข่งกับ global"      "! resolvectl status 2>/dev/null | grep -A2 '^Link' | grep -qE 'DNS Servers:.*[0-9]' "
 chk "Port ${HTTP_PORT}/tcp เปิดใน UFW"     "ufw status | grep -qE '^${HTTP_PORT}/tcp'"
 chk "Port ${REALITY_PORT}/tcp เปิดใน UFW"  "ufw status | grep -qE '^${REALITY_PORT}/tcp'"
 chk "Port ${PANEL_PORT}/tcp เปิดใน UFW"    "ufw status | grep -qE '^${PANEL_PORT}/tcp'"
