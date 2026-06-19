@@ -118,23 +118,13 @@ ufw default deny incoming
 ufw default allow outgoing
 ufw default deny forward
 
-ufw_allow() {
-  local port="$1" comment="$2"
-  if ! ufw allow "${port}/tcp" comment "$comment" 2>&1 | tee /tmp/ufw_last.log | grep -qE "^(Rule|Skipping)"; then
-    if grep -qi "invalid syntax" /tmp/ufw_last.log; then
-      warn "ufw comment มีปัญหา syntax สำหรับพอร์ต ${port} — ลองใหม่แบบไม่มี comment"
-      ufw allow "${port}/tcp"
-    fi
-  fi
-}
-
-ufw_allow "${SSH_PORT}" "SSH"
-ufw_allow "${HTTP_PORT}" "HTTP - ACME and Cloudflare"
-ufw_allow "${REALITY_PORT}" "VLESS Reality and Cloudflare HTTPS"
-ufw_allow "${PANEL_PORT}" "3x-ui Panel and Cloudflare HTTPS"
+ufw allow ${SSH_PORT}/tcp
+ufw allow ${HTTP_PORT}/tcp
+ufw allow ${REALITY_PORT}/tcp
+ufw allow ${PANEL_PORT}/tcp
 
 for p in "${CF_PORTS[@]}"; do
-  ufw_allow "${p}" "Cloudflare proxy"
+  ufw allow ${p}/tcp
 done
 
 sed -i 's/^IPV6=yes/IPV6=no/' /etc/default/ufw 2>/dev/null || true
