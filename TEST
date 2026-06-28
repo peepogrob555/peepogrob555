@@ -1,0 +1,762 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Block Puzzle Helper</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@500;700&display=swap');
+:root{
+  --bg:#07070e;--s1:#0d0d1a;--s2:#111120;
+  --b1:#1a1a2e;--b2:#252540;
+  --txt:#e2e8f8;--sub:#4a5080;--sub2:#7080aa;
+  --A:#a78bfa;--Ag:#a78bfa1a;--Ab:#4c1d95;
+  --B:#2dd4bf;--Bg:#2dd4bf1a;--Bb:#0f4c44;
+  --C:#fb923c;--Cg:#fb923c1a;--Cb:#7c2d12;
+  --gold:#fbbf24;--red:#f87171;--green:#4ade80;
+  --cs:clamp(29px,8.2vw,39px);
+  --ps:clamp(11px,2.8vw,14px);
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html{scroll-behavior:smooth}
+body{background:var(--bg);color:var(--txt);font-family:'Inter',system-ui,sans-serif;min-height:100dvh;display:flex;flex-direction:column;align-items:center;overflow-x:hidden}
+.page{width:100%;max-width:480px;display:flex;flex-direction:column;align-items:center;padding-bottom:60px}
+
+/* ── HDR ── */
+.hdr{width:100%;padding:12px 15px 10px;display:flex;align-items:center;justify-content:space-between;
+  border-bottom:1px solid var(--b1);background:rgba(7,7,14,.85);
+  position:sticky;top:0;z-index:60;backdrop-filter:blur(16px)}
+.logo{font-size:13px;font-weight:900;letter-spacing:3px;text-transform:uppercase;
+  background:linear-gradient(90deg,var(--A),var(--B));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.logo-sub{font-size:8px;letter-spacing:2px;color:var(--sub2);margin-top:1px;text-transform:uppercase}
+.hbtn{width:28px;height:28px;border-radius:50%;border:1px solid var(--b2);background:var(--s1);
+  color:var(--sub2);font-size:12px;cursor:pointer;display:flex;align-items:center;justify-content:center;
+  transition:border-color .2s,color .2s}
+.hbtn:hover{border-color:var(--A);color:var(--A)}
+
+/* ── SEC ── */
+.sec{width:100%;padding:10px 15px 3px;font-size:8.5px;letter-spacing:2.5px;color:var(--sub2);
+  text-transform:uppercase;display:flex;align-items:center;gap:8px}
+.sec::after{content:'';flex:1;height:1px;background:var(--b1)}
+
+/* ── MAIN BOARD ── */
+.bwrap{padding:0 11px;width:100%}
+.board{display:grid;grid-template-columns:repeat(8,var(--cs));grid-template-rows:repeat(8,var(--cs));
+  gap:2px;background:var(--s1);border:1px solid var(--b2);border-radius:14px;
+  padding:7px;width:fit-content;margin:0 auto;touch-action:none;user-select:none}
+.cell{border-radius:4px;background:#0b0b1c;cursor:pointer;position:relative;overflow:hidden;transition:background .05s}
+.cell.filled{background:#22c55e40;box-shadow:inset 0 1px 0 #4ade8030}
+.cell.filled::after{content:'';position:absolute;left:2px;right:2px;top:2px;height:36%;
+  background:rgba(255,255,255,.1);border-radius:2px 2px 0 0;pointer-events:none}
+
+/* ── TRAY ── */
+.tray{display:flex;gap:6px;padding:5px 11px;width:100%}
+.slot{flex:1;background:var(--s1);border:2px solid var(--b2);border-radius:13px;
+  display:flex;flex-direction:column;align-items:center;gap:5px;padding:8px 3px 7px;
+  cursor:pointer;transition:border-color .15s,transform .12s,box-shadow .15s;
+  min-height:88px;position:relative;user-select:none}
+.slot.sA{border-color:var(--A)!important;box-shadow:0 0 0 1px var(--A),0 5px 16px var(--Ag);transform:translateY(-2px)}
+.slot.sB{border-color:var(--B)!important;box-shadow:0 0 0 1px var(--B),0 5px 16px var(--Bg);transform:translateY(-2px)}
+.slot.sC{border-color:var(--C)!important;box-shadow:0 0 0 1px var(--C),0 5px 16px var(--Cg);transform:translateY(-2px)}
+.slot-lbl{font-size:8.5px;letter-spacing:2px;color:var(--sub2);font-weight:800;text-transform:uppercase}
+.pgrid{display:grid;grid-template-columns:repeat(5,var(--ps));grid-template-rows:repeat(5,var(--ps));gap:2px;touch-action:none;user-select:none}
+.pc{border-radius:2px;background:#0e0e22;cursor:pointer;transition:background .05s}
+.pc.onA{background:var(--A)} .pc.onB{background:var(--B)} .pc.onC{background:var(--C)}
+
+/* ── AI STATUS ── */
+.airow{width:100%;padding:3px 13px 1px;display:flex;align-items:center;gap:7px;font-size:10px;color:var(--sub2);min-height:22px}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--b2);flex-shrink:0;transition:background .3s}
+.dot.thinking{background:var(--A);animation:blink .8s infinite}
+.dot.ok{background:var(--green)}
+.dot.warn{background:var(--gold)}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.15}}
+
+/* ── SCORE STRIP ── */
+.sstrip{display:flex;gap:5px;padding:3px 11px 0;width:100%}
+.sbox{flex:1;background:var(--s1);border:1px solid var(--b1);border-radius:9px;padding:7px 6px;text-align:center}
+.sv{font-family:'JetBrains Mono',monospace;font-size:15px;font-weight:700}
+.sl{font-size:7.5px;letter-spacing:1.5px;color:var(--sub2);text-transform:uppercase;margin-top:2px}
+
+/* ── BTN ROW ── */
+.btnrow{display:flex;gap:6px;padding:5px 11px;width:100%}
+.btn{flex:1;padding:12px 0;border:none;border-radius:10px;font-family:'Inter',sans-serif;
+  font-size:12px;font-weight:800;cursor:pointer;transition:opacity .15s,transform .1s;letter-spacing:.8px;text-transform:uppercase}
+.btn:active{transform:scale(.95);opacity:.8}
+.btn-g{background:transparent;border:1px solid var(--b2);color:var(--sub2)}
+.btn-ai{flex:2;background:linear-gradient(135deg,#4f46e5,#7c3aed,#a21caf);color:#fff;font-size:13px;
+  box-shadow:0 4px 20px #4f46e544}
+.btn-ai:disabled{opacity:.3;pointer-events:none}
+.btn-p{background:#0e1a0a;border:1px solid #1a3a10;color:var(--green);font-size:11px}
+
+/* ── RESULT CARDS ── */
+.res-sec{display:none;width:100%;padding:10px 15px 3px;font-size:8.5px;letter-spacing:2.5px;
+  color:var(--sub2);text-transform:uppercase;align-items:center;gap:8px}
+.res-sec::after{content:'';flex:1;height:1px;background:var(--b1)}
+.results{display:flex;flex-direction:column;gap:9px;padding:3px 11px 0;width:100%}
+.rcard{background:var(--s1);border:1px solid var(--b2);border-radius:14px;overflow:hidden;
+  opacity:0;transform:translateY(12px);transition:opacity .35s,transform .35s}
+.rcard.show{opacity:1;transform:none}
+.rcard.cA{border-color:var(--Ab)} .rcard.cB{border-color:var(--Bb)} .rcard.cC{border-color:var(--Cb)}
+.rhdr{display:flex;align-items:center;gap:7px;padding:9px 12px;border-bottom:1px solid var(--b1)}
+.rnum{width:20px;height:20px;border-radius:5px;display:flex;align-items:center;justify-content:center;
+  font-size:10px;font-weight:900;flex-shrink:0}
+.nA{background:var(--A);color:#1a0540} .nB{background:var(--B);color:#011a16} .nC{background:var(--C);color:#1a0800}
+.rtitle{font-size:12px;font-weight:700;flex:1}
+.rbadge{font-size:8px;font-weight:800;padding:2px 7px;border-radius:99px;border:1px solid currentColor;white-space:nowrap}
+.bc{color:var(--gold)} .bo{color:var(--sub2)}
+.rbody{display:flex;gap:9px;padding:9px 10px 11px;align-items:flex-start}
+.mboard{display:grid;grid-template-columns:repeat(8,13px);grid-template-rows:repeat(8,13px);
+  gap:1px;background:#08081a;border-radius:7px;padding:3px;border:1px solid var(--b1);flex-shrink:0}
+.mc{border-radius:1px;background:#0e0e22}
+.mf{background:#22c55e38}
+.mA{background:var(--A)} .mB{background:var(--B)} .mC{background:var(--C)}
+.mx{background:var(--gold);animation:cpop .5s ease-out}
+@keyframes cpop{0%{transform:scale(1.5);opacity:.6}100%{transform:scale(1);opacity:1}}
+.rinfo{flex:1;display:flex;flex-direction:column;gap:6px;min-width:75px}
+.rcoord{font-family:'JetBrains Mono',monospace;font-size:12px;background:var(--s2);border-radius:7px;padding:5px 8px;line-height:1.75}
+.rcoord span{color:var(--sub2);font-size:9px}
+.rsrow{display:flex;gap:4px}
+.rsbox{flex:1;background:var(--s2);border-radius:7px;padding:5px 4px;text-align:center}
+.rsbox .v{font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700}
+.rsbox .l{font-size:7px;color:var(--sub2);letter-spacing:.8px;text-transform:uppercase;margin-top:1px}
+.rclear{font-size:9px;color:var(--gold);background:#17110000;border:1px solid #3a2a00;border-radius:6px;padding:4px 7px;line-height:1.6}
+/* combo indicator */
+.combo-bar{display:flex;gap:3px;align-items:center;padding:0 12px 8px}
+.combo-seg{height:4px;border-radius:2px;flex:1;background:var(--b1);transition:background .3s}
+.combo-seg.lit{background:var(--gold)}
+.combo-label{font-size:9px;color:var(--gold);font-weight:700;letter-spacing:1px;white-space:nowrap}
+
+/* ── NEXT ROUND ── */
+.nextwrap{width:100%;padding:8px 11px 2px;display:none}
+.btn-next{width:100%;padding:14px;border:none;border-radius:12px;
+  background:linear-gradient(135deg,#12190a,#1e2e0e);
+  border:1px solid #2a4a18;color:var(--green);
+  font-size:14px;font-weight:900;font-family:'Inter',sans-serif;cursor:pointer;
+  letter-spacing:1px;display:flex;align-items:center;justify-content:center;gap:8px;
+  transition:opacity .15s,transform .1s,box-shadow .2s;
+  box-shadow:0 0 0 0 #4ade8000}
+.btn-next:hover{box-shadow:0 0 18px #4ade8030;transform:translateY(-1px)}
+.btn-next:active{transform:scale(.97)}
+
+/* ── LOOKAHEAD INSIGHT ── */
+.insight{background:var(--s2);border:1px solid var(--b2);border-radius:10px;
+  margin:4px 11px 0;padding:8px 11px;font-size:10px;line-height:1.65;color:var(--sub2);display:none}
+.insight strong{color:var(--txt)}
+.insight .hi{color:var(--gold);font-weight:700}
+
+/* ── HELP ── */
+.ov{display:none;position:fixed;inset:0;background:#000b;z-index:99;align-items:center;justify-content:center;backdrop-filter:blur(6px)}
+.ov.show{display:flex}
+.hcard{background:var(--s1);border:1px solid var(--b2);border-radius:18px;padding:22px 18px;max-width:300px;width:90vw}
+.hcard h3{color:var(--A);margin-bottom:11px;font-size:15px;font-weight:900}
+.hcard p{font-size:11px;color:#8899bb;line-height:1.75;margin-bottom:7px}
+.hcard p strong{color:var(--txt)}
+.hcard button{margin-top:10px;width:100%;padding:12px;background:linear-gradient(135deg,var(--A),var(--B));
+  border:none;border-radius:9px;color:#fff;font-weight:900;font-size:13px;cursor:pointer;font-family:'Inter',sans-serif}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="hdr">
+  <div><div class="logo">Block Helper</div><div class="logo-sub">Combo AI · v3</div></div>
+  <button class="hbtn" onclick="document.getElementById('hlp').classList.add('show')">?</button>
+</div>
+
+<!-- score strip (hidden until result) -->
+<div class="sstrip" id="sstrip" style="visibility:hidden">
+  <div class="sbox"><div class="sv" id="scL" style="color:var(--gold)">—</div><div class="sl">แถวลบ</div></div>
+  <div class="sbox"><div class="sv" id="scC" style="color:var(--A)">—</div><div class="sl">คะแนน</div></div>
+  <div class="sbox"><div class="sv" id="scO" style="color:var(--B)">—</div><div class="sl">ลำดับ</div></div>
+  <div class="sbox"><div class="sv" id="scS" style="color:var(--green)">—</div><div class="sl">setup</div></div>
+</div>
+
+<div class="sec">ตาราง 8×8 — แตะ/ลากวาด</div>
+<div class="bwrap"><div class="board" id="mainBoard"></div></div>
+<div class="airow"><div class="dot" id="dot"></div><span id="aiMsg">วาดตาราง + ชิ้นส่วน แล้วกด วิเคราะห์</span></div>
+
+<div class="sec">ชิ้นส่วน — แตะ/ลากในตาราง 5×5 ของแต่ละชิ้น</div>
+<div class="tray">
+  <div class="slot" id="slot0" onclick="pickSlot(0)">
+    <div class="slot-lbl">A</div><div class="pgrid" id="pg0"></div>
+  </div>
+  <div class="slot" id="slot1" onclick="pickSlot(1)">
+    <div class="slot-lbl">B</div><div class="pgrid" id="pg1"></div>
+  </div>
+  <div class="slot" id="slot2" onclick="pickSlot(2)">
+    <div class="slot-lbl">C</div><div class="pgrid" id="pg2"></div>
+  </div>
+</div>
+
+<div class="btnrow">
+  <button class="btn btn-g" onclick="clearBoard()" style="flex:.5">ล้าง</button>
+  <button class="btn btn-ai" id="btnAI" onclick="runAI()">✦ วิเคราะห์ AI</button>
+  <button class="btn btn-g" onclick="resetPieces()" style="flex:.65;color:#f472b6;border-color:#4c1d33">ล้างชิ้น</button>
+</div>
+
+<!-- combo bar -->
+<div class="combo-bar" id="comboBar" style="display:none">
+  <div class="combo-seg" id="cs0"></div>
+  <div class="combo-seg" id="cs1"></div>
+  <div class="combo-seg" id="cs2"></div>
+  <div class="combo-seg" id="cs3"></div>
+  <div class="combo-seg" id="cs4"></div>
+  <div class="combo-seg" id="cs5"></div>
+  <span class="combo-label" id="comboLbl"></span>
+</div>
+
+<!-- insight box -->
+<div class="insight" id="insight"></div>
+
+<!-- result cards -->
+<div class="res-sec" id="resSec">แนะนำลำดับวาง</div>
+<div class="results" id="results"></div>
+
+<!-- next round -->
+<div class="nextwrap" id="nextwrap">
+  <button class="btn-next" onclick="nextRound()">
+    ✓ รอบถัดไป — ใช้ตารางที่แก้แล้วอัตโนมัติ &nbsp;→
+  </button>
+</div>
+
+<!-- help -->
+<div class="ov" id="hlp">
+  <div class="hcard">
+    <h3>🧩 วิธีใช้</h3>
+    <p><strong>1. วาดตาราง 8×8</strong> — แตะ/ลากช่องให้ตรงกับสถานะเกมจริง</p>
+    <p><strong>2. วาดชิ้น A / B / C</strong> — แตะ/ลากในตาราง 5×5 ของแต่ละสล็อต รองรับชิ้นยาว 5 บล็อก</p>
+    <p><strong>3. กด วิเคราะห์ AI</strong> — AI คิดทีละ 3 ชิ้น ลองทุกลำดับ ทุกตำแหน่ง เน้น combo ต่อเนื่อง</p>
+    <p><strong>4. ดู 3 ตารางด้านล่าง</strong> — แต่ละตารางบอกตำแหน่งวาง + แถวที่ถูกลบ</p>
+    <p><strong>5. กด รอบถัดไป</strong> — ตาราง 8×8 อัปเดตอัตโนมัติ ไม่ต้องวาดใหม่</p>
+    <button onclick="document.getElementById('hlp').classList.remove('show')">เข้าใจแล้ว!</button>
+  </div>
+</div>
+</div>
+
+<script>
+// ═══════════════════════════════════════
+// CONSTANTS & STATE
+// ═══════════════════════════════════════
+const G=8, P=5;
+const NAMES=['A','B','C'], CLS=['A','B','C'];
+const COLORS=['var(--A)','var(--B)','var(--C)'];
+
+let board    = mk(G,G,0);
+let pieces   = [mk(P,P,0), mk(P,P,0), mk(P,P,0)];
+let lastFinalBoard = null;
+
+// drag
+let dragging=false, dragTarget=null, dragVal=null;
+
+function mk(r,c,v){ return Array.from({length:r},()=>Array(c).fill(v)); }
+function cloneBoard(b){ return b.map(x=>[...x]); }
+
+// ═══════════════════════════════════════
+// MAIN BOARD
+// ═══════════════════════════════════════
+function buildBoard(){
+  const el=document.getElementById('mainBoard');
+  el.innerHTML='';
+  for(let r=0;r<G;r++) for(let c=0;c<G;c++){
+    const d=document.createElement('div');
+    d.className='cell'+(board[r][c]?' filled':'');
+    d.dataset.r=r; d.dataset.c=c;
+    d.addEventListener('pointerdown',e=>{e.preventDefault();startDrag('B',r,c);},{passive:false});
+    d.addEventListener('pointerenter',()=>{if(dragging&&dragTarget==='B')paintBoard(r,c);});
+    el.appendChild(d);
+  }
+}
+function refreshBoard(){
+  document.querySelectorAll('#mainBoard .cell').forEach(d=>{
+    const r=+d.dataset.r,c=+d.dataset.c;
+    d.className='cell'+(board[r][c]?' filled':'');
+  });
+}
+function paintBoard(r,c){
+  if(board[r][c]===dragVal)return;
+  board[r][c]=dragVal;
+  const d=document.querySelector(`#mainBoard [data-r="${r}"][data-c="${c}"]`);
+  if(d) d.className='cell'+(board[r][c]?' filled':'');
+  clearResultUI();
+}
+
+// ═══════════════════════════════════════
+// PIECE GRIDS (5×5)
+// ═══════════════════════════════════════
+function buildPieceGrid(i){
+  const el=document.getElementById('pg'+i);
+  el.innerHTML='';
+  for(let r=0;r<P;r++) for(let c=0;c<P;c++){
+    const d=document.createElement('div');
+    d.className='pc'+(pieces[i][r][c]?' on'+CLS[i]:'');
+    d.dataset.r=r; d.dataset.c=c; d.dataset.pi=i;
+    d.addEventListener('pointerdown',e=>{e.preventDefault();startDrag('P'+i,r,c,i);},{passive:false});
+    d.addEventListener('pointerenter',()=>{if(dragging&&dragTarget==='P'+i)paintPiece(i,r,c);});
+    el.appendChild(d);
+  }
+}
+function refreshPieceGrid(i){
+  document.querySelectorAll(`#pg${i} .pc`).forEach(d=>{
+    const r=+d.dataset.r,c=+d.dataset.c;
+    d.className='pc'+(pieces[i][r][c]?' on'+CLS[i]:'');
+  });
+}
+function paintPiece(i,r,c){
+  if(pieces[i][r][c]===dragVal)return;
+  pieces[i][r][c]=dragVal;
+  const d=document.querySelector(`#pg${i} [data-r="${r}"][data-c="${c}"]`);
+  if(d) d.className='pc'+(pieces[i][r][c]?' on'+CLS[i]:'');
+  clearResultUI();
+}
+
+// ═══════════════════════════════════════
+// DRAG ENGINE
+// ═══════════════════════════════════════
+function startDrag(target,r,c,pi){
+  dragging=true; dragTarget=target;
+  if(target==='B'){ dragVal=board[r][c]?0:1; paintBoard(r,c); }
+  else            { dragVal=pieces[pi][r][c]?0:1; paintPiece(pi,r,c); }
+}
+function endDrag(){ dragging=false; dragTarget=null; dragVal=null; }
+document.addEventListener('pointerup',endDrag);
+document.addEventListener('touchend',endDrag);
+
+// Slot tap just highlights (drawing is always in 5×5)
+let selSlot=-1;
+function pickSlot(i){
+  selSlot=selSlot===i?-1:i;
+  document.querySelectorAll('.slot').forEach((s,j)=>{
+    s.className='slot'; if(j===selSlot) s.classList.add('s'+CLS[j]);
+  });
+}
+
+// ═══════════════════════════════════════
+// PIECE UTILS
+// ═══════════════════════════════════════
+function trimPiece(p){
+  let r0=P,c0=P,r1=-1,c1=-1,any=false;
+  for(let r=0;r<P;r++) for(let c=0;c<P;c++) if(p[r][c]){
+    any=true; r0=Math.min(r0,r); c0=Math.min(c0,c);
+    r1=Math.max(r1,r); c1=Math.max(c1,c);
+  }
+  if(!any) return null;
+  return p.slice(r0,r1+1).map(row=>row.slice(c0,c1+1));
+}
+function occupied(piece,r,c){
+  const out=[];
+  piece.forEach((row,dr)=>row.forEach((v,dc)=>{if(v)out.push([r+dr,c+dc]);}));
+  return out;
+}
+function canPlace(piece,r,c,b){
+  return piece.every((row,dr)=>row.every((v,dc)=>{
+    if(!v)return true;
+    const nr=r+dr,nc=c+dc;
+    return nr>=0&&nc>=0&&nr<G&&nc<G&&!b[nr][nc];
+  }));
+}
+function applyPlace(b,piece,r,c){
+  const nb=cloneBoard(b);
+  piece.forEach((row,dr)=>row.forEach((v,dc)=>{if(v)nb[r+dr][c+dc]=1;}));
+  return nb;
+}
+function clearLines(b){
+  const nb=cloneBoard(b),cR=[],cC=[];
+  for(let i=0;i<G;i++){
+    if(nb[i].every(v=>v))cR.push(i);
+    if(nb.every(row=>row[i]))cC.push(i);
+  }
+  cR.forEach(r=>{for(let c=0;c<G;c++)nb[r][c]=0;});
+  cC.forEach(c=>{for(let r=0;r<G;r++)nb[r][c]=0;});
+  return{nb,cR,cC};
+}
+function countFilled(b){ return b.reduce((s,row)=>s+row.reduce((a,v)=>a+v,0),0); }
+
+// ═══════════════════════════════════════
+// EVALUATION — combo-focused heuristic
+// ═══════════════════════════════════════
+/*
+  Philosophy: Prioritize in order:
+  1. Lines cleared NOW (cascade bonus for multi-line)
+  2. Lines set up (near-complete rows/cols = future clears)
+  3. Open contiguous space (flexibility for future pieces)
+  4. Penalise trapped holes (impossible to clear)
+*/
+function evalBoard(b, clearedNow=0){
+  let score=0;
+  const rf=Array(G).fill(0), cf=Array(G).fill(0);
+  for(let r=0;r<G;r++) for(let c=0;c<G;c++){
+    if(b[r][c]){rf[r]++;cf[c]++;}
+  }
+
+  // 1. Lines cleared — exponential cascade bonus
+  // (already added externally as clearedNow*CASCADE_BONUS, but also count setup)
+
+  // 2. Near-complete line setup — this is the CORE of combo prediction
+  let setupScore=0, linesReady=0;
+  for(let i=0;i<G;i++){
+    setupScore+=lineSetupBonus(rf[i]);
+    setupScore+=lineSetupBonus(cf[i]);
+    if(rf[i]>=7)linesReady++;
+    if(cf[i]>=7)linesReady++;
+  }
+  score+=setupScore;
+
+  // 3. Trapped holes — heavy penalty (they block future clears)
+  let holes=0;
+  for(let r=0;r<G;r++) for(let c=0;c<G;c++){
+    if(b[r][c])continue;
+    const walls=[[r-1,c],[r+1,c],[r,c-1],[r,c+1]]
+      .filter(([nr,nc])=>nr<0||nc<0||nr>=G||nc>=G||b[nr][nc]).length;
+    if(walls>=3){holes++;score-=80;}
+    else if(walls===2){holes+=.5;score-=20;}
+  }
+
+  // 4. Openness (fewer filled = more options)
+  const filled=countFilled(b);
+  score-=filled*2.5;
+
+  // 5. Connectivity bonus — reward compact blocks (easier to clear)
+  // penalise checkerboard-like dispersion
+  let checkers=0;
+  for(let r=0;r<G-1;r++) for(let c=0;c<G-1;c++){
+    const s=b[r][c]+b[r+1][c]+b[r][c+1]+b[r+1][c+1];
+    if(s===1||s===3)checkers++;
+  }
+  score-=checkers*3;
+
+  return{score, linesReady, holes};
+}
+
+function lineSetupBonus(n){
+  // Exponential: getting close to 8 is worth much more than linearly
+  if(n>=8)return 1200; // shouldn't happen here (already cleared)
+  if(n===7)return 500; // one piece away from clearing!
+  if(n===6)return 140;
+  if(n===5)return 35;
+  if(n===4)return 8;
+  return 0;
+}
+
+// ═══════════════════════════════════════
+// PERMUTATIONS
+// ═══════════════════════════════════════
+function permutations(arr){
+  if(arr.length<=1)return[arr];
+  const out=[];
+  arr.forEach((v,i)=>{
+    permutations([...arr.slice(0,i),...arr.slice(i+1)]).forEach(p=>out.push([v,...p]));
+  });
+  return out;
+}
+
+// ═══════════════════════════════════════
+// AI CORE — 3-piece exhaustive beam search
+// ═══════════════════════════════════════
+/*
+  Algorithm:
+  For each permutation of available pieces (up to 6):
+    Step 1: Find top-K candidate positions for piece[0] on current board
+    Step 2: For each candidate, find top-K positions for piece[1] on resulting board
+    Step 3: For each combo, find best position for piece[2] on resulting board
+    Step 4: Score FINAL board (after all 3 placed + clears) with combo-weighted score
+  
+  Scoring: cleared_lines^1.5 * 800 + setup_bonus + board_eval
+  This super-exponentially rewards clearing multiple lines per sequence.
+*/
+const K1=25, K2=20, K3=64; // candidates per depth (K3=all for final piece)
+
+function scoreSequence(steps, finalBoard, totalCleared){
+  // Super-exponential reward for clearing multiple lines
+  const comboMultiplier = totalCleared<=0 ? 1 : Math.pow(totalCleared,1.6);
+  const clearBonus = comboMultiplier * 850;
+  const {score:boardScore, linesReady} = evalBoard(finalBoard, totalCleared);
+  const setupBonus = linesReady * 200; // bonus for future combos
+  return clearBonus + boardScore + setupBonus;
+}
+
+function topCandidates(b, piece, K){
+  const all=[];
+  for(let r=0;r<G;r++) for(let c=0;c<G;c++){
+    if(!canPlace(piece,r,c,b))continue;
+    const nb=applyPlace(b,piece,r,c);
+    const{nb:nc,cR,cC}=clearLines(nb);
+    const cleared=cR.length+cC.length;
+    const{score}=evalBoard(nc,cleared);
+    all.push({r,c,nb:nc,cleared,cR,cC,score:score+cleared*700});
+  }
+  all.sort((a,z)=>z.score-a.score);
+  return all.slice(0,K);
+}
+
+function runAI(){
+  const avail=[0,1,2].filter(i=>trimPiece(pieces[i]));
+  if(!avail.length){setStatus('วาดชิ้นส่วนก่อนอย่างน้อย 1 ชิ้น','');return;}
+
+  setStatus('⏳ กำลังวิเคราะห์ทุกลำดับ...','thinking');
+  document.getElementById('btnAI').disabled=true;
+
+  // Use setTimeout so UI can update first
+  setTimeout(()=>{
+    const trimmed=pieces.map(p=>trimPiece(p));
+    const allPerms=permutations(avail);
+
+    let bestTotal=-Infinity, bestSeq=null, bestTotalCleared=0, bestFinal=null;
+
+    for(const perm of allPerms){
+      const ps=perm.map(i=>trimmed[i]).filter(Boolean);
+      if(ps.length!==perm.length)continue;
+
+      // Depth 1
+      const d1cands=topCandidates(board, ps[0], K1);
+
+      for(const d1 of d1cands){
+        if(perm.length===1){
+          // Only 1 piece available
+          const total=scoreSequence([{pi:perm[0],r:d1.r,c:d1.c,cR:d1.cR,cC:d1.cC}],
+            d1.nb, d1.cleared);
+          if(total>bestTotal){
+            bestTotal=total; bestTotalCleared=d1.cleared; bestFinal=d1.nb;
+            bestSeq=[{pi:perm[0],r:d1.r,c:d1.c,cR:d1.cR,cC:d1.cC}];
+          }
+          continue;
+        }
+
+        // Depth 2
+        const d2cands=topCandidates(d1.nb, ps[1], K2);
+
+        for(const d2 of d2cands){
+          if(perm.length===2){
+            const tc=d1.cleared+d2.cleared;
+            const total=scoreSequence(
+              [{pi:perm[0],r:d1.r,c:d1.c,cR:d1.cR,cC:d1.cC},
+               {pi:perm[1],r:d2.r,c:d2.c,cR:d2.cR,cC:d2.cC}],
+              d2.nb, tc);
+            if(total>bestTotal){
+              bestTotal=total; bestTotalCleared=tc; bestFinal=d2.nb;
+              bestSeq=[{pi:perm[0],r:d1.r,c:d1.c,cR:d1.cR,cC:d1.cC},
+                       {pi:perm[1],r:d2.r,c:d2.c,cR:d2.cR,cC:d2.cC}];
+            }
+            continue;
+          }
+
+          // Depth 3 — try ALL positions for last piece (maximize final result)
+          const d3cands=topCandidates(d2.nb, ps[2], K3);
+          for(const d3 of d3cands){
+            const tc=d1.cleared+d2.cleared+d3.cleared;
+            const total=scoreSequence(
+              [{pi:perm[0],r:d1.r,c:d1.c,cR:d1.cR,cC:d1.cC},
+               {pi:perm[1],r:d2.r,c:d2.c,cR:d2.cR,cC:d2.cC},
+               {pi:perm[2],r:d3.r,c:d3.c,cR:d3.cR,cC:d3.cC}],
+              d3.nb, tc);
+            if(total>bestTotal){
+              bestTotal=total; bestTotalCleared=tc; bestFinal=d3.nb;
+              bestSeq=[{pi:perm[0],r:d1.r,c:d1.c,cR:d1.cR,cC:d1.cC},
+                       {pi:perm[1],r:d2.r,c:d2.c,cR:d2.cR,cC:d2.cC},
+                       {pi:perm[2],r:d3.r,c:d3.c,cR:d3.cR,cC:d3.cC}];
+            }
+          }
+        }
+      }
+    }
+
+    document.getElementById('btnAI').disabled=false;
+
+    if(!bestSeq){setStatus('⚠ ไม่พบตำแหน่งวาง — ตรวจสอบรูปชิ้น','warn');return;}
+
+    lastFinalBoard=bestFinal;
+
+    // Compute setup quality for next round
+    const{linesReady:nextReady}=evalBoard(bestFinal,0);
+
+    // Score strip
+    const pts=Math.round(Math.pow(Math.max(bestTotalCleared,0)+1,1.6)*50+avail.length*10);
+    const ord=bestSeq.map(s=>NAMES[s.pi]).join('→');
+    document.getElementById('scL').textContent=bestTotalCleared||'0';
+    document.getElementById('scC').textContent='+'+pts;
+    document.getElementById('scO').textContent=ord;
+    document.getElementById('scS').textContent=nextReady>0?nextReady+'🔥':'—';
+    document.getElementById('sstrip').style.visibility='visible';
+
+    // Combo bar
+    showComboBar(bestTotalCleared);
+
+    // Insight
+    showInsight(bestSeq, bestTotalCleared, nextReady, bestFinal);
+
+    renderResults(bestSeq);
+    document.getElementById('nextwrap').style.display='block';
+    setStatus(`✓ ลำดับ ${ord} — ลบ ${bestTotalCleared} แถว · setup ${nextReady} เส้น/รอบถัดไป`,'ok');
+  },30);
+}
+
+// ═══════════════════════════════════════
+// COMBO BAR
+// ═══════════════════════════════════════
+function showComboBar(cleared){
+  const bar=document.getElementById('comboBar');
+  bar.style.display='flex';
+  const max=6;
+  for(let i=0;i<max;i++){
+    document.getElementById('cs'+i).className='combo-seg'+(i<cleared?' lit':'');
+  }
+  const lbl=document.getElementById('comboLbl');
+  if(cleared===0)lbl.textContent='';
+  else if(cleared===1)lbl.textContent='COMBO ×1';
+  else if(cleared===2)lbl.textContent='COMBO ×2 🔥';
+  else if(cleared===3)lbl.textContent='COMBO ×3 💥';
+  else lbl.textContent=`COMBO ×${cleared} ⚡`;
+}
+
+// ═══════════════════════════════════════
+// INSIGHT BOX
+// ═══════════════════════════════════════
+function showInsight(seq, totalCleared, nextReady, finalBoard){
+  const el=document.getElementById('insight');
+  const rf=Array(G).fill(0),cf=Array(G).fill(0);
+  for(let r=0;r<G;r++) for(let c=0;c<G;c++) if(finalBoard[r][c]){rf[r]++;cf[c]++;}
+  const hot7r=[], hot7c=[];
+  for(let i=0;i<G;i++){
+    if(rf[i]===7)hot7r.push(i+1);
+    if(cf[i]===7)hot7c.push(i+1);
+  }
+  let txt='';
+  if(totalCleared>0){
+    const names=seq.filter(s=>s.cR.length+s.cC.length>0).map(s=>'ชิ้น '+NAMES[s.pi]).join(', ');
+    txt+=`<strong>ลบได้ ${totalCleared} แถว/คอลัมน์</strong> จาก ${names}. `;
+  }
+  if(hot7r.length||hot7c.length){
+    txt+=`หลังวางครบ มีแถว <span class="hi">${[...hot7r.map(x=>'H'+x),...hot7c.map(x=>'V'+x)].join(', ')}</span> เหลืออีก 1 ช่องก็ลบได้ — รอบถัดไปเน้นชิ้นที่เติมได้`;
+  } else if(nextReady===0&&totalCleared===0){
+    txt+='ยังไม่มีแถวเกือบเต็ม — ลองวาดชิ้นที่ต่อแถวเดิมได้';
+  }
+  el.innerHTML=txt||'';
+  el.style.display=txt?'block':'none';
+}
+
+// ═══════════════════════════════════════
+// RENDER RESULT CARDS
+// ═══════════════════════════════════════
+function renderResults(seq){
+  document.getElementById('resSec').style.display='flex';
+  const res=document.getElementById('results');
+  res.innerHTML='';
+  let runBoard=cloneBoard(board);
+
+  seq.forEach((step,idx)=>{
+    const{pi,r,c,cR,cC}=step;
+    const piece=trimPiece(pieces[pi]);
+    const pCells=occupied(piece,r,c);
+    const afterPlace=applyPlace(runBoard,piece,r,c);
+    const clearTotal=cR.length+cC.length;
+
+    const card=document.createElement('div');
+    card.className=`rcard c${CLS[pi]}`;
+
+    // header
+    const hdr=document.createElement('div');
+    hdr.className='rhdr';
+    hdr.innerHTML=`
+      <div class="rnum n${CLS[pi]}">${idx+1}</div>
+      <div class="rtitle">วางชิ้น <strong style="color:${COLORS[pi]}">${NAMES[pi]}</strong></div>
+      <div class="rbadge ${clearTotal>0?'bc':'bo'}">${clearTotal>0?`🔥 ลบ ${clearTotal} แถว`:'วางได้'}</div>`;
+    card.appendChild(hdr);
+
+    // body
+    const body=document.createElement('div');
+    body.className='rbody';
+
+    // mini board (show state AFTER place, with cleared cells yellow)
+    const pSet=new Set(pCells.map(([rr,cc])=>`${rr},${cc}`));
+    const mb=document.createElement('div'); mb.className='mboard';
+    for(let rr=0;rr<G;rr++) for(let cc=0;cc<G;cc++){
+      const d=document.createElement('div'); d.className='mc';
+      const k=`${rr},${cc}`;
+      const isCleared=cR.includes(rr)||cC.includes(cc);
+      if(isCleared)           d.classList.add('mx');
+      else if(pSet.has(k))    d.classList.add('m'+CLS[pi]);
+      else if(afterPlace[rr][cc]) d.classList.add('mf');
+      mb.appendChild(d);
+    }
+    body.appendChild(mb);
+
+    // info panel
+    const info=document.createElement('div'); info.className='rinfo';
+    const coord=document.createElement('div'); coord.className='rcoord';
+    coord.innerHTML=`<span>แถว</span> ${r+1} &nbsp;·&nbsp; <span>คอลัมน์</span> ${c+1}`;
+    info.appendChild(coord);
+
+    const srow=document.createElement('div'); srow.className='rsrow';
+    srow.innerHTML=`
+      <div class="rsbox"><div class="v" style="color:${COLORS[pi]}">${pCells.length}</div><div class="l">บล็อก</div></div>
+      <div class="rsbox"><div class="v" style="color:var(--gold)">${clearTotal}</div><div class="l">ลบ</div></div>
+      <div class="rsbox"><div class="v">+${pCells.length*10+clearTotal*50}</div><div class="l">คะแนน</div></div>`;
+    info.appendChild(srow);
+
+    if(clearTotal>0){
+      const cl=document.createElement('div'); cl.className='rclear';
+      const parts=[];
+      if(cR.length)parts.push(`แถว: ${cR.map(x=>x+1).join(', ')}`);
+      if(cC.length)parts.push(`คอลัมน์: ${cC.map(x=>x+1).join(', ')}`);
+      cl.textContent='🗑 '+parts.join(' · ');
+      info.appendChild(cl);
+    }
+
+    body.appendChild(info);
+    card.appendChild(body);
+    res.appendChild(card);
+    requestAnimationFrame(()=>setTimeout(()=>card.classList.add('show'),55+idx*120));
+
+    // advance running board
+    const{nb:nc}=clearLines(afterPlace);
+    runBoard=nc;
+  });
+}
+
+// ═══════════════════════════════════════
+// NEXT ROUND
+// ═══════════════════════════════════════
+function nextRound(){
+  if(lastFinalBoard){ board=cloneBoard(lastFinalBoard); lastFinalBoard=null; }
+  pieces=[mk(P,P,0),mk(P,P,0),mk(P,P,0)];
+  selSlot=-1;
+  document.querySelectorAll('.slot').forEach(s=>s.className='slot');
+  [0,1,2].forEach(i=>buildPieceGrid(i));
+  clearResultUI();
+  refreshBoard();
+  setStatus('ตารางอัปเดตแล้ว — วาดชิ้นส่วนใหม่ แล้วกด วิเคราะห์ AI','');
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+
+// ═══════════════════════════════════════
+// CONTROLS
+// ═══════════════════════════════════════
+function clearBoard(){ board=mk(G,G,0); lastFinalBoard=null; clearResultUI(); refreshBoard(); }
+function resetPieces(){
+  pieces=[mk(P,P,0),mk(P,P,0),mk(P,P,0)]; selSlot=-1;
+  document.querySelectorAll('.slot').forEach(s=>s.className='slot');
+  [0,1,2].forEach(i=>buildPieceGrid(i));
+  clearResultUI();
+}
+function clearResultUI(){
+  document.getElementById('results').innerHTML='';
+  document.getElementById('resSec').style.display='none';
+  document.getElementById('nextwrap').style.display='none';
+  document.getElementById('comboBar').style.display='none';
+  document.getElementById('insight').style.display='none';
+  document.getElementById('sstrip').style.visibility='hidden';
+}
+function setStatus(msg,dotCls){
+  document.getElementById('aiMsg').textContent=msg;
+  document.getElementById('dot').className='dot'+(dotCls?' '+dotCls:'');
+}
+
+// ═══════════════════════════════════════
+// INIT
+// ═══════════════════════════════════════
+window.addEventListener('load',()=>{
+  buildBoard();
+  [0,1,2].forEach(i=>buildPieceGrid(i));
+});
+</script>
+</body>
+</html>
