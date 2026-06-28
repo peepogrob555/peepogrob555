@@ -40,6 +40,17 @@ ufw default allow incoming; ufw default allow outgoing
 ufw allow 22/tcp; ufw allow 80/tcp; ufw allow 443/tcp; ufw allow 2053/tcp
 ufw --force enable
 
+echo "กำลังตั้งค่าระบบป้องกัน DNS Leak แบบถาวร (Cloudflare)..."
+cat <<EOF > /etc/systemd/resolved.conf
+[Resolve]
+DNS=1.1.1.1 1.0.0.1
+FallbackDNS=
+Domains=~.
+LLMNR=no
+MulticastDNS=no
+EOF
+systemctl restart systemd-resolved
+
 echo "กำลังปรับแต่ง Kernel..."
 modprobe sch_cake
 echo "sch_cake" > /etc/modules-load.d/cake.conf
@@ -60,11 +71,16 @@ vm.swappiness = 10
 EOF
 sysctl --system > /dev/null
 
-echo "กำลังตั้งค่า Network Optimization..."
+echo "กำลังตั้งค่า Network & DNS Interface Optimization..."
 cat <<'EOF' > /usr/local/bin/nic-optimize.sh
 #!/bin/bash
 IFACE=$(ip route show default | awk '/default/ {print $5}')
 if [ -n "$IFACE" ]; then
+    # [Anti-DNS Leak] ดักตบ DHCP ของตึก ReadyIDC ทันทีหลังบูตเครื่องเสร็จ ห้ามสลับกลับ
+    resolvectl dns $IFACE 1.1.1.1 1.0.0.1 2>/dev/null
+    resolvectl domain $IFACE "~." 2>/dev/null
+
+    # ปรับแต่งประสิทธิภาพเครือข่าย
     ethtool -K $IFACE gso off tso off gro off lro off 2>/dev/null
     ip link set dev $IFACE txqueuelen 10000 2>/dev/null
     tc qdisc replace dev $IFACE root cake bandwidth 1000mbit ethernet 2>/dev/null
@@ -74,14 +90,17 @@ chmod +x /usr/local/bin/nic-optimize.sh
 
 cat <<EOF > /etc/systemd/system/vless-nic-optimize.service
 [Unit]
-Description=Network Optimization Service
+Description=Network & DNS Optimization Service
 After=network-online.target
+Wants=network-online.target
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/nic-optimize.sh
+RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target
 EOF
+systemctl daemon-reload
 systemctl enable --now vless-nic-optimize.service
 
 echo "กำลังติดตั้ง 3X-UI..."
@@ -91,5 +110,6 @@ systemctl stop rsyslog; systemctl disable rsyslog
 
 echo "======================================================"
 echo "การตั้งค่าเสร็จสมบูรณ์ เครดิต: FB:Shogun | IG:peepogrob555"
-echo "รีบูตเครื่อง 1 ครั้งเพื่อให้การตั้งค่า Kernel มีผล"
+echo "ระบบป้องกัน DNS Leak ฝังลง Boot Service เรียบร้อยแล้ว"
+echo "สามารถสั่งรีบูตเครื่อง 1 ครั้งได้เลยครับ!"
 echo "======================================================"
