@@ -12,7 +12,6 @@ apt-get install -y ufw e2fsprogs sed iptables ethtool dnsutils curl \
     linux-tools-common linux-tools-$(uname -r) cpufrequtils fail2ban
 
 echo "===== [2/5] ตั้งค่า Firewall & Cloudflare DNS ====="
-# MSS clamp = MTU 1500 - IP(20) - TCP(20) = 1460 (ล็อค MTU ฝั่งมือถือ 1500)
 cat <<EOF > /etc/ufw/before.rules
 *mangle
 :POSTROUTING ACCEPT [0:0]
@@ -101,8 +100,6 @@ echo "===== [5/5] ตั้งค่า Kernel, Network & CPU Optimization =====
 modprobe sch_cake
 echo "sch_cake" > /etc/modules-load.d/cake.conf
 
-# BDP = 150Mbps x 60ms = 1.07MB → max 2MB (headroom สำหรับ gaming)
-# tcp_base_mss = 1460 (MTU 1500 - IP 20 - TCP 20) ล็อคให้ตรงฝั่งมือถือ
 cat <<EOF > /etc/sysctl.d/99-vless-pure-optimize.conf
 net.core.default_qdisc = cake
 net.ipv4.tcp_congestion_control = bbr
@@ -152,8 +149,6 @@ EOF
 
 systemctl disable --now irqbalance 2>/dev/null
 
-# cake bandwidth = 150mbit (ตรงกับเน็ต 4G/4G+ จริง) rtt 60ms (เป้าหมาย latency)
-# ตั้งตรงความจริงเพื่อให้ cake ควบคุมคิวได้ กัน bufferbloat ตอน gaming
 cat <<'EOF' > /usr/local/bin/nic-optimize.sh
 #!/bin/bash
 IFACE=$(ip route show default | awk '/default/ {print $5}')
