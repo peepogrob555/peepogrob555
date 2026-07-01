@@ -1,4 +1,4 @@
-#!/bin/bash
+!/bin/bash
 if [[ $EUID -ne 0 ]]; then
    echo "Error: This script must be run as root"
    exit 1
@@ -12,10 +12,11 @@ apt-get install -y ufw e2fsprogs sed iptables ethtool dnsutils curl \
     linux-tools-common linux-tools-$(uname -r) cpufrequtils fail2ban
 
 echo "===== [2/5] ตั้งค่า Firewall & Cloudflare DNS ====="
+# MSS clamp = MTU 1500 - IP(20) - TCP(20) = 1460 (ล็อค MTU ฝั่งมือถือ 1500)
 cat <<EOF > /etc/ufw/before.rules
 *mangle
 :POSTROUTING ACCEPT [0:0]
--A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1360
+-A POSTROUTING -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1460
 COMMIT
 *filter
 :ufw-before-input - [0:0]
@@ -27,7 +28,7 @@ COMMIT
 EOF
 ufw --force reset
 ufw default allow incoming; ufw default allow outgoing
-ufw allow 22/tcp; ufw allow 80/tcp; ufw allow 443/tcp
+ufw allow 22/tcp; ufw allow 2222/tcp; ufw allow 80/tcp; ufw allow 443/tcp
 
 for p in 2052 2053 2082 2083 2086 2087 2095 2096 8080 8443 8880; do
     ufw allow ${p}/tcp
@@ -59,11 +60,9 @@ EOF
     chattr +i /etc/resolv.conf 2>/dev/null
 fi
 
-echo "===== [3/5] ติดตั้ง 3X-UI (หยุดรอให้กรอกเอง) & Patch Fail2ban ====="
-# คำสั่งติดตั้งแบบ Interactive ดั้งเดิม รอให้คุณกรอกหน้าจอเองตามใจชอบ
+echo "===== [3/5] ติดตั้ง 3X-UI & Patch Fail2ban ====="
 bash <(curl -Ls https://raw.githubusercontent.com/MHSanaei/3x-ui/master/install.sh)
 
-# หลังจากคุณกรอกเสร็จ สคริปต์จะทำงานส่วนที่เหลือต่อให้อัตโนมัติ:
 mkdir -p /etc/systemd/journald.conf.d
 cat <<EOF > /etc/systemd/journald.conf.d/00-disable-disk-log.conf
 [Journal]
@@ -102,14 +101,16 @@ echo "===== [5/5] ตั้งค่า Kernel, Network & CPU Optimization =====
 modprobe sch_cake
 echo "sch_cake" > /etc/modules-load.d/cake.conf
 
+# BDP = 150Mbps x 60ms = 1.07MB → max 2MB (headroom สำหรับ gaming)
+# tcp_base_mss = 1460 (MTU 1500 - IP 20 - TCP 20) ล็อคให้ตรงฝั่งมือถือ
 cat <<EOF > /etc/sysctl.d/99-vless-pure-optimize.conf
 net.core.default_qdisc = cake
 net.ipv4.tcp_congestion_control = bbr
-net.ipv4.tcp_base_mss = 1360
-net.core.rmem_max = 3276800
-net.core.wmem_max = 3276800
-net.ipv4.tcp_rmem = 4096 87380 3276800
-net.ipv4.tcp_wmem = 4096 65536 3276800
+net.ipv4.tcp_base_mss = 1460
+net.core.rmem_max = 2097152
+net.core.wmem_max = 2097152
+net.ipv4.tcp_rmem = 4096 87380 2097152
+net.ipv4.tcp_wmem = 4096 65536 2097152
 net.ipv4.tcp_fastopen = 3
 net.core.somaxconn = 65535
 net.ipv4.tcp_tw_reuse = 1
@@ -151,6 +152,8 @@ EOF
 
 systemctl disable --now irqbalance 2>/dev/null
 
+# cake bandwidth = 150mbit (ตรงกับเน็ต 4G/4G+ จริง) rtt 60ms (เป้าหมาย latency)
+# ตั้งตรงความจริงเพื่อให้ cake ควบคุมคิวได้ กัน bufferbloat ตอน gaming
 cat <<'EOF' > /usr/local/bin/nic-optimize.sh
 #!/bin/bash
 IFACE=$(ip route show default | awk '/default/ {print $5}')
@@ -158,7 +161,7 @@ if [ -n "$IFACE" ]; then
     ethtool -K $IFACE gso off tso off gro off lro off 2>/dev/null
     ethtool -G $IFACE rx 4096 tx 4096 2>/dev/null
     ip link set dev $IFACE txqueuelen 10000 2>/dev/null
-    tc qdisc replace dev $IFACE root cake bandwidth 1000mbit rtt 60ms nat ack-filter ethernet 2>/dev/null
+    tc qdisc replace dev $IFACE root cake bandwidth 150mbit rtt 60ms nat ack-filter ethernet 2>/dev/null
 fi
 EOF
 chmod +x /usr/local/bin/nic-optimize.sh
@@ -181,7 +184,7 @@ systemctl enable --now disable-thp.service
 systemctl enable --now cpu-performance.service
 systemctl enable --now vless-nic-optimize.service
 
-echo "===== ฝังตัวเช็คระบบ Ultimate Version (9 จุดเช็ค) ====="
+echo "===== ฝังตัวเช็คระบบ (9 จุด) ====="
 cat <<'EOF' > /usr/local/bin/syscheck.sh
 #!/bin/bash
 clear
@@ -198,9 +201,9 @@ echo "--- 1. Systemd Services Status ---"
 services=("disable-thp" "cpu-performance" "vless-nic-optimize" "fail2ban")
 for srv in "${services[@]}"; do
     if systemctl is-active --quiet "$srv"; then
-        echo -e "  $srv: ${GREEN}Active (Running/Exited)${NC}"
+        echo -e "  $srv: ${GREEN}Active${NC}"
     else
-        echo -e "  $srv: ${RED}Inactive (Failed/Missing)${NC}"
+        echo -e "  $srv: ${RED}Inactive${NC}"
         ((FAIL_COUNT++))
     fi
 done
@@ -209,102 +212,75 @@ echo ""
 echo "--- 2. Kernel & Network Tuning ---"
 bbr_check=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 cake_check=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-if [ "$bbr_check" == "bbr" ]; then
-    echo -e "  TCP Congestion Control: ${GREEN}$bbr_check${NC}"
-else
-    echo -e "  TCP Congestion Control: ${RED}$bbr_check (Should be bbr)${NC}"
-    ((FAIL_COUNT++))
-fi
-if [ "$cake_check" == "cake" ]; then
-    echo -e "  Default Qdisc: ${GREEN}$cake_check${NC}"
-else
-    echo -e "  Default Qdisc: ${RED}$cake_check (Should be cake)${NC}"
-    ((FAIL_COUNT++))
-fi
+mss_check=$(sysctl -n net.ipv4.tcp_base_mss 2>/dev/null)
+buf_check=$(sysctl -n net.core.rmem_max 2>/dev/null)
+[ "$bbr_check" == "bbr" ] && echo -e "  TCP Congestion: ${GREEN}$bbr_check${NC}" || { echo -e "  TCP Congestion: ${RED}$bbr_check (ควรเป็น bbr)${NC}"; ((FAIL_COUNT++)); }
+[ "$cake_check" == "cake" ] && echo -e "  Default Qdisc: ${GREEN}$cake_check${NC}" || { echo -e "  Default Qdisc: ${RED}$cake_check (ควรเป็น cake)${NC}"; ((FAIL_COUNT++)); }
+[ "$mss_check" == "1460" ] && echo -e "  TCP Base MSS: ${GREEN}$mss_check (MTU 1500 ✓)${NC}" || echo -e "  TCP Base MSS: ${RED}$mss_check (ควรเป็น 1460)${NC}"
+[ "$buf_check" == "2097152" ] && echo -e "  Buffer Max: ${GREEN}2MB (BDP optimized ✓)${NC}" || echo -e "  Buffer Max: ${RED}$buf_check (ควรเป็น 2097152)${NC}"
 echo ""
 
 echo "--- 3. Network Interface (NIC) Tweak ---"
 IFACE=$(ip route show default | awk '/default/ {print $5}')
 if [ -n "$IFACE" ]; then
     txq=$(cat /sys/class/net/$IFACE/tx_queue_len 2>/dev/null)
-    if [ "$txq" -eq 10000 ]; then
-        echo -e "  Interface ($IFACE) TxQueueLen: ${GREEN}$txq${NC}"
-    else
-        echo -e "  Interface ($IFACE) TxQueueLen: ${RED}$txq (Should be 10000)${NC}"
-        ((FAIL_COUNT++))
-    fi
+    [ "$txq" -eq 10000 ] && echo -e "  TxQueueLen ($IFACE): ${GREEN}$txq${NC}" || { echo -e "  TxQueueLen ($IFACE): ${RED}$txq (ควรเป็น 10000)${NC}"; ((FAIL_COUNT++)); }
     if tc qdisc show dev $IFACE | grep -q "cake"; then
-        echo -e "  Traffic Control (tc): ${GREEN}CAKE Active${NC}"
+        cake_bw=$(tc qdisc show dev $IFACE | grep -o 'bandwidth [^ ]*' | head -1)
+        cake_rtt=$(tc qdisc show dev $IFACE | grep -o 'rtt [^ ]*' | head -1)
+        echo -e "  Traffic Control: ${GREEN}CAKE Active | $cake_bw | $cake_rtt${NC}"
     else
-        echo -e "  Traffic Control (tc): ${RED}CAKE Missing${NC}"
-        ((FAIL_COUNT++))
+        echo -e "  Traffic Control: ${RED}CAKE Missing${NC}"; ((FAIL_COUNT++))
     fi
 else
-    echo -e "  Default Interface: ${RED}Not Found${NC}"
-    ((FAIL_COUNT++))
+    echo -e "  Interface: ${RED}Not Found${NC}"; ((FAIL_COUNT++))
 fi
 echo ""
 
 echo "--- 4. Transparent Huge Pages (THP) ---"
-if grep -q "\[never\]" /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null; then
-    echo -e "  THP Status: ${GREEN}Disabled (never)${NC}"
-else
-    echo -e "  THP Status: ${RED}Enabled (Should be never)${NC}"
-    ((FAIL_COUNT++))
-fi
+grep -q "\[never\]" /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null \
+    && echo -e "  THP: ${GREEN}Disabled (never)${NC}" \
+    || { echo -e "  THP: ${RED}Enabled (ควรเป็น never)${NC}"; ((FAIL_COUNT++)); }
 echo ""
 
-echo "--- 5. Zero-Log Config (Journald) ---"
+echo "--- 5. Zero-Log (Journald) ---"
 if grep -q "Storage=volatile" /etc/systemd/journald.conf.d/*.conf 2>/dev/null || grep -q "Storage=volatile" /etc/systemd/journald.conf 2>/dev/null; then
-    echo -e "  Journald Storage: ${GREEN}Volatile (RAM Only)${NC}"
+    echo -e "  Journald: ${GREEN}Volatile (RAM Only)${NC}"
 else
-    echo -e "  Journald Storage: ${RED}Persistent/Auto (Writing to Disk)${NC}"
-    ((FAIL_COUNT++))
+    echo -e "  Journald: ${RED}Persistent (Writing to Disk)${NC}"; ((FAIL_COUNT++))
 fi
 echo ""
 
-echo "--- 6. Swap Space Status ---"
+echo "--- 6. Swap Space ---"
 swap_total=$(free -m | awk '/Swap/ {print $2}')
-if [ -n "$swap_total" ] && [ "$swap_total" -gt 7000 ]; then
-    echo -e "  Swap Space: ${GREEN}Active (${swap_total}MB / ~8GB)${NC}"
-else
-    echo -e "  Swap Space: ${RED}Inactive or Incorrect Size (${swap_total}MB)${NC}"
-    ((FAIL_COUNT++))
-fi
+[ -n "$swap_total" ] && [ "$swap_total" -gt 7000 ] \
+    && echo -e "  Swap: ${GREEN}Active (${swap_total}MB / ~8GB)${NC}" \
+    || { echo -e "  Swap: ${RED}Inactive or Wrong Size (${swap_total}MB)${NC}"; ((FAIL_COUNT++)); }
 echo ""
 
-echo "--- 7. Firewall (UFW) Status ---"
-if ufw status | grep -q "Status: active"; then
-    echo -e "  UFW Firewall: ${GREEN}Active${NC}"
-else
-    echo -e "  UFW Firewall: ${RED}Inactive${NC}"
-    ((FAIL_COUNT++))
-fi
+echo "--- 7. Firewall (UFW) ---"
+ufw status | grep -q "Status: active" \
+    && echo -e "  UFW: ${GREEN}Active${NC}" \
+    || { echo -e "  UFW: ${RED}Inactive${NC}"; ((FAIL_COUNT++)); }
 echo ""
 
-echo "--- 8. 3X-UI & Xray Core Ports ---"
-if ss -tulpn | grep -E 'x-ui|xray|v2ray' >/dev/null 2>&1; then
-    echo -e "  Core Ports Status: ${GREEN}LISTEN (Ready)${NC}"
-else
-    echo -e "  Core Ports Status: ${RED}No active port listening${NC}"
-    ((FAIL_COUNT++))
-fi
+echo "--- 8. 3X-UI & Xray Core ---"
+ss -tulpn | grep -E 'x-ui|xray|v2ray' >/dev/null 2>&1 \
+    && echo -e "  Core Ports: ${GREEN}LISTEN (Ready)${NC}" \
+    || { echo -e "  Core Ports: ${RED}No active port${NC}"; ((FAIL_COUNT++)); }
 echo ""
 
 echo "--- 9. Fail2ban SSHD Jail ---"
-if fail2ban-client status sshd >/dev/null 2>&1; then
-    echo -e "  Fail2ban SSHD Jail: ${GREEN}Active & Monitoring${NC}"
-else
-    echo -e "  Fail2ban SSHD Jail: ${RED}Inactive or Misconfigured${NC}"
-    ((FAIL_COUNT++))
-fi
+fail2ban-client status sshd >/dev/null 2>&1 \
+    && echo -e "  Fail2ban: ${GREEN}Active & Monitoring${NC}" \
+    || { echo -e "  Fail2ban: ${RED}Inactive or Misconfigured${NC}"; ((FAIL_COUNT++)); }
 echo ""
 
 echo "======================================================"
 if [ $FAIL_COUNT -eq 0 ]; then
-    echo -e "  ${GREEN}STATUS: ระบบจูนนิ่งสมบูรณ์แบบ 100% (SUCCESSFUL)${NC}"
+    echo -e "  ${GREEN}STATUS: ระบบจูนนิ่งสมบูรณ์แบบ 100% ✓${NC}"
 else
-    echo -e "  ${RED}STATUS: พบปัญหาทั้งหมด $FAIL_COUNT จุดที่ต้องตรวจสอบ${NC}"
+    echo -e "  ${RED}STATUS: พบปัญหา $FAIL_COUNT จุดที่ต้องตรวจสอบ${NC}"
 fi
 echo "======================================================"
 EOF
@@ -312,10 +288,8 @@ chmod +x /usr/local/bin/syscheck.sh
 
 echo "======================================================"
 echo " การตั้งค่าเสร็จสมบูรณ์ เครดิต: FB:Shogun | IG:peepogrob555"
-echo " เรียกใช้งานตัวเช็คระบบด้วยตัวเองได้ตลอดเวลาทางคำสั่ง: syscheck.sh"
+echo " เรียกเช็คระบบได้ตลอดเวลาด้วยคำสั่ง: syscheck.sh"
 echo " สั่ง 'reboot' 1 ครั้งเพื่อให้ค่าทั้งหมดเริ่มทำงานสมบูรณ์"
 echo "======================================================"
 sleep 2
-
-# เรียกสคริปต์ขึ้นมาทำงานโชว์ผลลัพธ์ทันทีหลังติดตั้งเสร็จ
 /usr/local/bin/syscheck.sh
