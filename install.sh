@@ -27,8 +27,8 @@ COMMIT
 COMMIT
 EOF
 ufw --force reset
-ufw default allow incoming; ufw default allow outgoing
-ufw allow 22/tcp; ufw allow 2222/tcp; ufw allow 80/tcp; ufw allow 443/tcp
+ufw default deny incoming; ufw default allow outgoing
+ufw allow 22/tcp; ufw allow 80/tcp; ufw allow 443/tcp
 
 for p in 2052 2053 2082 2083 2086 2087 2095 2096 8080 8443 8880; do
     ufw allow ${p}/tcp
@@ -161,7 +161,7 @@ if [ -n "$IFACE" ]; then
     ethtool -K $IFACE gso off tso off gro off lro off 2>/dev/null
     ethtool -G $IFACE rx 4096 tx 4096 2>/dev/null
     ip link set dev $IFACE txqueuelen 10000 2>/dev/null
-    tc qdisc replace dev $IFACE root cake bandwidth 150mbit rtt 60ms nat ack-filter ethernet 2>/dev/null
+    tc qdisc replace dev $IFACE root cake bandwidth 350mbit rtt 60ms nat ack-filter ethernet 2>/dev/null
 fi
 EOF
 chmod +x /usr/local/bin/nic-optimize.sh
