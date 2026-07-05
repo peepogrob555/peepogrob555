@@ -516,7 +516,3 @@ while true; do
         5) util_speedtest ;;
         0) echo -e "${RED}ออกจากโปรแกรม${NC}"; exit 0 ;;
         *) echo -e "${RED}กรุณาเลือก 0-5${NC}"; sleep 1 ;;
-    esac
-done
-MAINEOF
-bash -n /home/claude/vps-optimizer-th.sh && echo "syntax OK"
