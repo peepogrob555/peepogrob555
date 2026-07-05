@@ -3,13 +3,13 @@
 # install.sh — SSH Tunnel Server Setup (Ubuntu Server 22.04)
 #
 # ติดตั้ง: OpenSSH, Dropbear, badvpn-udpgw, Nginx (WSS reverse proxy),
-#          Certbot/Let's Encrypt, UFW, Fail2Ban, sysctl/BBR tuning
+#          Certbot/Let's Encrypt, UFW, Fail2Ban, sysctl/BBR/CAKE tuning
 #
 # วิธีใช้:
 #   sudo bash install.sh
 #
-# สคริปต์นี้ "ทำเอง" ทุกขั้นตอนแบบ manual (ไม่พึ่ง auto-script สำเร็จรูปจากที่อื่น
-# ไม่ใช้ Docker ไม่ใช้ Panel สำเร็จรูป) แต่รวมเป็นไฟล์เดียวเพื่อความสะดวกในการรัน
+# สคริปต์นี้ "ทำเอง" ทุกขั้นตอนแบบ manual (ไม่ใช่ auto-script สำเร็จรูปจากที่อื่น
+# ไม่ใช้ Docker ไม่ใช้ Panel สำเร็จรูป) เพื่อให้ควบคุมและเข้าใจความสะดวกในการรับผิดชอบ
 ###############################################################################
 set -euo pipefail
 trap 'echo "[ERROR] เกิดข้อผิดพลาดที่บรรทัด $LINENO — สคริปต์หยุดทำงาน" >&2' ERR
@@ -23,7 +23,7 @@ log()  { echo -e "\n\033[1;32m==> $*\033[0m"; }
 warn() { echo -e "\033[1;33m[!] $*\033[0m"; }
 
 ###############################################################################
-# 0. รับค่าตั้งต้นจากผู้ใช้ (ค่าเฉพาะเครื่อง ไม่ควรฝังตายตัวในสคริปต์)
+# 0. รับค่าตั้งต้นจากผู้ใช้ (ค่าเฉพาะเครื่อง ไม่ควรตายตัวในสคริปต์)
 ###############################################################################
 log "0. กรอกค่าตั้งต้น"
 
@@ -33,9 +33,9 @@ TZ_NAME=${TZ_NAME:-Asia/Bangkok}
 read -rp "ชื่อ user ระบบใหม่ (สำหรับ sudo, ไม่ใช่ root): " SYS_USER
 read -rsp "รหัสผ่านของ user นี้: " SYS_USER_PASS; echo
 read -rp "โดเมนที่ชี้มาที่ VPS นี้แล้ว (เช่น tunnel.example.com): " DOMAIN
-read -rp "อีเมลสำหรับ Let's Encrypt (แจ้งเตือนก่อน cert หมดอายุ): " LE_EMAIL
-read -rp "Username สำหรับเข้าเว็บพาแนลจัดการ user (ไม่ใช่ user ระบบ): " PANEL_ADMIN_USER
-read -rsp "Password สำหรับเว็บพาแนล: " PANEL_ADMIN_PASS; echo
+read -rp "อีเมลสำหรับ Let's Encrypt (ใช้แจ้งเตือนก่อน cert หมดอายุ): " LE_EMAIL
+read -rp "Username สำหรับเว็บเข้าจัดการ user (ไม่ใช่ user ระบบ): " PANEL_ADMIN_USER
+read -rsp "Password สำหรับเว็บจัดการ: " PANEL_ADMIN_PASS; echo
 
 SSH_PORT=22
 DROPBEAR_PORT_PUBLIC=80
@@ -43,6 +43,11 @@ DROPBEAR_PORT_INTERNAL=109
 NGINX_SSL_PORT=443
 UDPGW_PORT=7300
 PANEL_PORT=3000
+
+# --- ความเร็วลิงก์อินเทอร์เน็ตของ VPS สำหรับ CAKE shaping ---
+# fix ตายตัวตามที่ต้องการ ไม่ต้องถามระหว่างติดตั้ง เผื่อรันซ้ำหรือรันแบบ non-interactive
+LINK_MBIT=350
+CAKE_MBIT=350
 
 ###############################################################################
 # 1. เตรียมระบบพื้นฐาน
@@ -71,12 +76,12 @@ else
   usermod -aG sudo "$SYS_USER"
 fi
 
-log "1.5 เตรียมโฟลเดอร์ .ssh ให้ user ใหม่ (รองรับ SSH key ในอนาคต)"
+log "1.5 เตรียมโฟลเดอร์ .ssh ให้ user ใหม่ (รอรับ SSH key ภายหลัง)"
 install -d -m 700 -o "$SYS_USER" -g "$SYS_USER" "/home/${SYS_USER}/.ssh"
 touch "/home/${SYS_USER}/.ssh/authorized_keys"
 chown "$SYS_USER:$SYS_USER" "/home/${SYS_USER}/.ssh/authorized_keys"
 chmod 600 "/home/${SYS_USER}/.ssh/authorized_keys"
-warn "ถ้าจะใช้ SSH Key ให้นำ public key ไปวางใน /home/${SYS_USER}/.ssh/authorized_keys เอง"
+warn "ถ้าจะใช้ SSH Key ให้เอา public key มาวางใน /home/${SYS_USER}/.ssh/authorized_keys เอง"
 
 ###############################################################################
 # 2. Firewall (UFW)
@@ -88,8 +93,8 @@ ufw allow "${SSH_PORT}/tcp"        comment 'OpenSSH'
 ufw allow "${DROPBEAR_PORT_PUBLIC}/tcp" comment 'Dropbear raw/payload'
 ufw allow "${NGINX_SSL_PORT}/tcp"  comment 'Nginx SSL/WSS'
 ufw allow "${UDPGW_PORT}/udp"      comment 'badvpn-udpgw'
-# หมายเหตุ: ไม่เปิด UDP 1-65535 — udpgw ใช้พอร์ตเดียว (7300) รับ-ส่งข้อมูล
-# แล้วมัน relay ไปปลายทางจริงเอง ไม่จำเป็นต้องเปิดพอร์ตอื่นเพิ่มเลย
+# หมายเหตุ: ไม่เปิด UDP 1-65535 — udpgw ใช้แค่พอร์ตเดียว (7300) รับ-ส่งข้อมูล
+# แล้วมัน relay ให้ปลายทางจริงเอง ไม่จำเป็นต้องเปิดพอร์ตอื่นเพิ่มเลย
 ufw --force enable
 ufw status verbose
 
@@ -110,13 +115,12 @@ sed -i \
   -e "s/^#\?AllowTcpForwarding .*/AllowTcpForwarding yes/" \
   -e "s/^#\?X11Forwarding .*/X11Forwarding no/" \
   /etc/ssh/sshd_config
-# เพิ่มค่าที่อาจไม่มีอยู่เดิม
 grep -q "^MaxAuthTries" /etc/ssh/sshd_config || echo "MaxAuthTries 3" >> /etc/ssh/sshd_config
 grep -q "^ClientAliveInterval" /etc/ssh/sshd_config || echo "ClientAliveInterval 60" >> /etc/ssh/sshd_config
 grep -q "^ClientAliveCountMax" /etc/ssh/sshd_config || echo "ClientAliveCountMax 3" >> /etc/ssh/sshd_config
 grep -q "^AllowTcpForwarding" /etc/ssh/sshd_config || echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config
 
-sshd -t   # ทดสอบ syntax ก่อน restart จริง ป้องกันล็อกตัวเองออก
+sshd -t   # ทดสอบ syntax ก่อน restart จริง กันล็อกตัวเองออก
 systemctl restart ssh
 systemctl enable ssh
 systemctl status ssh --no-pager -l | head -5
@@ -134,7 +138,6 @@ if [[ ! -f /etc/dropbear/dropbear_rsa_host_key ]]; then
   dropbearkey -t rsa -s 2048 -f /etc/dropbear/dropbear_rsa_host_key
 fi
 
-# ปิด dropbear ที่มากับ apt (ใช้ systemd service ของเราเองแทน เพื่อคุมพอร์ตได้ 2 ตัว)
 systemctl disable --now dropbear 2>/dev/null || true
 
 cat > /etc/systemd/system/dropbear.service <<EOF
@@ -206,8 +209,6 @@ systemctl status badvpn-udpgw --no-pager -l | head -5
 ###############################################################################
 log "6. ติดตั้ง Nginx"
 apt install -y nginx
-
-# ปิด default site กัน conflict
 rm -f /etc/nginx/sites-enabled/default
 
 log "7. ขอ SSL certificate ด้วย Certbot (standalone ชั่วคราว เพราะ nginx ยังไม่ฟัง 80/443)"
@@ -232,9 +233,6 @@ systemctl enable --now certbot.timer
 
 log "8. เขียนไฟล์ Nginx config พร้อม WebSocket upgrade headers"
 cat > /etc/nginx/sites-available/ssh-tunnel.conf <<EOF
-# map สำหรับ WebSocket Upgrade header:
-# ถ้า client ส่ง "Upgrade: websocket" ให้ \$connection_upgrade = "upgrade"
-# ถ้าไม่ส่ง (HTTP ปกติ) ให้ \$connection_upgrade = "close"
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
     ''      close;
@@ -250,19 +248,17 @@ server {
     ssl_protocols       TLSv1.2 TLSv1.3;
     ssl_ciphers         HIGH:!aNULL:!MD5;
 
-    # --- WebSocket -> OpenSSH (พอร์ต 22) ---
     location /ssh-ws {
         proxy_pass http://127.0.0.1:${SSH_PORT};
         proxy_http_version 1.1;
-        proxy_set_header Upgrade \$http_upgrade;          # ส่งต่อคำขอ upgrade เป็น websocket
-        proxy_set_header Connection \$connection_upgrade;  # บอกให้ต่อ connection ค้างไว้ (ไม่ปิดหลัง response)
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection \$connection_upgrade;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_read_timeout 3600s;   # กัน connection ถูกตัดระหว่าง idle
+        proxy_read_timeout 3600s;
         proxy_send_timeout 3600s;
     }
 
-    # --- WebSocket -> Dropbear (internal พอร์ต 109) ---
     location /dropbear-ws {
         proxy_pass http://127.0.0.1:${DROPBEAR_PORT_INTERNAL};
         proxy_http_version 1.1;
@@ -274,7 +270,6 @@ server {
         proxy_send_timeout 3600s;
     }
 
-    # --- เว็บพาแนลจัดการ user (อยู่หลัง SSL, ไม่เปิดพอร์ตตรง) ---
     location /panel/ {
         proxy_pass http://127.0.0.1:${PANEL_PORT}/;
         proxy_http_version 1.1;
@@ -286,7 +281,7 @@ server {
     }
 
     location / {
-        return 444;   # ปิดเส้นทางอื่นทั้งหมดที่ไม่รู้จัก (ลด fingerprint / กัน scanner)
+        return 444;
     }
 }
 EOF
@@ -328,9 +323,6 @@ if ! command -v node &>/dev/null; then
 fi
 
 PANEL_DIR=/opt/ssh-panel
-
-# เขียนไฟล์ทั้งหมดของพาแนลลงดิสก์ตรงนี้ (สคริปต์นี้เป็นไฟล์เดียว จบในตัว
-# ไม่ต้องพึ่งโฟลเดอร์ panel/ ข้างเคียง — รันผ่าน curl | bash ได้เลย)
 mkdir -p /opt/ssh-panel/views /usr/local/bin/ssh-panel
 
 cat > /opt/ssh-panel/package.json <<'PANEL_PACKAGE_JSON'
@@ -354,14 +346,6 @@ PANEL_PACKAGE_JSON
 
 cat > /opt/ssh-panel/server.js <<'PANEL_SERVER_JS'
 // server.js — SSH Tunnel User Management Panel
-//
-// สถาปัตยกรรมความปลอดภัย:
-//  - Panel รันด้วย user จำกัดสิทธิ์ (panelsvc) ไม่ใช่ root
-//  - เรียกคำสั่งระบบผ่าน execFile (ไม่ผ่าน shell) + array args เท่านั้น -> กัน command injection
-//  - sudo อนุญาตให้รันได้แค่ script ที่กำหนดไว้ล่วงหน้าใน /etc/sudoers.d/ssh-panel เท่านั้น
-//  - ทุก input (username / password / days) ผ่าน whitelist regex ก่อนส่งไป shell script เสมอ
-//  - ฟังเฉพาะ 127.0.0.1 -> เข้าถึงได้ผ่าน Nginx (SSL) เท่านั้น ไม่เปิดสู่อินเทอร์เน็ตตรง ๆ
-
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
@@ -388,7 +372,7 @@ const SCRIPTS = {
   online: '/usr/local/bin/ssh-panel/onlineusers.sh',
 };
 
-app.set('trust proxy', 1); // อยู่หลัง Nginx reverse proxy
+app.set('trust proxy', 1);
 app.use(express.json());
 app.use(express.urlencoded({ extended: false }));
 app.use(express.static(path.join(__dirname, 'public')));
@@ -399,9 +383,9 @@ app.use(session({
   saveUninitialized: false,
   cookie: {
     httpOnly: true,
-    secure: true,       // ต้องเข้าผ่าน https (Nginx SSL) เท่านั้น
+    secure: true,
     sameSite: 'strict',
-    maxAge: 1000 * 60 * 60 * 4, // 4 ชั่วโมง
+    maxAge: 1000 * 60 * 60 * 4,
   },
 }));
 
@@ -418,7 +402,6 @@ function requireAuth(req, res, next) {
   return res.status(401).json({ error: 'Unauthorized' });
 }
 
-// --- Whitelist validators: ทุก input ต้องผ่านตรงนี้ก่อนแตะ shell เสมอ ---
 const usernameRe = /^[a-z][a-z0-9_-]{2,31}$/;
 function validUsername(u) { return typeof u === 'string' && usernameRe.test(u); }
 function validPassword(p) { return typeof p === 'string' && p.length >= 6 && p.length <= 128 && !/\s/.test(p); }
@@ -680,14 +663,12 @@ PANEL_DASHBOARD_HTML
 cat > /usr/local/bin/ssh-panel/adduser.sh <<'PANEL_ADDUSER_SH'
 #!/bin/bash
 # adduser.sh <username> <password> <expiry_days>
-# รันด้วย root ผ่าน sudo (จำกัดไว้ใน /etc/sudoers.d/ssh-panel เท่านั้น)
 set -euo pipefail
 
 USERNAME="${1:-}"
 PASSWORD="${2:-}"
 DAYS="${3:-}"
 
-# ตรวจซ้ำอีกชั้นในฝั่ง shell แม้ Node.js จะ validate มาแล้ว (defense in depth)
 if ! [[ "$USERNAME" =~ ^[a-z][a-z0-9_-]{2,31}$ ]]; then
   echo "Invalid username" >&2
   exit 1
@@ -707,8 +688,6 @@ fi
 
 EXPIRE_DATE=$(date -d "+${DAYS} days" +%Y-%m-%d)
 
-# shell เป็น /usr/sbin/nologin: กันไม่ให้ login แบบ interactive shell ได้
-# แต่ SSH port-forward / tunnel ยังใช้งานได้ปกติ เพราะไม่ต้องพึ่ง shell
 useradd -m -s /usr/sbin/nologin -e "$EXPIRE_DATE" "$USERNAME"
 echo "${USERNAME}:${PASSWORD}" | chpasswd
 
@@ -730,7 +709,6 @@ if ! id "$USERNAME" &>/dev/null; then
   echo "User does not exist" >&2
   exit 1
 fi
-# กันลบ user ระบบ/บัญชี panel โดยไม่ตั้งใจ
 if [[ "$USERNAME" == "root" || "$USERNAME" == "panelsvc" ]]; then
   echo "Refusing to delete protected account" >&2
   exit 1
@@ -774,7 +752,7 @@ cat > /etc/sudoers.d/ssh-panel <<EOF
 panelsvc ALL=(root) NOPASSWD: /usr/local/bin/ssh-panel/adduser.sh, /usr/local/bin/ssh-panel/deluser.sh, /usr/local/bin/ssh-panel/listusers.sh, /usr/local/bin/ssh-panel/onlineusers.sh
 EOF
 chmod 440 /etc/sudoers.d/ssh-panel
-visudo -c   # ตรวจ syntax sudoers ป้องกันพัง sudo ทั้งระบบ
+visudo -c
 
 log "สร้าง password hash สำหรับพาแนล (bcrypt)"
 cd "$PANEL_DIR"
@@ -846,23 +824,17 @@ EOF
 sysctl net.ipv4.tcp_congestion_control
 
 ###############################################################################
-# 12.1 CAKE qdisc — shaping + fair-queue ต่อปลายทาง (แม่นกว่า fq เฉย ๆ สำหรับ
-#      เซิร์ฟเวอร์ที่เสิร์ฟ user จำนวนมากพร้อมกัน)
+# 12.1 CAKE qdisc — shaping คงที่ที่ 350mbit ตามที่กำหนด (ไม่ถามระหว่างติดตั้ง)
 ###############################################################################
-log "12.1 โหลด sch_cake และตั้ง shaping บน interface ขาออกจริง"
+log "12.1 โหลด sch_cake และตั้ง shaping บน interface ขาออกจริง (fix 350mbit, rtt 50ms, dual-dsthost)"
 
 modprobe sch_cake 2>/dev/null || warn "โหลด sch_cake ไม่สำเร็จ (เช็ค kernel version: uname -r ต้อง >= 4.19)"
 echo "sch_cake" > /etc/modules-load.d/sch_cake.conf
 
-# ตั้ง bandwidth ให้ CAKE — ควรเป็นค่าประมาณ 90-95% ของลิงก์จริง (300mbit -> 285mbit)
-# เผื่อ overhead ของ L2/small-packet กัน queue ไปกองที่ NIC ฮาร์ดแวร์แทน (บั๊กกลับมาเป็น bufferbloat)
-read -rp "Bandwidth ขาออกจริงของ VPS นี้ (Mbit, เช่น 300): " LINK_MBIT
-LINK_MBIT=${LINK_MBIT:-300}
-CAKE_MBIT=$(( LINK_MBIT * 95 / 100 ))
-
 cat > /usr/local/bin/apply-cake.sh <<EOF
 #!/bin/bash
-# apply-cake.sh — แนบ CAKE เข้ากับ default-route interface ทุกครั้งที่บูต
+# apply-cake.sh — ตั้ง CAKE บน default-route interface ทุกครั้งที่บูต
+# bandwidth fix ไว้ที่ ${CAKE_MBIT}mbit ตามที่กำหนดตายตัว ไม่ผูกกับ prompt ใดๆ
 set -euo pipefail
 IFACE=\$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if (\$i=="dev") print \$(i+1)}' | head -1)
 if [[ -z "\$IFACE" ]]; then
@@ -870,8 +842,6 @@ if [[ -z "\$IFACE" ]]; then
   exit 1
 fi
 modprobe sch_cake 2>/dev/null || true
-# dual-dsthost: แยก fair-queue ตาม destination host -> user คนเดียวแย่ง bandwidth คนอื่นไม่ได้
-# rtt 50ms: บอก CAKE ให้คำนวณ target/interval ตาม RTT จริงของ mobile client (แม่นกว่าค่า default 100ms)
 tc qdisc replace dev "\$IFACE" root cake bandwidth ${CAKE_MBIT}mbit rtt 50ms dual-dsthost
 echo "Applied CAKE on \$IFACE: bandwidth=${CAKE_MBIT}mbit rtt=50ms dual-dsthost"
 EOF
@@ -896,8 +866,8 @@ systemctl daemon-reload
 systemctl enable --now cake-shaper
 systemctl status cake-shaper --no-pager -l | head -5
 
-warn "หมายเหตุ: ถ้าลิงก์จริงเปลี่ยน (อัปเกรด/ลดแพ็กเกจ VPS) ต้องแก้เลข bandwidth ใน"
-warn "  /usr/local/bin/apply-cake.sh แล้ว: sudo systemctl restart cake-shaper"
+warn "ถ้าลิงก์จริงเปลี่ยน (อัปเกรด/ลดแพ็กเกจ VPS) ต้องแก้ CAKE_MBIT ใน /usr/local/bin/apply-cake.sh เอง"
+warn "  แล้วรัน: sudo systemctl restart cake-shaper"
 
 log "เสร็จสิ้น! สรุปข้อมูลสำคัญ:"
 cat <<SUMMARY
@@ -909,7 +879,7 @@ cat <<SUMMARY
   WSS Dropbear      : wss://${DOMAIN}:${NGINX_SSL_PORT}/dropbear-ws
   UDP Custom (udpgw): ${DOMAIN}:${UDPGW_PORT} (UDP)
   เว็บพาแนล         : https://${DOMAIN}/panel/  (login: ${PANEL_ADMIN_USER})
-  CAKE shaping      : ${CAKE_MBIT}mbit (จากลิงก์จริง ${LINK_MBIT}mbit), rtt=50ms, dual-dsthost
+  CAKE shaping      : ${CAKE_MBIT}mbit (fix ตายตัว), rtt=50ms, dual-dsthost
 
   *** เก็บรหัสผ่านทั้งหมดไว้ให้ปลอดภัย และลบ history ของ terminal ที่พิมพ์รหัสผ่านไว้ ***
 SUMMARY
