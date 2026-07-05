@@ -1,4 +1,3 @@
-cat > /home/claude/vps-optimizer-th.sh << 'MAINEOF'
 #!/bin/bash
 if [[ $EUID -ne 0 ]]; then echo "Error: run as root"; exit 1; fi
 export DEBIAN_FRONTEND=noninteractive
