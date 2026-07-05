@@ -1,41 +1,23 @@
 #!/bin/bash
 ###############################################################################
-# install.sh — SSH Tunnel Server Setup (Ubuntu Server 22.04)
+# install-simple.sh — SSH Tunnel Server (ฉบับง่าย ไม่ถามอะไรเลย)
+# ใช้ IP แทนโดเมน, SSL เป็น self-signed (เพราะไม่มีโดเมนขอ Let's Encrypt ไม่ได้)
 #
-# ติดตั้ง: OpenSSH, Dropbear, badvpn-udpgw, Nginx (WSS reverse proxy),
-#          Certbot/Let's Encrypt, UFW, Fail2Ban, sysctl/BBR/CAKE tuning
-#
-# วิธีใช้:
-#   sudo bash install.sh
-#
-# สคริปต์นี้ "ทำเอง" ทุกขั้นตอนแบบ manual (ไม่ใช่ auto-script สำเร็จรูปจากที่อื่น
-# ไม่ใช้ Docker ไม่ใช้ Panel สำเร็จรูป) เพื่อให้ควบคุมและเข้าใจความสะดวกในการรับผิดชอบ
+# วิธีใช้: sudo bash install-simple.sh
 ###############################################################################
 set -euo pipefail
-trap 'echo "[ERROR] เกิดข้อผิดพลาดที่บรรทัด $LINENO — สคริปต์หยุดทำงาน" >&2' ERR
+trap 'echo "[ERROR] พังที่บรรทัด $LINENO"; exit 1' ERR
 
-if [[ $EUID -ne 0 ]]; then
-  echo "กรุณารันด้วย sudo หรือ root: sudo bash install.sh" >&2
-  exit 1
-fi
-
-log()  { echo -e "\n\033[1;32m==> $*\033[0m"; }
-warn() { echo -e "\033[1;33m[!] $*\033[0m"; }
+[[ $EUID -eq 0 ]] || { echo "รันด้วย sudo หรือ root"; exit 1; }
+log() { echo -e "\n\033[1;32m==> $*\033[0m"; }
 
 ###############################################################################
-# 0. รับค่าตั้งต้นจากผู้ใช้ (ค่าเฉพาะเครื่อง ไม่ควรตายตัวในสคริปต์)
+# ค่าคงที่ทั้งหมด — ไม่ถามอะไรเลย แก้ตรงนี้ได้ถ้าต้องการเปลี่ยน
 ###############################################################################
-log "0. กรอกค่าตั้งต้น"
-
-read -rp "Hostname ที่ต้องการตั้ง (เช่น vps-tunnel): " NEW_HOSTNAME
-# fix ตายตัวไว้เลย กันพิมพ์ผิด (เช่น "Asia/Bankok") แล้วสคริปต์ตายตอน timedatectl
-TZ_NAME="Asia/Bangkok"
-read -rp "ชื่อ user ระบบใหม่ (สำหรับ sudo, ไม่ใช่ root): " SYS_USER
-read -rsp "รหัสผ่านของ user นี้: " SYS_USER_PASS; echo
-read -rp "โดเมนที่ชี้มาที่ VPS นี้แล้ว (เช่น tunnel.example.com): " DOMAIN
-read -rp "อีเมลสำหรับ Let's Encrypt (ใช้แจ้งเตือนก่อน cert หมดอายุ): " LE_EMAIL
-read -rp "Username สำหรับเว็บเข้าจัดการ user (ไม่ใช่ user ระบบ): " PANEL_ADMIN_USER
-read -rsp "Password สำหรับเว็บจัดการ: " PANEL_ADMIN_PASS; echo
+SYS_USER="sshadmin"
+SYS_USER_PASS=$(openssl rand -base64 12)      # สุ่มรหัส user ระบบ โชว์ให้ตอนจบ
+PANEL_ADMIN_USER="peepogrob555"
+PANEL_ADMIN_PASS='G7!vQ2mZ9#xL4tR8@cP6nW1sD5hY3kJ9!aB8vT2mQ7zX4cN6pR1sF5dH9kL3wE'
 
 SSH_PORT=22
 DROPBEAR_PORT_PUBLIC=80
@@ -43,130 +25,90 @@ DROPBEAR_PORT_INTERNAL=109
 NGINX_SSL_PORT=443
 UDPGW_PORT=7300
 PANEL_PORT=3000
-
-# --- ความเร็วลิงก์อินเทอร์เน็ตของ VPS สำหรับ CAKE shaping ---
-# fix ตายตัวตามที่ต้องการ ไม่ต้องถามระหว่างติดตั้ง เผื่อรันซ้ำหรือรันแบบ non-interactive
-LINK_MBIT=350
 CAKE_MBIT=350
 
+SERVER_IP=$(curl -4 -s ifconfig.me || hostname -I | awk '{print $1}')
+
 ###############################################################################
-# 1. เตรียมระบบพื้นฐาน
+# 1. เตรียมระบบ
 ###############################################################################
-log "1.1 apt update / upgrade — อัปเดต package list และแพตช์ความปลอดภัย"
+log "1. อัปเดตระบบ + สร้าง user"
 export DEBIAN_FRONTEND=noninteractive
-apt update -y
-apt upgrade -y
+apt update -y && apt upgrade -y
 apt install -y curl wget git build-essential cmake ufw fail2ban unzip \
-  software-properties-common ca-certificates gnupg lsb-release chrony
+  ca-certificates gnupg chrony openssl
 
-log "1.2 ตั้ง Timezone เป็น ${TZ_NAME} — ให้ log/cert หมดอายุตรงเวลาจริง"
-timedatectl set-timezone "$TZ_NAME"
+timedatectl set-timezone Asia/Bangkok
 
-log "1.3 ตั้ง Hostname เป็น ${NEW_HOSTNAME}"
-hostnamectl set-hostname "$NEW_HOSTNAME"
-sed -i "s/^127.0.1.1.*/127.0.1.1\t${NEW_HOSTNAME}/" /etc/hosts || \
-  echo "127.0.1.1 ${NEW_HOSTNAME}" >> /etc/hosts
-
-log "1.4 สร้าง user ใหม่ (${SYS_USER}) เพื่อเลิกใช้ root ทำงานประจำวัน"
-if id "$SYS_USER" &>/dev/null; then
-  warn "user ${SYS_USER} มีอยู่แล้ว ข้ามการสร้าง"
-else
+if ! id "$SYS_USER" &>/dev/null; then
   adduser --gecos "" --disabled-password "$SYS_USER"
   echo "${SYS_USER}:${SYS_USER_PASS}" | chpasswd
   usermod -aG sudo "$SYS_USER"
 fi
-
-log "1.5 เตรียมโฟลเดอร์ .ssh ให้ user ใหม่ (รอรับ SSH key ภายหลัง)"
 install -d -m 700 -o "$SYS_USER" -g "$SYS_USER" "/home/${SYS_USER}/.ssh"
 touch "/home/${SYS_USER}/.ssh/authorized_keys"
-chown "$SYS_USER:$SYS_USER" "/home/${SYS_USER}/.ssh/authorized_keys"
 chmod 600 "/home/${SYS_USER}/.ssh/authorized_keys"
-warn "ถ้าจะใช้ SSH Key ให้เอา public key มาวางใน /home/${SYS_USER}/.ssh/authorized_keys เอง"
+chown "$SYS_USER:$SYS_USER" "/home/${SYS_USER}/.ssh/authorized_keys"
 
 ###############################################################################
-# 2. Firewall (UFW)
+# 2. Firewall
 ###############################################################################
-log "2. ตั้งค่า UFW — เปิดเฉพาะพอร์ตที่ใช้งานจริงเท่านั้น"
+log "2. ตั้ง UFW — เปิดเฉพาะพอร์ตที่ใช้จริง"
 ufw default deny incoming
 ufw default allow outgoing
-ufw allow "${SSH_PORT}/tcp"        comment 'OpenSSH'
-ufw allow "${DROPBEAR_PORT_PUBLIC}/tcp" comment 'Dropbear raw/payload'
-ufw allow "${NGINX_SSL_PORT}/tcp"  comment 'Nginx SSL/WSS'
-ufw allow "${UDPGW_PORT}/udp"      comment 'badvpn-udpgw'
-# หมายเหตุ: ไม่เปิด UDP 1-65535 — udpgw ใช้แค่พอร์ตเดียว (7300) รับ-ส่งข้อมูล
-# แล้วมัน relay ให้ปลายทางจริงเอง ไม่จำเป็นต้องเปิดพอร์ตอื่นเพิ่มเลย
+ufw allow "${SSH_PORT}/tcp"              comment 'OpenSSH'
+ufw allow "${DROPBEAR_PORT_PUBLIC}/tcp"  comment 'Dropbear'
+ufw allow "${NGINX_SSL_PORT}/tcp"        comment 'Nginx SSL/WSS/Panel'
+ufw allow "${UDPGW_PORT}/udp"            comment 'badvpn-udpgw'
 ufw --force enable
-ufw status verbose
 
 ###############################################################################
 # 3. OpenSSH
 ###############################################################################
-log "3. ตั้งค่า OpenSSH (${SSH_PORT})"
+log "3. ตั้งค่า OpenSSH"
 apt install -y openssh-server
 cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak.$(date +%s)
-
 sed -i \
-  -e "s/^#\?Port .*/Port ${SSH_PORT}/" \
   -e "s/^#\?PermitRootLogin .*/PermitRootLogin no/" \
   -e "s/^#\?PasswordAuthentication .*/PasswordAuthentication yes/" \
   -e "s/^#\?MaxAuthTries .*/MaxAuthTries 3/" \
   -e "s/^#\?ClientAliveInterval .*/ClientAliveInterval 60/" \
   -e "s/^#\?ClientAliveCountMax .*/ClientAliveCountMax 3/" \
   -e "s/^#\?AllowTcpForwarding .*/AllowTcpForwarding yes/" \
-  -e "s/^#\?X11Forwarding .*/X11Forwarding no/" \
   /etc/ssh/sshd_config
-grep -q "^MaxAuthTries" /etc/ssh/sshd_config || echo "MaxAuthTries 3" >> /etc/ssh/sshd_config
-grep -q "^ClientAliveInterval" /etc/ssh/sshd_config || echo "ClientAliveInterval 60" >> /etc/ssh/sshd_config
-grep -q "^ClientAliveCountMax" /etc/ssh/sshd_config || echo "ClientAliveCountMax 3" >> /etc/ssh/sshd_config
 grep -q "^AllowTcpForwarding" /etc/ssh/sshd_config || echo "AllowTcpForwarding yes" >> /etc/ssh/sshd_config
-
-sshd -t   # ทดสอบ syntax ก่อน restart จริง กันล็อกตัวเองออก
-systemctl restart ssh
-systemctl enable ssh
-systemctl status ssh --no-pager -l | head -5
+sshd -t
+systemctl restart ssh && systemctl enable ssh
 
 ###############################################################################
 # 4. Dropbear
 ###############################################################################
-log "4. ติดตั้ง Dropbear (พอร์ตสาธารณะ ${DROPBEAR_PORT_PUBLIC}, internal ${DROPBEAR_PORT_INTERNAL})"
+log "4. ติดตั้ง Dropbear (public ${DROPBEAR_PORT_PUBLIC}, internal ${DROPBEAR_PORT_INTERNAL})"
 apt install -y dropbear-bin
 mkdir -p /etc/dropbear
-if [[ ! -f /etc/dropbear/dropbear_ecdsa_host_key ]]; then
-  dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key
-fi
-if [[ ! -f /etc/dropbear/dropbear_rsa_host_key ]]; then
-  dropbearkey -t rsa -s 2048 -f /etc/dropbear/dropbear_rsa_host_key
-fi
-
+[[ -f /etc/dropbear/dropbear_ecdsa_host_key ]] || dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key
+[[ -f /etc/dropbear/dropbear_rsa_host_key ]]   || dropbearkey -t rsa -s 2048 -f /etc/dropbear/dropbear_rsa_host_key
 systemctl disable --now dropbear 2>/dev/null || true
 
 cat > /etc/systemd/system/dropbear.service <<EOF
 [Unit]
-Description=Dropbear SSH server (public ${DROPBEAR_PORT_PUBLIC} + internal ${DROPBEAR_PORT_INTERNAL})
+Description=Dropbear SSH
 After=network.target
-
 [Service]
-ExecStart=/usr/sbin/dropbear -F -E \\
-  -p ${DROPBEAR_PORT_PUBLIC} \\
-  -p 127.0.0.1:${DROPBEAR_PORT_INTERNAL} \\
-  -r /etc/dropbear/dropbear_ecdsa_host_key \\
-  -r /etc/dropbear/dropbear_rsa_host_key
+ExecStart=/usr/sbin/dropbear -F -E -p ${DROPBEAR_PORT_PUBLIC} -p 127.0.0.1:${DROPBEAR_PORT_INTERNAL} \\
+  -r /etc/dropbear/dropbear_ecdsa_host_key -r /etc/dropbear/dropbear_rsa_host_key
 Restart=always
 RestartSec=3
-NoNewPrivileges=true
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
 systemctl enable --now dropbear
-systemctl status dropbear --no-pager -l | head -5
 
 ###############################################################################
-# 5. badvpn-udpgw (compile จาก source เพราะไม่มีใน apt ของ 22.04 แล้ว)
+# 5. badvpn-udpgw
 ###############################################################################
-log "5. คอมไพล์และติดตั้ง badvpn-udpgw"
+log "5. คอมไพล์ badvpn-udpgw"
 if [[ ! -f /usr/local/bin/badvpn-udpgw ]]; then
   rm -rf /usr/local/src/badvpn
   git clone --depth 1 https://github.com/ambrop72/badvpn.git /usr/local/src/badvpn
@@ -176,164 +118,111 @@ if [[ ! -f /usr/local/bin/badvpn-udpgw ]]; then
   make -j"$(nproc)"
   cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
   cd -
-else
-  warn "badvpn-udpgw มีอยู่แล้ว ข้ามการคอมไพล์"
 fi
 
 cat > /etc/systemd/system/badvpn-udpgw.service <<EOF
 [Unit]
 Description=BadVPN UDP Gateway
 After=network.target
-
 [Service]
-ExecStart=/usr/local/bin/badvpn-udpgw \\
-  --listen-addr 0.0.0.0:${UDPGW_PORT} \\
-  --max-clients 1000 \\
-  --max-connections-for-client 10
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 0.0.0.0:${UDPGW_PORT} --max-clients 1000 --max-connections-for-client 10
 Restart=always
 RestartSec=5
 User=nobody
-NoNewPrivileges=true
-PrivateTmp=true
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
 systemctl enable --now badvpn-udpgw
-systemctl status badvpn-udpgw --no-pager -l | head -5
 
 ###############################################################################
-# 6+7+8. Nginx + SSL (Certbot) + WebSocket reverse proxy
+# 6. Nginx + Self-signed SSL + WebSocket
 ###############################################################################
-log "6. ติดตั้ง Nginx"
+log "6. ติดตั้ง Nginx + สร้าง self-signed certificate (ใช้ IP แทนโดเมน)"
 apt install -y nginx
 rm -f /etc/nginx/sites-enabled/default
 
-log "7. ขอ SSL certificate ด้วย Certbot (standalone ชั่วคราว เพราะ nginx ยังไม่ฟัง 80/443)"
-apt install -y certbot python3-certbot-nginx
-systemctl stop nginx 2>/dev/null || true
-certbot certonly --standalone --non-interactive --agree-tos \
-  -m "$LE_EMAIL" -d "$DOMAIN" --preferred-challenges http
+mkdir -p /etc/nginx/ssl
+if [[ ! -f /etc/nginx/ssl/selfsigned.crt ]]; then
+  openssl req -x509 -nodes -newkey rsa:2048 -days 3650 \
+    -keyout /etc/nginx/ssl/selfsigned.key \
+    -out /etc/nginx/ssl/selfsigned.crt \
+    -subj "/CN=${SERVER_IP}"
+fi
 
-log "7.1 ตั้ง renewal hook: หยุด Dropbear พอร์ต 80 ชั่วคราวตอน renew (กันชนพอร์ต)"
-mkdir -p /etc/letsencrypt/renewal-hooks/pre /etc/letsencrypt/renewal-hooks/post
-cat > /etc/letsencrypt/renewal-hooks/pre/stop-services.sh <<'EOF'
-#!/bin/bash
-systemctl stop dropbear nginx
-EOF
-cat > /etc/letsencrypt/renewal-hooks/post/start-services.sh <<'EOF'
-#!/bin/bash
-systemctl start dropbear nginx
-EOF
-chmod +x /etc/letsencrypt/renewal-hooks/pre/stop-services.sh
-chmod +x /etc/letsencrypt/renewal-hooks/post/start-services.sh
-systemctl enable --now certbot.timer
-
-log "8. เขียนไฟล์ Nginx config พร้อม WebSocket upgrade headers"
 cat > /etc/nginx/sites-available/ssh-tunnel.conf <<EOF
 map \$http_upgrade \$connection_upgrade {
     default upgrade;
     ''      close;
 }
-
 server {
     listen ${NGINX_SSL_PORT} ssl;
     listen [::]:${NGINX_SSL_PORT} ssl;
-    server_name ${DOMAIN};
+    server_name _;
 
-    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         HIGH:!aNULL:!MD5;
+    ssl_certificate     /etc/nginx/ssl/selfsigned.crt;
+    ssl_certificate_key /etc/nginx/ssl/selfsigned.key;
+    ssl_protocols TLSv1.2 TLSv1.3;
 
     location /ssh-ws {
         proxy_pass http://127.0.0.1:${SSH_PORT};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
         proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
     }
-
     location /dropbear-ws {
         proxy_pass http://127.0.0.1:${DROPBEAR_PORT_INTERNAL};
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
         proxy_read_timeout 3600s;
-        proxy_send_timeout 3600s;
     }
-
     location /panel/ {
         proxy_pass http://127.0.0.1:${PANEL_PORT}/;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection \$connection_upgrade;
-        proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
     }
-
-    location / {
-        return 444;
-    }
+    location / { return 444; }
 }
 EOF
-
 ln -sf /etc/nginx/sites-available/ssh-tunnel.conf /etc/nginx/sites-enabled/ssh-tunnel.conf
 nginx -t
 systemctl enable --now nginx
 systemctl restart nginx
 
 ###############################################################################
-# 10. Fail2Ban
+# 7. Fail2Ban
 ###############################################################################
-log "10. ตั้งค่า Fail2Ban ป้องกัน brute force"
+log "7. Fail2Ban"
 cat > /etc/fail2ban/jail.local <<EOF
 [sshd]
-enabled  = true
-port     = ${SSH_PORT}
-filter   = sshd
-logpath  = /var/log/auth.log
+enabled = true
+port = ${SSH_PORT}
 maxretry = 4
 findtime = 300
-bantime  = 3600
-
-[nginx-http-auth]
-enabled  = true
-port     = http,https
-logpath  = /var/log/nginx/error.log
+bantime = 3600
 EOF
 systemctl enable --now fail2ban
 systemctl restart fail2ban
 
 ###############################################################################
-# 11. Web Panel (Node.js) — user management
+# 8. เว็บพาแนล (Node.js) — user/pass ล็อคตายตัวตามที่กำหนด
 ###############################################################################
-log "11. ติดตั้ง Node.js + เว็บพาแนลจัดการ user"
-if ! command -v node &>/dev/null; then
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt install -y nodejs
-fi
+log "8. ติดตั้งเว็บพาแนลจัดการ user"
+command -v node &>/dev/null || { curl -fsSL https://deb.nodesource.com/setup_20.x | bash -; apt install -y nodejs; }
 
 PANEL_DIR=/opt/ssh-panel
-mkdir -p /opt/ssh-panel/views /usr/local/bin/ssh-panel
+mkdir -p "$PANEL_DIR/views" /usr/local/bin/ssh-panel
 
-cat > /opt/ssh-panel/package.json <<'PANEL_PACKAGE_JSON'
+cat > "$PANEL_DIR/package.json" <<'EOF'
 {
   "name": "ssh-tunnel-panel",
   "version": "1.0.0",
-  "description": "Web panel for managing SSH tunnel user accounts",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js"
-  },
+  "scripts": { "start": "node server.js" },
   "dependencies": {
     "bcryptjs": "^2.4.3",
     "dotenv": "^16.4.5",
@@ -342,10 +231,9 @@ cat > /opt/ssh-panel/package.json <<'PANEL_PACKAGE_JSON'
     "express-session": "^1.18.0"
   }
 }
-PANEL_PACKAGE_JSON
+EOF
 
-cat > /opt/ssh-panel/server.js <<'PANEL_SERVER_JS'
-// server.js — SSH Tunnel User Management Panel
+cat > "$PANEL_DIR/server.js" <<'EOF'
 require('dotenv').config();
 const express = require('express');
 const session = require('express-session');
@@ -360,11 +248,6 @@ const ADMIN_USER = process.env.ADMIN_USER;
 const ADMIN_PASS_HASH = process.env.ADMIN_PASS_HASH;
 const SESSION_SECRET = process.env.SESSION_SECRET;
 
-if (!ADMIN_USER || !ADMIN_PASS_HASH || !SESSION_SECRET) {
-  console.error('ขาด ADMIN_USER / ADMIN_PASS_HASH / SESSION_SECRET ใน .env — รัน install.sh ให้เสร็จก่อน');
-  process.exit(1);
-}
-
 const SCRIPTS = {
   add: '/usr/local/bin/ssh-panel/adduser.sh',
   del: '/usr/local/bin/ssh-panel/deluser.sh',
@@ -374,41 +257,21 @@ const SCRIPTS = {
 
 app.set('trust proxy', 1);
 app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
-app.use(express.static(path.join(__dirname, 'public')));
-
 app.use(session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: {
-    httpOnly: true,
-    secure: true,
-    sameSite: 'strict',
-    maxAge: 1000 * 60 * 60 * 4,
-  },
+  cookie: { httpOnly: true, secure: true, sameSite: 'strict', maxAge: 1000 * 60 * 60 * 4 },
 }));
 
-const loginLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'ลองล็อกอินผิดหลายครั้งเกินไป กรุณารอ 15 นาที' },
-});
-
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5 });
 function requireAuth(req, res, next) {
   if (req.session && req.session.authed) return next();
   return res.status(401).json({ error: 'Unauthorized' });
 }
-
 const usernameRe = /^[a-z][a-z0-9_-]{2,31}$/;
-function validUsername(u) { return typeof u === 'string' && usernameRe.test(u); }
-function validPassword(p) { return typeof p === 'string' && p.length >= 6 && p.length <= 128 && !/\s/.test(p); }
-function validDays(d) {
-  const n = Number(d);
-  return Number.isInteger(n) && n > 0 && n <= 3650;
-}
+const validUsername = u => typeof u === 'string' && usernameRe.test(u);
+const validPassword = p => typeof p === 'string' && p.length >= 6 && p.length <= 128 && !/\s/.test(p);
 
 function runScript(scriptPath, args, res) {
   execFile('sudo', [scriptPath, ...args], { timeout: 10000 }, (err, stdout, stderr) => {
@@ -418,28 +281,21 @@ function runScript(scriptPath, args, res) {
 }
 
 app.get('/', (req, res) => {
-  const file = req.session && req.session.authed ? 'dashboard.html' : 'login.html';
-  res.sendFile(path.join(__dirname, 'views', file));
+  res.sendFile(path.join(__dirname, 'views', req.session?.authed ? 'dashboard.html' : 'login.html'));
 });
 
 app.post('/api/login', loginLimiter, async (req, res) => {
   const { username, password } = req.body || {};
-  if (typeof username !== 'string' || typeof password !== 'string') {
-    return res.status(400).json({ error: 'ข้อมูลไม่ถูกต้อง' });
+  if (username !== ADMIN_USER || !(await bcrypt.compare(password || '', ADMIN_PASS_HASH))) {
+    return res.status(401).json({ error: 'Username หรือ Password ไม่ถูกต้อง' });
   }
-  if (username !== ADMIN_USER) return res.status(401).json({ error: 'Username หรือ Password ไม่ถูกต้อง' });
-  const ok = await bcrypt.compare(password, ADMIN_PASS_HASH);
-  if (!ok) return res.status(401).json({ error: 'Username หรือ Password ไม่ถูกต้อง' });
-  req.session.regenerate((err) => {
-    if (err) return res.status(500).json({ error: 'เกิดข้อผิดพลาด' });
+  req.session.regenerate(err => {
+    if (err) return res.status(500).json({ error: 'error' });
     req.session.authed = true;
     res.json({ ok: true });
   });
 });
-
-app.post('/api/logout', (req, res) => {
-  req.session.destroy(() => res.json({ ok: true }));
-});
+app.post('/api/logout', (req, res) => req.session.destroy(() => res.json({ ok: true })));
 
 app.get('/api/users', requireAuth, (req, res) => {
   execFile('sudo', [SCRIPTS.list], { timeout: 10000 }, (err, stdout, stderr) => {
@@ -447,305 +303,160 @@ app.get('/api/users', requireAuth, (req, res) => {
     res.json({ users: stdout.trim().split('\n').filter(Boolean) });
   });
 });
-
 app.get('/api/online', requireAuth, (req, res) => {
   execFile('sudo', [SCRIPTS.online], { timeout: 10000 }, (err, stdout, stderr) => {
     if (err) return res.status(500).json({ error: (stderr || err.message).trim() });
     res.json({ online: stdout.trim() });
   });
 });
-
 app.post('/api/users', requireAuth, (req, res) => {
-  const { username, password, days } = req.body || {};
-  if (!validUsername(username)) {
-    return res.status(400).json({ error: 'Username ไม่ถูกต้อง (a-z, 0-9, _- เท่านั้น, 3-32 ตัวอักษร, ขึ้นต้นด้วยตัวอักษร)' });
-  }
-  if (!validPassword(password)) {
-    return res.status(400).json({ error: 'Password ไม่ถูกต้อง (6-128 ตัวอักษร ห้ามมีช่องว่าง)' });
-  }
-  if (!validDays(days)) {
-    return res.status(400).json({ error: 'จำนวนวันไม่ถูกต้อง (1-3650)' });
-  }
-  runScript(SCRIPTS.add, [username, password, String(days)], res);
-});
-
-app.delete('/api/users/:username', requireAuth, (req, res) => {
-  const { username } = req.params;
+  const { username, password } = req.body || {};
   if (!validUsername(username)) return res.status(400).json({ error: 'Username ไม่ถูกต้อง' });
-  runScript(SCRIPTS.del, [username], res);
+  if (!validPassword(password)) return res.status(400).json({ error: 'Password ไม่ถูกต้อง' });
+  runScript(SCRIPTS.add, [username, password], res);
+});
+app.delete('/api/users/:username', requireAuth, (req, res) => {
+  if (!validUsername(req.params.username)) return res.status(400).json({ error: 'Username ไม่ถูกต้อง' });
+  runScript(SCRIPTS.del, [req.params.username], res);
 });
 
-app.listen(PORT, '127.0.0.1', () => {
-  console.log(`SSH Panel listening on 127.0.0.1:${PORT}`);
-});
-PANEL_SERVER_JS
+app.listen(PORT, '127.0.0.1', () => console.log(`Panel on 127.0.0.1:${PORT}`));
+EOF
 
-cat > /opt/ssh-panel/views/login.html <<'PANEL_LOGIN_HTML'
-<!DOCTYPE html>
-<html lang="th">
-<head>
-<meta charset="UTF-8">
+cat > "$PANEL_DIR/views/login.html" <<'EOF'
+<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SSH Panel — Login</title>
+<title>SSH Panel</title>
 <style>
-  body { font-family: system-ui, sans-serif; background:#0f1117; color:#e6e6e6; display:flex; align-items:center; justify-content:center; height:100vh; margin:0; }
-  .card { background:#1a1d27; padding:2rem; border-radius:12px; width:320px; box-shadow:0 8px 24px rgba(0,0,0,.4); }
-  h1 { font-size:1.2rem; margin:0 0 1.2rem; text-align:center; }
-  input { width:100%; padding:.6rem; margin:.4rem 0; border-radius:6px; border:1px solid #333; background:#0f1117; color:#fff; box-sizing:border-box; }
-  button { width:100%; padding:.6rem; margin-top:.8rem; border:none; border-radius:6px; background:#2ecc71; color:#08120b; font-weight:600; cursor:pointer; }
-  button:hover { background:#27ae60; }
-  #err { color:#ff6b6b; font-size:.85rem; min-height:1.2rem; text-align:center; margin-top:.5rem; }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>SSH Tunnel Panel</h1>
-    <form id="loginForm">
-      <input type="text" id="username" placeholder="Username" autocomplete="username" required>
-      <input type="password" id="password" placeholder="Password" autocomplete="current-password" required>
-      <button type="submit">เข้าสู่ระบบ</button>
-      <div id="err"></div>
-    </form>
-  </div>
+body{font-family:system-ui;background:#0f1117;color:#eee;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}
+.card{background:#1a1d27;padding:2rem;border-radius:12px;width:300px}
+input{width:100%;padding:.6rem;margin:.4rem 0;border-radius:6px;border:1px solid #333;background:#0f1117;color:#fff;box-sizing:border-box}
+button{width:100%;padding:.6rem;margin-top:.6rem;border:none;border-radius:6px;background:#2ecc71;font-weight:600;cursor:pointer}
+#err{color:#ff6b6b;font-size:.85rem;text-align:center;margin-top:.5rem}
+</style></head><body>
+<div class="card">
+<h2 style="text-align:center">SSH Tunnel Panel</h2>
+<form id="f">
+<input id="u" placeholder="Username" required>
+<input id="p" type="password" placeholder="Password" required>
+<button>เข้าสู่ระบบ</button>
+<div id="err"></div>
+</form></div>
 <script>
-document.getElementById('loginForm').addEventListener('submit', async (e) => {
+f.addEventListener('submit', async e=>{
   e.preventDefault();
-  const username = document.getElementById('username').value;
-  const password = document.getElementById('password').value;
-  const errEl = document.getElementById('err');
-  errEl.textContent = '';
-  try {
-    const r = await fetch('api/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
-    });
-    const data = await r.json();
-    if (r.ok && data.ok) {
-      location.reload();
-    } else {
-      errEl.textContent = data.error || 'เข้าสู่ระบบไม่สำเร็จ';
-    }
-  } catch {
-    errEl.textContent = 'เชื่อมต่อไม่ได้';
-  }
+  const r = await fetch('api/login',{method:'POST',headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({username:u.value,password:p.value})});
+  const d = await r.json();
+  if (r.ok && d.ok) location.reload(); else err.textContent = d.error||'ผิดพลาด';
 });
-</script>
-</body>
-</html>
-PANEL_LOGIN_HTML
+</script></body></html>
+EOF
 
-cat > /opt/ssh-panel/views/dashboard.html <<'PANEL_DASHBOARD_HTML'
-<!DOCTYPE html>
-<html lang="th">
-<head>
-<meta charset="UTF-8">
+cat > "$PANEL_DIR/views/dashboard.html" <<'EOF'
+<!DOCTYPE html><html lang="th"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>SSH Panel — Dashboard</title>
+<title>Dashboard</title>
 <style>
-  body { font-family: system-ui, sans-serif; background:#0f1117; color:#e6e6e6; margin:0; padding:1.5rem; }
-  .wrap { max-width:720px; margin:0 auto; }
-  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:1.2rem; }
-  h1 { font-size:1.2rem; margin:0; }
-  button { border:none; border-radius:6px; padding:.5rem .9rem; cursor:pointer; font-weight:600; }
-  .btn-primary { background:#2ecc71; color:#08120b; }
-  .btn-danger { background:#e74c3c; color:#fff; }
-  .btn-logout { background:#333; color:#eee; }
-  .card { background:#1a1d27; border-radius:10px; padding:1rem 1.2rem; margin-bottom:1rem; }
-  form.inline { display:flex; gap:.5rem; flex-wrap:wrap; }
-  input { flex:1; min-width:100px; padding:.5rem; border-radius:6px; border:1px solid #333; background:#0f1117; color:#fff; }
-  table { width:100%; border-collapse:collapse; font-size:.9rem; }
-  th, td { text-align:left; padding:.4rem .3rem; border-bottom:1px solid #2a2d38; }
-  #msg { min-height:1.2rem; font-size:.85rem; margin-top:.5rem; }
-  #msg.ok { color:#2ecc71; }
-  #msg.err { color:#ff6b6b; }
-  pre { white-space:pre-wrap; font-size:.8rem; background:#0f1117; padding:.6rem; border-radius:6px; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <header>
-    <h1>SSH Tunnel — User Management</h1>
-    <button class="btn-logout" id="logoutBtn">ออกจากระบบ</button>
-  </header>
-
-  <div class="card">
-    <h3>เพิ่ม User ใหม่</h3>
-    <form class="inline" id="addForm">
-      <input type="text" id="newUser" placeholder="username" required>
-      <input type="text" id="newPass" placeholder="password" required>
-      <input type="number" id="newDays" placeholder="อายุ (วัน)" value="30" min="1" max="3650" required>
-      <button class="btn-primary" type="submit">เพิ่ม</button>
-    </form>
-    <div id="msg"></div>
-  </div>
-
-  <div class="card">
-    <h3>รายชื่อ User <button onclick="loadUsers()" style="float:right" class="btn-logout">รีเฟรช</button></h3>
-    <table id="userTable"><tbody></tbody></table>
-  </div>
-
-  <div class="card">
-    <h3>สถานะออนไลน์ <button onclick="loadOnline()" style="float:right" class="btn-logout">รีเฟรช</button></h3>
-    <pre id="onlineBox">-</pre>
-  </div>
+body{font-family:system-ui;background:#0f1117;color:#eee;margin:0;padding:1.5rem}
+.wrap{max-width:700px;margin:0 auto}
+header{display:flex;justify-content:space-between;margin-bottom:1rem}
+button{border:none;border-radius:6px;padding:.5rem .9rem;cursor:pointer;font-weight:600}
+.card{background:#1a1d27;border-radius:10px;padding:1rem;margin-bottom:1rem}
+input{padding:.5rem;border-radius:6px;border:1px solid #333;background:#0f1117;color:#fff;margin-right:.4rem}
+table{width:100%;border-collapse:collapse;font-size:.9rem}
+td,th{padding:.4rem;border-bottom:1px solid #2a2d38;text-align:left}
+#msg{min-height:1.2rem;font-size:.85rem}
+</style></head><body><div class="wrap">
+<header><h2>SSH Tunnel — Users</h2><button onclick="logout()">ออกจากระบบ</button></header>
+<div class="card">
+<h4>เพิ่ม User</h4>
+<form id="addF">
+<input id="nu" placeholder="username" required>
+<input id="np" placeholder="password" required>
+<button style="background:#2ecc71">เพิ่ม</button>
+</form><div id="msg"></div>
 </div>
-
+<div class="card"><h4>User ทั้งหมด <button onclick="loadUsers()" style="float:right;background:#333;color:#eee">รีเฟรช</button></h4>
+<table id="tbl"><tbody></tbody></table></div>
+<div class="card"><h4>ออนไลน์ <button onclick="loadOnline()" style="float:right;background:#333;color:#eee">รีเฟรช</button></h4>
+<pre id="onl" style="white-space:pre-wrap;font-size:.8rem">-</pre></div>
+</div>
 <script>
-function setMsg(text, ok) {
-  const el = document.getElementById('msg');
-  el.textContent = text;
-  el.className = ok ? 'ok' : 'err';
-}
-
-async function loadUsers() {
-  const r = await fetch('api/users');
-  const data = await r.json();
-  const tbody = document.querySelector('#userTable tbody');
-  tbody.innerHTML = '';
-  if (!r.ok) { setMsg(data.error || 'โหลดรายชื่อไม่สำเร็จ', false); return; }
-  (data.users || []).forEach(line => {
-    const [user, rest] = line.split(' | ');
-    const tr = document.createElement('tr');
-    tr.innerHTML = `<td>${user}</td><td>${rest || ''}</td><td><button class="btn-danger" data-u="${user}">ลบ</button></td>`;
-    tbody.appendChild(tr);
+async function loadUsers(){
+  const r=await fetch('api/users'); const d=await r.json();
+  const tb=document.querySelector('#tbl tbody'); tb.innerHTML='';
+  (d.users||[]).forEach(l=>{
+    const [u,rest]=l.split(' | ');
+    const tr=document.createElement('tr');
+    tr.innerHTML=`<td>${u}</td><td>${rest||''}</td><td><button style="background:#e74c3c;color:#fff" data-u="${u}">ลบ</button></td>`;
+    tb.appendChild(tr);
   });
-  tbody.querySelectorAll('button[data-u]').forEach(btn => {
-    btn.addEventListener('click', () => deleteUser(btn.dataset.u));
-  });
+  tb.querySelectorAll('button[data-u]').forEach(b=>b.onclick=()=>delUser(b.dataset.u));
 }
-
-async function loadOnline() {
-  const r = await fetch('api/online');
-  const data = await r.json();
-  document.getElementById('onlineBox').textContent = r.ok ? (data.online || '-') : (data.error || 'error');
+async function loadOnline(){
+  const r=await fetch('api/online'); const d=await r.json();
+  onl.textContent = r.ok ? d.online : d.error;
 }
-
-async function deleteUser(username) {
-  if (!confirm(`ยืนยันลบ user "${username}" ?`)) return;
-  const r = await fetch(`api/users/${encodeURIComponent(username)}`, { method: 'DELETE' });
-  const data = await r.json();
-  setMsg(data.message || data.error, r.ok);
-  loadUsers();
+async function delUser(u){
+  if(!confirm('ลบ '+u+' ?'))return;
+  const r=await fetch('api/users/'+encodeURIComponent(u),{method:'DELETE'});
+  const d=await r.json(); msg.textContent=d.message||d.error; loadUsers();
 }
-
-document.getElementById('addForm').addEventListener('submit', async (e) => {
+addF.addEventListener('submit', async e=>{
   e.preventDefault();
-  const username = document.getElementById('newUser').value.trim();
-  const password = document.getElementById('newPass').value;
-  const days = document.getElementById('newDays').value;
-  const r = await fetch('api/users', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ username, password, days })
-  });
-  const data = await r.json();
-  setMsg(data.message || data.error, r.ok);
-  if (r.ok) {
-    document.getElementById('addForm').reset();
-    document.getElementById('newDays').value = 30;
-    loadUsers();
-  }
+  const r=await fetch('api/users',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({username:nu.value.trim(),password:np.value})});
+  const d=await r.json(); msg.textContent=d.message||d.error;
+  if(r.ok){addF.reset(); loadUsers();}
 });
+async function logout(){await fetch('api/logout',{method:'POST'}); location.reload();}
+loadUsers(); loadOnline();
+</script></body></html>
+EOF
 
-document.getElementById('logoutBtn').addEventListener('click', async () => {
-  await fetch('api/logout', { method: 'POST' });
-  location.reload();
-});
-
-loadUsers();
-loadOnline();
-</script>
-</body>
-</html>
-PANEL_DASHBOARD_HTML
-
-cat > /usr/local/bin/ssh-panel/adduser.sh <<'PANEL_ADDUSER_SH'
+cat > /usr/local/bin/ssh-panel/adduser.sh <<'EOF'
 #!/bin/bash
-# adduser.sh <username> <password> <expiry_days>
 set -euo pipefail
-
-USERNAME="${1:-}"
-PASSWORD="${2:-}"
-DAYS="${3:-}"
-
-if ! [[ "$USERNAME" =~ ^[a-z][a-z0-9_-]{2,31}$ ]]; then
-  echo "Invalid username" >&2
-  exit 1
-fi
-if [[ -z "$PASSWORD" || "$PASSWORD" =~ [[:space:]] ]]; then
-  echo "Invalid password" >&2
-  exit 1
-fi
-if ! [[ "$DAYS" =~ ^[0-9]+$ ]] || [[ "$DAYS" -lt 1 || "$DAYS" -gt 3650 ]]; then
-  echo "Invalid expiry days" >&2
-  exit 1
-fi
-if id "$USERNAME" &>/dev/null; then
-  echo "User already exists" >&2
-  exit 1
-fi
-
-EXPIRE_DATE=$(date -d "+${DAYS} days" +%Y-%m-%d)
-
-useradd -m -s /usr/sbin/nologin -e "$EXPIRE_DATE" "$USERNAME"
+USERNAME="${1:-}"; PASSWORD="${2:-}"
+[[ "$USERNAME" =~ ^[a-z][a-z0-9_-]{2,31}$ ]] || { echo "Invalid username" >&2; exit 1; }
+[[ -n "$PASSWORD" && ! "$PASSWORD" =~ [[:space:]] ]] || { echo "Invalid password" >&2; exit 1; }
+id "$USERNAME" &>/dev/null && { echo "User exists" >&2; exit 1; }
+useradd -m -s /usr/sbin/nologin "$USERNAME"
 echo "${USERNAME}:${PASSWORD}" | chpasswd
+echo "Created ${USERNAME} (ไม่จำกัดวันใช้งาน)"
+EOF
 
-echo "Created user ${USERNAME}, expires ${EXPIRE_DATE}"
-PANEL_ADDUSER_SH
-
-cat > /usr/local/bin/ssh-panel/deluser.sh <<'PANEL_DELUSER_SH'
+cat > /usr/local/bin/ssh-panel/deluser.sh <<'EOF'
 #!/bin/bash
-# deluser.sh <username>
 set -euo pipefail
-
 USERNAME="${1:-}"
-
-if ! [[ "$USERNAME" =~ ^[a-z][a-z0-9_-]{2,31}$ ]]; then
-  echo "Invalid username" >&2
-  exit 1
-fi
-if ! id "$USERNAME" &>/dev/null; then
-  echo "User does not exist" >&2
-  exit 1
-fi
-if [[ "$USERNAME" == "root" || "$USERNAME" == "panelsvc" ]]; then
-  echo "Refusing to delete protected account" >&2
-  exit 1
-fi
-
+[[ "$USERNAME" =~ ^[a-z][a-z0-9_-]{2,31}$ ]] || { echo "Invalid username" >&2; exit 1; }
+id "$USERNAME" &>/dev/null || { echo "No such user" >&2; exit 1; }
+[[ "$USERNAME" != "root" && "$USERNAME" != "panelsvc" ]] || { echo "Protected" >&2; exit 1; }
 pkill -KILL -u "$USERNAME" 2>/dev/null || true
 userdel -r "$USERNAME"
+echo "Deleted ${USERNAME}"
+EOF
 
-echo "Deleted user ${USERNAME}"
-PANEL_DELUSER_SH
-
-cat > /usr/local/bin/ssh-panel/listusers.sh <<'PANEL_LISTUSERS_SH'
+cat > /usr/local/bin/ssh-panel/listusers.sh <<'EOF'
 #!/bin/bash
-# listusers.sh — แสดง user ที่เป็นบัญชี SSH tunnel (uid >= 1000, ไม่รวม system user)
 set -euo pipefail
-
-awk -F: '$3 >= 1000 && $3 < 60000 && $1 != "panelsvc" && $1 != "nobody" {print $1}' /etc/passwd | \
-while read -r u; do
-  exp=$(chage -l "$u" 2>/dev/null | grep "Account expires" | cut -d: -f2 | sed 's/^ *//')
-  echo "${u} | expires: ${exp:-never}"
+awk -F: '$3>=1000 && $3<60000 && $1!="panelsvc" && $1!="nobody"{print $1}' /etc/passwd | while read -r u; do
+  echo "${u} | ไม่จำกัดวันใช้งาน"
 done
-PANEL_LISTUSERS_SH
+EOF
 
-cat > /usr/local/bin/ssh-panel/onlineusers.sh <<'PANEL_ONLINEUSERS_SH'
+cat > /usr/local/bin/ssh-panel/onlineusers.sh <<'EOF'
 #!/bin/bash
-# onlineusers.sh — แสดง session ที่ล็อกอินอยู่ + connection ที่ established บนพอร์ตที่ใช้งาน
 set -euo pipefail
-
-echo "--- who ---"
-who || true
-echo "--- established connections (22/80/443) ---"
+echo "--- who ---"; who || true
+echo "--- established (22/80/443) ---"
 ss -tnp state established '( dport = :22 or dport = :80 or dport = :443 or sport = :22 or sport = :80 or sport = :443 )' 2>/dev/null || true
-PANEL_ONLINEUSERS_SH
+EOF
 
 chown root:root /usr/local/bin/ssh-panel/*.sh
 chmod 700 /usr/local/bin/ssh-panel/*.sh
-
 id -u panelsvc &>/dev/null || useradd -r -s /usr/sbin/nologin panelsvc
 
 cat > /etc/sudoers.d/ssh-panel <<EOF
@@ -754,10 +465,9 @@ EOF
 chmod 440 /etc/sudoers.d/ssh-panel
 visudo -c
 
-log "สร้าง password hash สำหรับพาแนล (bcrypt)"
 cd "$PANEL_DIR"
 npm install --omit=dev
-ADMIN_HASH=$(node -e "const b=require('bcryptjs'); b.hash(process.argv[1],10).then(h=>console.log(h))" "$PANEL_ADMIN_PASS")
+ADMIN_HASH=$(node -e "require('bcryptjs').hash(process.argv[1],10).then(h=>console.log(h))" "$PANEL_ADMIN_PASS")
 SESSION_SECRET=$(openssl rand -hex 32)
 
 cat > "$PANEL_DIR/.env" <<EOF
@@ -771,38 +481,28 @@ chown -R panelsvc:panelsvc "$PANEL_DIR"
 
 cat > /etc/systemd/system/ssh-panel.service <<EOF
 [Unit]
-Description=SSH Tunnel User Management Panel
+Description=SSH Tunnel Panel
 After=network.target
-
 [Service]
-Type=simple
 User=panelsvc
 WorkingDirectory=${PANEL_DIR}
 ExecStart=/usr/bin/node ${PANEL_DIR}/server.js
 Restart=always
 RestartSec=5
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=${PANEL_DIR}
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
 systemctl enable --now ssh-panel
-systemctl status ssh-panel --no-pager -l | head -5
 
 ###############################################################################
-# 12. Optimization: sysctl, limits, BBR
+# 9. Optimize (BBR + CAKE 350mbit)
 ###############################################################################
-log "12. ปรับแต่ง sysctl / limits / เปิด BBR"
+log "9. เปิด BBR + ตั้ง CAKE 350mbit"
 modprobe tcp_bbr 2>/dev/null || true
 echo "tcp_bbr" > /etc/modules-load.d/bbr.conf
-
 cat >> /etc/sysctl.conf <<'EOF'
 
-# --- SSH Tunnel Server Optimization ---
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.core.rmem_max = 16777216
@@ -811,75 +511,56 @@ net.ipv4.tcp_rmem = 4096 87380 16777216
 net.ipv4.tcp_wmem = 4096 65536 16777216
 net.ipv4.tcp_fin_timeout = 15
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.ip_local_port_range = 1024 65535
 fs.file-max = 100000
 EOF
 sysctl -p
-
 cat >> /etc/security/limits.conf <<'EOF'
 * soft nofile 65535
 * hard nofile 65535
 EOF
 
-sysctl net.ipv4.tcp_congestion_control
-
-###############################################################################
-# 12.1 CAKE qdisc — shaping คงที่ที่ 350mbit ตามที่กำหนด (ไม่ถามระหว่างติดตั้ง)
-###############################################################################
-log "12.1 โหลด sch_cake และตั้ง shaping บน interface ขาออกจริง (fix 350mbit, rtt 50ms, dual-dsthost)"
-
-modprobe sch_cake 2>/dev/null || warn "โหลด sch_cake ไม่สำเร็จ (เช็ค kernel version: uname -r ต้อง >= 4.19)"
+modprobe sch_cake 2>/dev/null || true
 echo "sch_cake" > /etc/modules-load.d/sch_cake.conf
-
 cat > /usr/local/bin/apply-cake.sh <<EOF
 #!/bin/bash
-# apply-cake.sh — ตั้ง CAKE บน default-route interface ทุกครั้งที่บูต
-# bandwidth fix ไว้ที่ ${CAKE_MBIT}mbit ตามที่กำหนดตายตัว ไม่ผูกกับ prompt ใดๆ
 set -euo pipefail
 IFACE=\$(ip -4 route show default | awk '{for(i=1;i<=NF;i++) if (\$i=="dev") print \$(i+1)}' | head -1)
-if [[ -z "\$IFACE" ]]; then
-  echo "ไม่พบ default route interface" >&2
-  exit 1
-fi
 modprobe sch_cake 2>/dev/null || true
 tc qdisc replace dev "\$IFACE" root cake bandwidth ${CAKE_MBIT}mbit rtt 50ms dual-dsthost
-echo "Applied CAKE on \$IFACE: bandwidth=${CAKE_MBIT}mbit rtt=50ms dual-dsthost"
 EOF
 chmod +x /usr/local/bin/apply-cake.sh
-
 cat > /etc/systemd/system/cake-shaper.service <<'EOF'
 [Unit]
-Description=Apply CAKE qdisc shaping on public interface
+Description=CAKE shaping
 After=network-online.target
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/bin/apply-cake.sh
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
-
 systemctl daemon-reload
 systemctl enable --now cake-shaper
-systemctl status cake-shaper --no-pager -l | head -5
 
-warn "ถ้าลิงก์จริงเปลี่ยน (อัปเกรด/ลดแพ็กเกจ VPS) ต้องแก้ CAKE_MBIT ใน /usr/local/bin/apply-cake.sh เอง"
-warn "  แล้วรัน: sudo systemctl restart cake-shaper"
-
-log "เสร็จสิ้น! สรุปข้อมูลสำคัญ:"
+###############################################################################
+# สรุป
+###############################################################################
+log "เสร็จสิ้น!"
 cat <<SUMMARY
 
-  Domain            : ${DOMAIN}
-  OpenSSH           : ${DOMAIN}:${SSH_PORT}          (user: ${SYS_USER})
-  Dropbear (raw)    : ${DOMAIN}:${DROPBEAR_PORT_PUBLIC}
-  WSS OpenSSH       : wss://${DOMAIN}:${NGINX_SSL_PORT}/ssh-ws
-  WSS Dropbear      : wss://${DOMAIN}:${NGINX_SSL_PORT}/dropbear-ws
-  UDP Custom (udpgw): ${DOMAIN}:${UDPGW_PORT} (UDP)
-  เว็บพาแนล         : https://${DOMAIN}/panel/  (login: ${PANEL_ADMIN_USER})
-  CAKE shaping      : ${CAKE_MBIT}mbit (fix ตายตัว), rtt=50ms, dual-dsthost
+  IP เซิร์ฟเวอร์      : ${SERVER_IP}
+  OpenSSH            : ${SERVER_IP}:${SSH_PORT}
+  Dropbear (raw)      : ${SERVER_IP}:${DROPBEAR_PORT_PUBLIC}
+  WSS OpenSSH         : wss://${SERVER_IP}:${NGINX_SSL_PORT}/ssh-ws  (self-signed, ยอมรับ cert warning ตอนต่อ)
+  WSS Dropbear        : wss://${SERVER_IP}:${NGINX_SSL_PORT}/dropbear-ws
+  UDP Custom (udpgw)  : ${SERVER_IP}:${UDPGW_PORT} (UDP)
+  เว็บพาแนล           : https://${SERVER_IP}/panel/
+    -> login: ${PANEL_ADMIN_USER}
+    -> password: (ตามที่กำหนดไว้ ไม่แสดงซ้ำในนี้ เพราะคุณให้มาเองแล้ว)
+  CAKE shaping        : ${CAKE_MBIT}mbit rtt=50ms dual-dsthost
 
-  *** เก็บรหัสผ่านทั้งหมดไว้ให้ปลอดภัย และลบ history ของ terminal ที่พิมพ์รหัสผ่านไว้ ***
+  User ระบบสำหรับ sudo (${SYS_USER}) รหัสผ่านที่สุ่มให้: ${SYS_USER_PASS}
+  *** จดรหัสนี้เก็บไว้ทันที แล้วลบ/เลื่อน terminal history ทิ้ง ***
 SUMMARY
