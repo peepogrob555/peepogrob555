@@ -1,5 +1,4 @@
 #!/bin/bash
-#สำหร้บใช้กับHTTP CUSTOM Enable DNS✅ UDP CUSTOM✅ หลักๆทำมาใช้เองแต่เอาไปใช้ได้เน้นปิงต่ำ เล่นเกมส์ ใช้งานทั่วไป
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
@@ -27,7 +26,7 @@ echo -e "  เลือกวิธีให้ผู้ใช้เชื่อ
 echo -e "${CYAN}══════════════════════════════════════════════════════════════${NC}"
 echo -e "  ${GREEN}[1] Domain${NC}   (ตัวอย่าง: vpn.example.com)"
 echo -e "      ต้องมีโดเมนตั้ง A record ชี้มา ${SERVER_IP} ไว้ก่อนแล้ว"
-echo -e "      ข้อดี: จำง่าย, ซ่อน IP จริงผ่าน Cloudflare proxy ได้ (เฉพาะพอต TLS/HTTP)"
+echo -e "      ข้อดี: จำง่าย, ใช้แทน IP ได้ (โหมดนี้ไม่มี TLS แนะนำตั้ง Cloudflare เป็น DNS only เท่านั้น)"
 echo -e "      ข้อเสีย: ถ้า DNS ล่มหรือตั้งผิด ต่อไม่ได้จนกว่าจะแก้"
 echo ""
 echo -e "  ${GREEN}[2] IP ตรง${NC}   (${SERVER_IP})"
@@ -45,20 +44,17 @@ case "$CONN_MODE" in
       read -rp "โดเมนว่างไม่ได้ กรอกใหม่: " USER_DOMAIN
     done
     CONNECT_ADDRESS="$USER_DOMAIN"
-    CERT_CN="$USER_DOMAIN"
     echo -e "   ${GREEN}✓ เลือกโหมด Domain -> ${CONNECT_ADDRESS}${NC}"
     ;;
   2)
     USER_DOMAIN=""
     CONNECT_ADDRESS="$SERVER_IP"
-    CERT_CN="$SERVER_IP"
     echo -e "   ${GREEN}✓ เลือกโหมด IP ตรง -> ${CONNECT_ADDRESS}${NC}"
     ;;
   *)
     echo -e "   ${YELLOW}⚠️ เลือกไม่ถูกต้อง ใช้ค่าเริ่มต้นเป็น IP ตรง${NC}"
     USER_DOMAIN=""
     CONNECT_ADDRESS="$SERVER_IP"
-    CERT_CN="$SERVER_IP"
     ;;
 esac
 
@@ -70,8 +66,8 @@ apt -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" up
 echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
 echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
 apt install -y curl wget git ufw fail2ban iptables-persistent netfilter-persistent \
-  dnsutils vnstat htop unzip ipset openssl build-essential cmake \
-  dropbear stunnel4 squid
+  dnsutils vnstat htop unzip ipset build-essential cmake python3 \
+  dropbear squid
 
 echo ""
 echo "🌐 [2/10] ล็อก DNS ให้ใช้ Cloudflare (1.1.1.1 / 1.0.0.1) อย่างเดียว..."
@@ -174,6 +170,14 @@ EOF
 sysctl --system > /dev/null 2>&1 || echo "   ⚠️ บาง sysctl key ยังไม่พร้อม จะครบหลัง reboot"
 echo "   ✓ ตั้งค่า sysctl แล้ว"
 
+echo "   กำลังตั้ง MSS clamp = 1400 (ไม่มี TLS แล้ว overhead เหลือแค่ SSH framing + WS handshake ครั้งเดียว แต่ยังกัน PMTUD blackhole บนมือถือไทยไว้)..."
+iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1400 2>/dev/null || \
+  iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1400
+iptables -t mangle -C FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1400 2>/dev/null || \
+  iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 1400
+netfilter-persistent save > /dev/null 2>&1
+echo "   ✓ MSS clamp ตั้งแล้ว ไม่ต้องพึ่งค่า MTU ฝั่ง client เลย"
+
 cat > /etc/security/limits.d/99-udpcustom.conf << 'EOF'
 * soft nofile 1048576
 * hard nofile 1048576
@@ -221,50 +225,96 @@ systemctl restart dropbear
 echo "   ✓ Dropbear ทำงานที่พอต 2222, 2082, 2086, 2095"
 
 echo ""
-echo "🔐 [7/10] ตั้งค่า Stunnel4 (SSH ห่อ TLS พอตกลุ่ม SSL)..."
-mkdir -p /etc/stunnel
-openssl req -newkey rsa:2048 -x509 -days 3650 -nodes \
-  -subj "/C=TH/ST=Bangkok/L=Bangkok/O=VPN/CN=${CERT_CN}" \
-  -keyout /etc/stunnel/key.pem -out /etc/stunnel/cert.pem > /dev/null 2>&1
-cat /etc/stunnel/key.pem /etc/stunnel/cert.pem > /etc/stunnel/stunnel.pem
-chmod 600 /etc/stunnel/stunnel.pem
+echo "🔌 [7/10] ตั้งค่า WebSocket Proxy (ไม่มี TLS) ห่อ SSH ไว้ในพอตกลุ่ม HTTP..."
+cat > /usr/local/bin/ws-proxy.py << 'PYEOF'
+#!/usr/bin/env python3
+import socket
+import threading
 
-cat > /etc/stunnel/stunnel.conf << 'EOF'
-pid = /var/run/stunnel4.pid
-cert = /etc/stunnel/stunnel.pem
-client = no
-socket = l:TCP_NODELAY=1
-socket = r:TCP_NODELAY=1
+LISTEN_PORTS = [443, 8443, 2053, 2083, 2087, 2096]
+TARGET_HOST = "127.0.0.1"
+TARGET_PORT = 2222
+BUFFER_SIZE = 65536
+HANDSHAKE_RESPONSE = (
+    b"HTTP/1.1 101 Switching Protocols\r\n"
+    b"Upgrade: websocket\r\n"
+    b"Connection: Upgrade\r\n\r\n"
+)
 
-[ssh-443]
-accept = 443
-connect = 127.0.0.1:22
+def relay(src, dst):
+    try:
+        while True:
+            data = src.recv(BUFFER_SIZE)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for sock in (src, dst):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
 
-[ssh-8443]
-accept = 8443
-connect = 127.0.0.1:22
+def handle_client(client_sock):
+    target_sock = None
+    try:
+        client_sock.settimeout(10)
+        client_sock.recv(BUFFER_SIZE)
+        client_sock.settimeout(None)
+        client_sock.sendall(HANDSHAKE_RESPONSE)
+        target_sock = socket.create_connection((TARGET_HOST, TARGET_PORT))
+        t1 = threading.Thread(target=relay, args=(client_sock, target_sock), daemon=True)
+        t2 = threading.Thread(target=relay, args=(target_sock, client_sock), daemon=True)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+    except OSError:
+        pass
+    finally:
+        client_sock.close()
+        if target_sock is not None:
+            target_sock.close()
 
-[ssh-2053]
-accept = 2053
-connect = 127.0.0.1:22
+def listen_on_port(port):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("0.0.0.0", port))
+    server.listen(256)
+    while True:
+        client_sock, _ = server.accept()
+        client_sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        threading.Thread(target=handle_client, args=(client_sock,), daemon=True).start()
 
-[ssh-2083]
-accept = 2083
-connect = 127.0.0.1:22
+if __name__ == "__main__":
+    threads = []
+    for port in LISTEN_PORTS:
+        t = threading.Thread(target=listen_on_port, args=(port,), daemon=True)
+        t.start()
+        threads.append(t)
+    for t in threads:
+        t.join()
+PYEOF
+chmod +x /usr/local/bin/ws-proxy.py
 
-[ssh-2087]
-accept = 2087
-connect = 127.0.0.1:22
+cat > /etc/systemd/system/ws-proxy.service << 'EOF'
+[Unit]
+Description=SSH WebSocket Proxy (no TLS)
+After=network.target dropbear.service
 
-[ssh-2096]
-accept = 2096
-connect = 127.0.0.1:22
+[Service]
+ExecStart=/usr/bin/python3 /usr/local/bin/ws-proxy.py
+Restart=always
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
 EOF
-
-sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4 2>/dev/null || echo "ENABLED=1" > /etc/default/stunnel4
-systemctl enable stunnel4 > /dev/null 2>&1
-systemctl restart stunnel4
-echo "   ✓ Stunnel4 ทำงานที่พอต 443, 8443, 2053, 2083, 2087, 2096 (cert CN=${CERT_CN})"
+systemctl daemon-reload
+systemctl enable --now ws-proxy > /dev/null 2>&1
+echo "   ✓ WebSocket Proxy (ไม่มี TLS) ทำงานที่พอต 443, 8443, 2053, 2083, 2087, 2096 -> forward เข้า dropbear 127.0.0.1:2222"
 
 echo ""
 echo "🌍 [8/10] ตั้งค่า Squid (CONNECT proxy จำกัดเฉพาะไปพอต SSH)..."
@@ -278,7 +328,7 @@ http_port 80
 http_port 8080
 http_port 8880
 http_port 2052
-visible_hostname ${CERT_CN}
+visible_hostname ${CONNECT_ADDRESS}
 EOF
 systemctl enable squid > /dev/null 2>&1
 systemctl restart squid
@@ -318,13 +368,13 @@ if [ -n "$USER_DOMAIN" ]; then
   cat << EOF
    ตั้งค่าที่ผู้ให้บริการโดเมน/Cloudflare สำหรับ ${USER_DOMAIN}:
    -> A record: ${USER_DOMAIN} -> ${SERVER_IP}
-   -> proxy status เลือก "DNS only" (เมฆสีเทา) สำหรับพอต SSH ตรง/UDP
-   -> ถ้าอยากซ่อน IP ผ่าน Cloudflare proxy (เมฆสีส้ม) ใช้ได้เฉพาะพอตกลุ่ม
-      443, 8443, 2053, 2083, 2087, 2096 (Stunnel/TLS) และ 80, 8080, 8880,
-      2052 (Squid) เท่านั้น เพราะ Cloudflare free/pro ไม่รองรับ UDP และ
-      ไม่รองรับ TCP พอตอื่นที่ไม่อยู่ในลิสต์ของ Cloudflare
+   -> proxy status เลือก "DNS only" (เมฆสีเทา) เท่านั้น
+   -> ⚠️ ไม่มี TLS ที่ต้นทางแล้ว ถ้าเปลี่ยนเป็น Cloudflare proxy (เมฆสีส้ม)
+      จะบังคับ SSL mode เป็น "Flexible" เท่านั้น ซึ่งข้อมูลช่วง Cloudflare
+      -> เซิร์ฟเวอร์เราจะวิ่งแบบ plaintext ทั้งเส้น (ไม่ปลอดภัยเพิ่มความเสี่ยง
+      ถูกดักข้อมูลกลางทาง) แนะนำให้คง "DNS only" ไว้ตลอดสำหรับสถาปัตยกรรมนี้
    -> พอต 22, 2222, 2082, 2086, 2095 (Dropbear ตรง) และ UDP ทั้งหมด ต้องวิ่ง
-      ตรงเข้า IP เท่านั้น ต่อผ่าน Cloudflare proxy ไม่ได้
+      ตรงเข้า IP เท่านั้น ต่อผ่าน Cloudflare proxy ไม่ได้อยู่แล้ว
 EOF
 else
   echo "   โหมด IP ตรง — ไม่ต้องตั้งค่าโดเมนใดๆ ใช้ ${SERVER_IP} เชื่อมต่อได้ทันที"
@@ -339,22 +389,25 @@ echo "   ufw status verbose"
 echo "   sysctl net.ipv4.tcp_congestion_control     # ควรได้ bbr"
 echo "   sysctl net.core.default_qdisc              # ควรได้ cake"
 echo "   cat /etc/resolv.conf                       # ควรเห็นแค่ 1.1.1.1 / 1.0.0.1"
-echo "   systemctl status dropbear stunnel4 squid badvpn-udpgw fail2ban"
+echo "   systemctl status dropbear ws-proxy squid badvpn-udpgw fail2ban"
 echo "   fail2ban-client status sshd"
 echo "   fail2ban-client status dropbear"
 echo "   ss -tulnp | grep -E ':(22|2222|443|8443|2052|2053|2082|2083|2086|2087|2095|2096|80|8080|8880)\\b'"
+echo "   iptables -t mangle -L -n -v | grep TCPMSS       # ควรเห็น set-mss 1400"
 echo ""
 echo "┌──────────────────────────────────────────────────────────────────┐"
 echo "│  ที่อยู่เชื่อมต่อหลัก : ${CONNECT_ADDRESS}"
 echo "│──────────────────────────────────────────────────────────────────│"
 echo "│  Dropbear (SSH ตรง)    : ${CONNECT_ADDRESS}:2222, :2082, :2086, :2095"
 echo "│  OpenSSH               : ${CONNECT_ADDRESS}:22"
-echo "│  Stunnel4 (SSH+TLS)    : ${CONNECT_ADDRESS}:443, :8443, :2053, :2083, :2087, :2096"
+echo "│  WebSocket (ไม่มี TLS) : ${CONNECT_ADDRESS}:443, :8443, :2053, :2083, :2087, :2096"
 echo "│  Squid (CONNECT->SSH)  : ${CONNECT_ADDRESS}:80, :8080, :8880, :2052"
 echo "│  UDP Custom app UDPGW  : 127.0.0.1:7300 (local)"
 echo "│  UDP data plane        : ${CONNECT_ADDRESS} พอต 1-65535"
 echo "│  fail2ban              : sshd(22) + dropbear(2222,2082,2086,2095)"
+echo "│  TCP MSS clamp         : 1400 (กัน blackhole บนเน็ตมือถือไทย)"
 echo "└──────────────────────────────────────────────────────────────────┘"
 echo ""
 echo -e "${YELLOW}⚠️  แนะนำ reboot 1 ครั้งให้ BBR/cake/FD-limit apply เต็มที่: reboot${NC}"
 echo -e "${CYAN}======================================================================${NC}"
+#สำหร้บใช้กับHTTP CUSTOM Enable DNS✅ UDP CUSTOM✅ หลักๆทำมาใช้เองแต่เอาไปใช้ได้เน้นปิงต่ำ เล่นเกมส์ ใช้งานทั่วไป
