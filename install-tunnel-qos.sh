@@ -2,19 +2,15 @@
 set -e
 export DEBIAN_FRONTEND=noninteractive
 
-# ============================================================
-# แก้แค่นี้ก่อนรัน แล้วไม่ต้องพิมพ์อะไรเพิ่มอีก
-# ============================================================
 DROPBEAR_MAIN_PORT=80
 DROPBEAR_EXTRA_PORTS="143 442"
 BADVPN_PORT1=7300
-BADVPN_PORT2=7301                  # instance สำรอง แบ่งโหลด CPU — ใส่ port นี้เป็นตัวเลือกสำรองในแอปด้วย
+BADVPN_PORT2=7301
 
-SHAPE_MBIT=350                     # แบนด์วิดท์รวมของลิงก์ (ยืนยันจาก speedtest จริง)
-DOWN_MBIT_PER_USER=15              # cap download ต่อคน (hard ceiling)
-UP_MBIT_PER_USER=4                 # cap upload ต่อคน (hard ceiling)
+SHAPE_MBIT=350
+DOWN_MBIT_PER_USER=15
+UP_MBIT_PER_USER=4
 TUNNEL_MTU=1420
-# ============================================================
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
@@ -32,7 +28,7 @@ echo "ตรวจพบ interface: $IFACE"
 
 echo "[1/8] ติดตั้ง dependencies..."
 apt-get update -qq
-apt-get install -y dropbear ufw iptables-persistent netfilter-persistent \
+apt-get install -y dropbear ufw \
   build-essential cmake git ethtool iproute2 > /dev/null 2>&1
 
 echo "[2/8] ตั้งค่า dropbear..."
@@ -116,14 +112,14 @@ sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
 ufw default deny incoming > /dev/null
 ufw default allow outgoing > /dev/null
 ufw default deny routed > /dev/null
-ufw allow 1:65535/tcp > /dev/null
-ufw allow 1:65535/udp > /dev/null
 for p in 21 23 25 111 135 137 138 139 445 512 513 514 1433 2049 3306 3389 5432 5900 6379 11211 27017; do
   ufw deny "${p}/tcp" > /dev/null
 done
 for p in 19 69 111 123 137 138 161 162 1900 3389 5353 11211; do
   ufw deny "${p}/udp" > /dev/null
 done
+ufw allow 1:65535/tcp > /dev/null
+ufw allow 1:65535/udp > /dev/null
 ufw allow out to 1.1.1.1 port 53 > /dev/null
 ufw allow out to 1.0.0.1 port 53 > /dev/null
 ufw allow out to 2606:4700:4700::1111 port 53 > /dev/null
@@ -189,7 +185,6 @@ net.netfilter.nf_conntrack_udp_timeout_stream = 180
 fs.file-max = 2097152
 EOF
 sysctl --system > /dev/null 2>&1 || true
-netfilter-persistent save > /dev/null 2>&1
 
 echo "[7/8] ติดตั้งระบบ per-user hard-cap shaping (HTB + fq_codel)..."
 
@@ -388,4 +383,4 @@ echo "--- เช็คการทำงานของ shaper (รอ user conn
 echo "  journalctl -t tunnel-shaper -f"
 echo "  tc -s class show dev ${IFACE}"
 echo ""
-echo -e "${YELLOW}แนะนำ reboot 1 ครั้งแรกหลังติดตั้ง: reboot${NC}"
+echo -e "${YELLOW}แนะนำ reboot 1 ครั้งแรกหลังติดตั้ง: reboot${NC}"reboot${NC}"
