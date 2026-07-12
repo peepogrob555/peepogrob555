@@ -9,6 +9,13 @@ if [ "$EUID" -ne 0 ]; then
   exit 1
 fi
 
+if [ -f /etc/tunnel-qos.conf ]; then
+  source /etc/tunnel-qos.conf
+  echo "อ่านค่าจาก /etc/tunnel-qos.conf แล้ว (BADVPN_PORT1=${BADVPN_PORT1:-?} BADVPN_PORT2=${BADVPN_PORT2:-?})"
+else
+  echo -e "${YELLOW}ไม่พบ /etc/tunnel-qos.conf — ควรรัน install-tunnel-qos.sh ให้เสร็จก่อน (สคริปต์นี้จะพยายาม fallback ไปอ่านพอร์ตจาก unit file แทน)${NC}"
+fi
+
 for s in badvpn-udpgw1 badvpn-udpgw2; do
   systemctl is-active "$s" > /dev/null 2>&1 || {
     echo -e "${RED}${s} ไม่ได้รันอยู่ ต้องรัน install-tunnel-qos.sh ให้เสร็จก่อน${NC}"
@@ -16,14 +23,25 @@ for s in badvpn-udpgw1 badvpn-udpgw2; do
   }
 done
 
-echo "[1/3] สร้าง script อ่านพอร์ตสดใหม่ทุกครั้งที่รัน (กันปัญหาพอร์ตเปลี่ยนแล้ว service ค้างพอร์ตเก่า)..."
+echo "[1/3] สร้าง script อ่านพอร์ตให้ตรงกับที่ install-tunnel-qos.sh ตั้งไว้เสมอ..."
 cat > /usr/local/sbin/udpgw-loadbalance.sh << 'RUNTIME'
 #!/bin/bash
-BADVPN_PORT_PUBLIC=$(grep -oP '127\.0\.0\.1:\K[0-9]+' /etc/systemd/system/badvpn-udpgw1.service | head -1)
-BADVPN_PORT_BACKEND2=$(grep -oP '127\.0\.0\.1:\K[0-9]+' /etc/systemd/system/badvpn-udpgw2.service | head -1)
+# แหล่งความจริงหลัก: /etc/tunnel-qos.conf (เขียนโดย install-tunnel-qos.sh)
+# ถ้าไม่มีไฟล์นี้ หรืออ่านค่าไม่ได้ จะ fallback ไปอ่านจาก unit file ตรง ๆ แทน (กันปัญหาพอร์ตเปลี่ยนแล้ว service ค้างพอร์ตเก่า)
+[ -f /etc/tunnel-qos.conf ] && source /etc/tunnel-qos.conf
+
+BADVPN_PORT_PUBLIC="${BADVPN_PORT1:-}"
+BADVPN_PORT_BACKEND2="${BADVPN_PORT2:-}"
+
+if [ -z "$BADVPN_PORT_PUBLIC" ]; then
+  BADVPN_PORT_PUBLIC=$(grep -oP '127\.0\.0\.1:\K[0-9]+' /etc/systemd/system/badvpn-udpgw1.service 2>/dev/null | head -1)
+fi
+if [ -z "$BADVPN_PORT_BACKEND2" ]; then
+  BADVPN_PORT_BACKEND2=$(grep -oP '127\.0\.0\.1:\K[0-9]+' /etc/systemd/system/badvpn-udpgw2.service 2>/dev/null | head -1)
+fi
 
 if [ -z "$BADVPN_PORT_PUBLIC" ] || [ -z "$BADVPN_PORT_BACKEND2" ]; then
-  logger -t udpgw-loadbalance "อ่านพอร์ตจาก badvpn-udpgw1/2.service ไม่ได้ ข้าม"
+  logger -t udpgw-loadbalance "อ่านพอร์ตไม่ได้ทั้งจาก tunnel-qos.conf และ unit file ข้าม"
   exit 0
 fi
 
@@ -42,10 +60,10 @@ logger -t udpgw-loadbalance "ติดตั้งกฎแล้ว: ${BADVPN_P
 RUNTIME
 chmod +x /usr/local/sbin/udpgw-loadbalance.sh
 
-echo "[2/3] ติดตั้ง systemd service (เรียก script ข้างบนแทนการฝังพอร์ตตายตัว)..."
+echo "[2/3] ติดตั้ง systemd service..."
 cat > /etc/systemd/system/udpgw-loadbalance.service << 'EOF'
 [Unit]
-Description=Sync badvpn-udpgw load-balance NAT rule with current ports
+Description=Sync badvpn-udpgw load-balance NAT rule with current ports (tunnel-qos.conf aware)
 After=network.target badvpn-udpgw1.service badvpn-udpgw2.service
 Requires=badvpn-udpgw1.service badvpn-udpgw2.service
 
@@ -64,19 +82,19 @@ systemctl enable udpgw-loadbalance.service > /dev/null 2>&1
 echo "[3/3] รันทันทีเพื่อใส่กฎด้วยพอร์ตปัจจุบัน..."
 /usr/local/sbin/udpgw-loadbalance.sh
 
-BADVPN_PORT_PUBLIC=$(grep -oP '127\.0\.0\.1:\K[0-9]+' /etc/systemd/system/badvpn-udpgw1.service | head -1)
-BADVPN_PORT_BACKEND2=$(grep -oP '127\.0\.0\.1:\K[0-9]+' /etc/systemd/system/badvpn-udpgw2.service | head -1)
+BADVPN_PORT_PUBLIC="${BADVPN_PORT1:-$(grep -oP '127\.0\.0\.1:\K[0-9]+' /etc/systemd/system/badvpn-udpgw1.service 2>/dev/null | head -1)}"
+BADVPN_PORT_BACKEND2="${BADVPN_PORT2:-$(grep -oP '127\.0\.0\.1:\K[0-9]+' /etc/systemd/system/badvpn-udpgw2.service 2>/dev/null | head -1)}"
 
 echo ""
 echo -e "${GREEN}เสร็จแล้ว${NC}"
 echo ""
 echo "พอร์ตที่ใช้จริงตอนนี้: instance1=${BADVPN_PORT_PUBLIC} instance2=${BADVPN_PORT_BACKEND2}"
 echo "Client ยังคง config Udpgw Port = ${BADVPN_PORT_PUBLIC} เหมือนเดิมทุกคน"
-echo "แต่ ~ครึ่งหนึ่งของ session ใหม่ที่เข้าพอร์ต ${BADVPN_PORT_PUBLIC} จะถูกส่งไปประมวลผลที่ 127.0.0.1:${BADVPN_PORT_BACKEND2} (CPU core อื่น) อัตโนมัติ"
-echo "ต่อไปนี้ถ้าไปเปลี่ยนพอร์ต badvpn-udpgw1/2 ทีหลัง ไม่ต้องรันสคริปต์นี้ซ้ำแล้ว — service จะอ่านพอร์ตสดใหม่เองทุกครั้งที่บูต"
+echo "~ครึ่งหนึ่งของ session ใหม่ที่เข้าพอร์ต ${BADVPN_PORT_PUBLIC} จะถูกส่งไปประมวลผลที่ 127.0.0.1:${BADVPN_PORT_BACKEND2}"
+echo "(อีก core หนึ่ง ตาม CPUAffinity ที่ install-tunnel-qos.sh ตั้งไว้ให้ badvpn-udpgw1/2) อัตโนมัติ"
 echo ""
 echo "--- ตรวจสอบว่าทำงานจริง ---"
 echo "  ss -tn state established \"( dport = :${BADVPN_PORT_PUBLIC} or dport = :${BADVPN_PORT_BACKEND2} )\" | awk 'NR>1{print \$4}' | sort | uniq -c"
 echo "  iptables -t nat -L OUTPUT -n --line-numbers"
 echo ""
-echo -e "${YELLOW}หมายเหตุ: กฎนี้เจาะจงที่ TCP dport ${BADVPN_PORT_PUBLIC} ผ่าน loopback (-o lo) เท่านั้น ไม่กระทบ traffic อื่นในเครื่อง${NC}"
+echo -e "${YELLOW}ต่อไป: ติดตั้ง udp-custom (ตัวติดตั้งจริงเป็นไฟล์แยกจากค่าย udp-custom เอง ไม่ใช่ไฟล์ในชุดนี้) แล้วค่อยรัน post-udpcustom-patch.sh${NC}"
