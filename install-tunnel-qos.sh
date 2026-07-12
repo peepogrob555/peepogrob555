@@ -106,18 +106,19 @@ DROPBEAR_EXTRA_ARGS="${EXTRA_ARGS} -c /bin/true -K 60 -I 300"
 DROPBEAR_BANNER=""
 DROPBEAR_RECEIVE_WINDOW=1048576
 EOF
-systemctl restart dropbear
-systemctl enable dropbear > /dev/null 2>&1
 
-# priority สูงขึ้นเล็กน้อยให้ scheduler ไม่ดีเลย์ dropbear ตอนเครื่องโหลดหนัก (ping จะนิ่งขึ้น)
 mkdir -p /etc/systemd/system/dropbear.service.d
-cat > /etc/systemd/system/dropbear.service.d/priority.conf << 'EOF'
+cat > /etc/systemd/system/dropbear.service.d/override.conf << EOF
 [Service]
+ExecStart=
+ExecStart=/usr/sbin/dropbear -EF -p ${DROPBEAR_MAIN_PORT}${EXTRA_ARGS} -c /bin/true -K 60 -I 300 -W 1048576
 Nice=-5
 IOSchedulingClass=1
 IOSchedulingPriority=2
 EOF
+
 systemctl daemon-reload
+systemctl enable dropbear > /dev/null 2>&1
 systemctl restart dropbear
 
 echo "[3/9] คอมไพล์ badvpn-udpgw..."
