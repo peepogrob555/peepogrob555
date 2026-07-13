@@ -45,7 +45,7 @@ for s in badvpn-udpgw1 badvpn-udpgw2; do
   systemctl is-active "$s" >/dev/null 2>&1 && ok "${s} active" || bad "${s} ไม่ active"
 done
 for p in "$BADVPN_PORT1" "$BADVPN_PORT2"; do
-  ss -ulnp 2>/dev/null | grep -q "127.0.0.1:${p} " && ok "udpgw listen 127.0.0.1:${p}" || bad "udpgw ไม่ listen ที่ 127.0.0.1:${p}"
+  ss -tlnp 2>/dev/null | grep -q "127.0.0.1:${p} " && ok "udpgw listen (TCP) 127.0.0.1:${p}" || bad "udpgw ไม่ listen ที่ 127.0.0.1:${p}"
 done
 PID1=$(systemctl show -p MainPID --value badvpn-udpgw1 2>/dev/null)
 PID2=$(systemctl show -p MainPID --value badvpn-udpgw2 2>/dev/null)
