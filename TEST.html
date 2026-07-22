@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>SAKURA MATH PRINCESS v0.3t</title>
+    <title>SAKURA MATH PRINCESS v0.5t (SIX SEVEN 67 EDITION)</title>
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Kanit:wght@400;600;800;900&display=swap');
 
@@ -37,6 +37,57 @@
             pointer-events: none;
         }
 
+        /* 🖕 TROLL SAKURA ITEM STYLES */
+        .troll-flower {
+            position: absolute;
+            z-index: 80;
+            cursor: pointer;
+            user-select: none;
+            top: -60px;
+            will-change: transform, top;
+            filter: drop-shadow(0 4px 10px rgba(255, 105, 180, 0.4));
+            animation: trollFall linear forwards;
+            transition: transform 0.15s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+        }
+        @keyframes trollFall {
+            0% { top: -60px; transform: rotate(0deg); }
+            100% { top: 105vh; transform: rotate(360deg); }
+        }
+
+        /* 🔥 MEME 67 POP-UP & SCREEN SHAKE ANIMATIONS */
+        .pop-67-overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%) scale(0);
+            z-index: 999;
+            font-size: clamp(90px, 25vw, 220px);
+            font-weight: 900;
+            color: #ff0055;
+            text-shadow: 
+                0 0 20px #ff0055,
+                0 0 40px #ff0055,
+                6px 6px 0px #ffffff,
+                -6px -6px 0px #000000;
+            pointer-events: none;
+            animation: pop67Anim 1.2s cubic-bezier(0.175, 0.885, 0.32, 1.275) forwards;
+        }
+        @keyframes pop67Anim {
+            0% { transform: translate(-50%, -50%) scale(0) rotate(-25deg); opacity: 0; }
+            25% { transform: translate(-50%, -50%) scale(1.5) rotate(12deg); opacity: 1; }
+            70% { transform: translate(-50%, -50%) scale(1.2) rotate(-8deg); opacity: 1; }
+            100% { transform: translate(-50%, -50%) scale(2.2) rotate(20deg); opacity: 0; }
+        }
+
+        .shake-67-active {
+            animation: screenShake67 0.08s infinite alternate !important;
+        }
+        @keyframes screenShake67 {
+            0% { transform: translate(-18px, 12px) rotate(-6deg); filter: hue-rotate(90deg); }
+            50% { transform: translate(18px, -15px) rotate(6deg); filter: hue-rotate(180deg); }
+            100% { transform: translate(-12px, -8px) rotate(-4deg); filter: hue-rotate(270deg); }
+        }
+
         /* 💖 MAIN GAME CONTAINER */
         .game-wrapper {
             position: relative;
@@ -52,6 +103,7 @@
             background: rgba(255, 240, 245, 0.4);
             border: 4px solid rgba(255, 183, 197, 0.6);
             box-shadow: inset 0 0 80px rgba(255, 105, 180, 0.15);
+            transition: transform 0.1s ease;
         }
 
         /* 👑 HEADER BAR */
@@ -74,14 +126,17 @@
         }
 
         .score-box {
-            font-size: 24px;
+            font-size: 22px;
             font-weight: 800;
             color: #ff3366;
             text-shadow: 2px 2px 0px #ffe6ed;
             display: flex;
             align-items: center;
             gap: 6px;
+            min-width: 140px;
+            flex-shrink: 0;
         }
+
         .level-badge {
             font-size: 14px;
             font-weight: 800;
@@ -91,15 +146,22 @@
             border-radius: 20px;
             box-shadow: 0 4px 12px rgba(255, 117, 140, 0.4);
             letter-spacing: 0.5px;
+            flex-shrink: 0;
+            white-space: nowrap;
+            text-align: center;
         }
+
         .timer-box {
             font-size: 26px;
             font-weight: 900;
             color: #ff1493;
             text-shadow: 0 0 10px rgba(255, 20, 147, 0.3);
+            min-width: 100px;
+            text-align: right;
+            flex-shrink: 0;
+            font-variant-numeric: tabular-nums;
         }
 
-        /* ⏳ TIMER BAR */
         .timer-bar-container {
             width: 100%;
             max-width: 800px;
@@ -150,7 +212,7 @@
             box-shadow: 0 4px 10px rgba(255, 105, 180, 0.2);
         }
         .question-text {
-            font-size: clamp(32px, 6vw, 56px);
+            font-size: clamp(30px, 5.5vw, 54px);
             font-weight: 900;
             color: #3a1c24;
             text-shadow: 2px 3px 0px #ffd1dc;
@@ -171,7 +233,7 @@
             border: 3px solid #ff85a2;
             border-radius: 26px;
             color: #4a2e35;
-            font-size: clamp(22px, 4.5vw, 38px);
+            font-size: clamp(20px, 4vw, 36px);
             font-weight: 900;
             padding: 18px;
             cursor: pointer;
@@ -188,12 +250,12 @@
             transform: translateY(-5px) scale(1.03);
         }
 
-        /* 🌸 OVERLAY SCREENS */
+        /* 🌸 OVERLAY SCREENS & LEVEL SELECTOR */
         .overlay {
             position: absolute;
             top: 0; left: 0;
             width: 100vw; height: 100vh;
-            background: rgba(255, 240, 245, 0.95);
+            background: rgba(255, 240, 245, 0.96);
             backdrop-filter: blur(20px);
             z-index: 100;
             display: flex;
@@ -201,30 +263,66 @@
             justify-content: center;
             align-items: center;
             text-align: center;
-            padding: 24px;
+            padding: 20px;
         }
         .overlay-title {
-            font-size: clamp(38px, 8vw, 70px);
+            font-size: clamp(34px, 7vw, 64px);
             font-weight: 900;
             color: #ff1493;
             text-shadow: 3px 3px 0px #ffe6ed, 0 0 25px rgba(255, 20, 147, 0.3);
-            margin-bottom: 6px;
+            margin-bottom: 4px;
         }
         .overlay-subtitle {
-            font-size: 20px;
+            font-size: 18px;
             font-weight: 800;
             color: #ffffff;
             background: linear-gradient(135deg, #ff758c, #ff7eb3);
-            padding: 8px 24px;
+            padding: 6px 20px;
             border-radius: 25px;
             box-shadow: 0 6px 18px rgba(255, 117, 140, 0.35);
+            margin-bottom: 18px;
+        }
+
+        .level-select-title {
+            font-size: 16px;
+            font-weight: 800;
+            color: #7a4652;
+            margin-bottom: 10px;
+        }
+        .level-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            width: 100%;
+            max-width: 420px;
             margin-bottom: 22px;
         }
-        .overlay-desc {
-            font-size: 19px;
+        .btn-level {
+            background: #ffffff;
+            border: 2.5px solid #ffb7c5;
+            border-radius: 18px;
+            padding: 10px 14px;
+            font-family: 'Kanit', sans-serif;
+            font-size: 16px;
+            font-weight: 800;
             color: #5c3a42;
-            margin-bottom: 32px;
-            line-height: 1.7;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: 0 4px 12px rgba(255, 183, 197, 0.3);
+        }
+        .btn-level.active {
+            background: linear-gradient(135deg, #ff1493, #ff65a3);
+            color: #ffffff;
+            border-color: #ffffff;
+            box-shadow: 0 6px 20px rgba(255, 20, 147, 0.4);
+            transform: scale(1.04);
+        }
+
+        .overlay-desc {
+            font-size: 17px;
+            color: #5c3a42;
+            margin-bottom: 24px;
+            line-height: 1.6;
             font-weight: 600;
         }
         .btn-start {
@@ -232,9 +330,9 @@
             border: 4px solid #ffffff;
             border-radius: 50px;
             color: #fff;
-            font-size: 28px;
+            font-size: 26px;
             font-weight: 900;
-            padding: 18px 56px;
+            padding: 16px 50px;
             cursor: pointer;
             box-shadow: 0 12px 35px rgba(255, 20, 147, 0.5);
             transition: all 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
@@ -244,7 +342,6 @@
             box-shadow: 0 18px 45px rgba(255, 20, 147, 0.7);
         }
 
-        /* 👑 FOOTER CREDIT */
         .credit-footer {
             font-size: 14px;
             font-weight: 800;
@@ -259,15 +356,15 @@
 </head>
 <body>
 
-    <!-- Sakura & Explosion Particles Canvas -->
+    <!-- Canvas -->
     <canvas id="sakuraCanvas"></canvas>
 
     <!-- Main Game UI -->
-    <div class="game-wrapper">
+    <div class="game-wrapper" id="gameWrapper">
         <div style="width: 100%; max-width: 800px; display: flex; flex-direction: column; align-items: center;">
             <div class="header-bar">
                 <div class="score-box" id="scoreDisplay">🌸 คะแนน: 0</div>
-                <div class="level-badge">คณิตศาสตร์ระดับ ม.ต้น</div>
+                <div class="level-badge" id="levelBadgeDisplay">ระดับ ม.ต้น</div>
                 <div class="timer-box" id="timerDisplay">45.0s</div>
             </div>
             <div class="timer-bar-container">
@@ -286,24 +383,31 @@
             <button class="btn-answer">🍡</button>
         </div>
 
-        <!-- Single Credit Tag -->
-        <div class="credit-footer">By Shogun v0.3t</div>
+        <div class="credit-footer">By Shogun v0.5t (SIX SEVEN 67)</div>
     </div>
 
     <!-- Start / Game Over Overlay -->
     <div class="overlay" id="overlay">
         <div class="overlay-title">SAKURA MATH 🌸</div>
-        <div class="overlay-subtitle">คณิตศาสตร์ระดับ ม.ต้น</div>
+        <div class="overlay-subtitle">เกมคณิตศาสตร์ซากุระ</div>
+
+        <div class="level-select-title">🎯 เลือกระดับชั้นเรียน:</div>
+        <div class="level-grid">
+            <button class="btn-level" onclick="selectLevel('ประถมต้น', this)">ประถมต้น (ป.1-3)</button>
+            <button class="btn-level" onclick="selectLevel('ประถมปลาย', this)">ประถมปลาย (ป.4-6)</button>
+            <button class="btn-level active" onclick="selectLevel('ม.ต้น', this)">ม.ต้น (ม.1-3)</button>
+            <button class="btn-level" onclick="selectLevel('ม.ปลาย', this)">ม.ปลาย (ม.4-6)</button>
+        </div>
+
         <div class="overlay-desc" id="overlayDesc">
-            คิดคำนวณโจทย์คณิต ม.ต้น ในบรรยากาศซากุระแสนหวาน<br>
             ⏱️ เวลาคิดข้อละ <b>45 วินาที</b> | ตอบผิด/หมดเวลา เริ่มใหม่ทันที!
         </div>
-        <button class="btn-start" id="startBtn" onclick="startGame()">ลุยเลยเจ้าหญิง! ✨</button>
+        <button class="btn-start" id="startBtn" onclick="startGame()">พร้อมแล้ว ลุยเลย! ✨</button>
     </div>
 
     <script>
         // ==========================================
-        // 🔊 AUDIO ENGINE (Web Audio API)
+        // 🔊 AUDIO ENGINE
         // ==========================================
         let audioCtx = null;
         function initAudio() {
@@ -321,24 +425,32 @@
 
                 if (type === 'correct') {
                     osc.type = 'sine';
-                    osc.frequency.setValueAtTime(659.25, now); // E5
-                    osc.frequency.setValueAtTime(987.77, now + 0.1); // B5
+                    osc.frequency.setValueAtTime(659.25, now);
+                    osc.frequency.setValueAtTime(987.77, now + 0.1);
                     gain.gain.setValueAtTime(0.2, now);
                     gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
                     osc.start(now); osc.stop(now + 0.3);
                 } else if (type === 'wrong') {
-                    osc.type = 'triangle';
-                    osc.frequency.setValueAtTime(260, now);
-                    osc.frequency.exponentialRampToValueAtTime(130, now + 0.28);
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(220, now);
+                    osc.frequency.exponentialRampToValueAtTime(110, now + 0.25);
                     gain.gain.setValueAtTime(0.25, now);
-                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.28);
-                    osc.start(now); osc.stop(now + 0.28);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+                    osc.start(now); osc.stop(now + 0.25);
+                } else if (type === 'meme67') {
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(150, now);
+                    osc.frequency.linearRampToValueAtTime(800, now + 0.4);
+                    osc.frequency.linearRampToValueAtTime(200, now + 0.8);
+                    gain.gain.setValueAtTime(0.4, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 1.0);
+                    osc.start(now); osc.stop(now + 1.0);
                 }
             } catch(e) {}
         }
 
         // ==========================================
-        // 🌸 SAKURA PHYSICS & PARTICLE SYSTEM
+        // 🌸 SAKURA CANVAS & PARTICLES
         // ==========================================
         const canvas = document.getElementById('sakuraCanvas');
         const ctx = canvas.getContext('2d');
@@ -386,123 +498,213 @@
                 const angle = Math.random() * Math.PI * 2;
                 const speed = Math.random() * 8 + 3;
                 particles.push({
-                    x: x,
-                    y: y,
+                    x: x, y: y,
                     vx: Math.cos(angle) * speed,
                     vy: Math.sin(angle) * speed,
                     size: Math.random() * 8 + 4,
                     color: colors[Math.floor(Math.random() * colors.length)],
-                    alpha: 1,
-                    rotation: Math.random() * 360
+                    alpha: 1, rotation: Math.random() * 360
                 });
             }
         }
 
         function renderCanvas() {
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            // Falling Petals
             petals.forEach(p => {
                 p.swing += 0.02;
                 p.x += Math.sin(p.swing) * 1.2 + p.speedX;
                 p.y += p.speedY;
                 p.angle += p.spin;
-
                 drawSakuraPetal(p.x, p.y, p.size, p.angle);
-
                 if (p.y > canvas.height + 20) {
-                    p.y = -20;
-                    p.x = Math.random() * canvas.width;
+                    p.y = -20; p.x = Math.random() * canvas.width;
                 }
             });
 
-            // Burst Particles
             for (let i = particles.length - 1; i >= 0; i--) {
                 let pt = particles[i];
-                pt.x += pt.vx;
-                pt.y += pt.vy;
-                pt.vy += 0.15; // Gravity
-                pt.alpha -= 0.025;
-
+                pt.x += pt.vx; pt.y += pt.vy;
+                pt.vy += 0.15; pt.alpha -= 0.025;
                 ctx.save();
                 ctx.globalAlpha = Math.max(0, pt.alpha);
                 drawSakuraPetal(pt.x, pt.y, pt.size, pt.rotation);
                 ctx.restore();
-
                 if (pt.alpha <= 0) particles.splice(i, 1);
             }
-
             requestAnimationFrame(renderCanvas);
         }
         renderCanvas();
 
         // ==========================================
-        // 🧠 MATH GENERATOR (คณิตศาสตร์ระดับ ม.ต้น)
+        // 🖕 TROLL SAKURA SPAWNER
         // ==========================================
+        function startTrollLoop() {
+            const nextDelay = randInt(3000, 10000);
+            setTimeout(() => {
+                if (isPlaying) {
+                    const count = randInt(2, 5);
+                    for (let i = 0; i < count; i++) {
+                        setTimeout(() => { if (isPlaying) createTrollItem(); }, i * randInt(250, 600));
+                    }
+                }
+                startTrollLoop();
+            }, nextDelay);
+        }
+
+        function createTrollItem() {
+            const el = document.createElement('div');
+            el.className = 'troll-flower';
+            el.innerText = '🌸';
+            const size = randInt(28, 54);
+            el.style.fontSize = `${size}px`;
+            const startX = randInt(20, window.innerWidth - 70);
+            el.style.left = `${startX}px`;
+            const fallDuration = randInt(4000, 8000) / 1000;
+            el.style.animationDuration = `${fallDuration}s`;
+
+            let isPopped = false;
+            el.onclick = (e) => {
+                e.stopPropagation();
+                if (isPopped) return;
+                isPopped = true;
+                el.innerText = '🖕';
+                playSound('wrong');
+                el.style.animationPlayState = 'paused';
+                el.style.transform = `scale(1.6) rotate(${randInt(-25, 25)}deg)`;
+                el.style.filter = 'drop-shadow(0 6px 15px rgba(255, 0, 85, 0.8))';
+
+                setTimeout(() => {
+                    el.style.opacity = '0';
+                    el.style.transform += ' scale(0.3)';
+                    setTimeout(() => el.remove(), 300);
+                }, 800);
+            };
+
+            document.body.appendChild(el);
+            setTimeout(() => { if (el.parentNode && !isPopped) el.remove(); }, fallDuration * 1000 + 500);
+        }
+
+        // ==========================================
+        // 🔥 MEME 67 TRIGGER SYSTEM (SIX SEVEN)
+        // ==========================================
+        function trigger67MemeEffect() {
+            playSound('meme67');
+
+            // 1. สร้างตัวเลข 67 เด้งกระแทกหน้าจอ
+            const popEl = document.createElement('div');
+            popEl.className = 'pop-67-overlay';
+            popEl.innerText = '67';
+            document.body.appendChild(popEl);
+
+            // 2. สั่งจอเขย่า/โยก (Screen Shake & Tilt)
+            const wrapper = document.getElementById('gameWrapper');
+            wrapper.classList.add('shake-67-active');
+
+            // 3. เคลียร์เอฟเฟกต์ออกหลังจากผ่านไป 1.2 วินาที
+            setTimeout(() => {
+                wrapper.classList.remove('shake-67-active');
+            }, 1200);
+
+            setTimeout(() => {
+                popEl.remove();
+            }, 1300);
+        }
+
+        // ==========================================
+        // 🎯 LEVEL SYSTEM & MATH GENERATOR
+        // ==========================================
+        let selectedLevel = 'ม.ต้น';
+
+        function selectLevel(lvl, btn) {
+            selectedLevel = lvl;
+            document.querySelectorAll('.btn-level').forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            document.getElementById('levelBadgeDisplay').innerText = `ระดับ ${selectedLevel}`;
+        }
+
         function randInt(min, max) {
             return Math.floor(Math.random() * (max - min + 1)) + min;
         }
 
         function generateMathQuestion() {
-            const types = ['signed', 'algebra', 'exponent', 'combined', 'arithmetic'];
-            const type = types[Math.floor(Math.random() * types.length)];
             let question = '', answer = 0;
 
-            if (type === 'signed') {
-                // จำนวนเต็มบวก-ลบ (ม.ต้น)
-                const op = ['+', '-', '*'][Math.floor(Math.random() * 3)];
-                let a = randInt(-25, 25); if (a === 0) a = 8;
-                let b = randInt(-25, 25); if (b === 0) b = -6;
-                if (op === '+') { question = `(${a}) + (${b})`; answer = a + b; }
-                else if (op === '-') { question = `(${a}) - (${b})`; answer = a - b; }
-                else { question = `(${a}) × (${b})`; answer = a * b; }
-            } else if (type === 'algebra') {
-                // สมการเชิงเส้นตัวแปรเดียว (ม.ต้น)
-                let x = randInt(-12, 18); if (x === 0) x = 5;
-                let a = randInt(2, 7);
-                let b = randInt(2, 25);
-                let res = a * x + b;
-                question = `หาค่า x: ${a}x + ${b} = ${res}`;
-                answer = x;
-            } else if (type === 'exponent') {
-                // เลขยกกำลัง (ม.ต้น)
-                let base = randInt(8, 16);
-                let sub = randInt(10, 60);
-                question = `${base}² - ${sub}`;
-                answer = (base * base) - sub;
-            } else if (type === 'combined') {
-                // บวกลบคูณหารระคน (ม.ต้น)
-                let a = randInt(6, 14), b = randInt(4, 12), c = randInt(12, 60);
-                if (Math.random() > 0.5) {
-                    question = `(${a} × ${b}) - ${c}`;
-                    answer = (a * b) - c;
-                } else {
-                    question = `${c} + (${a} × ${b})`;
-                    answer = c + (a * b);
-                }
-            } else {
-                // บวก ลบ คูณ หาร ทั่วไป
-                const op = ['+', '-', '*', '/'][Math.floor(Math.random() * 4)];
-                if (op === '+') {
-                    let a = randInt(40, 180), b = randInt(30, 140);
+            if (selectedLevel === 'ประถมต้น') {
+                const type = randInt(1, 3);
+                if (type === 1) {
+                    let a = randInt(5, 50), b = randInt(5, 50);
                     question = `${a} + ${b}`; answer = a + b;
-                } else if (op === '-') {
-                    let a = randInt(60, 220), b = randInt(30, 120);
+                } else if (type === 2) {
+                    let a = randInt(20, 99), b = randInt(5, a);
                     question = `${a} - ${b}`; answer = a - b;
-                } else if (op === '*') {
-                    let a = randInt(8, 19), b = randInt(6, 16);
-                    question = `${a} × ${b}`; answer = a * b;
                 } else {
-                    let b = randInt(6, 16), ans = randInt(6, 24);
+                    let a = randInt(2, 9), b = randInt(2, 9);
+                    question = `${a} × ${b}`; answer = a * b;
+                }
+            } else if (selectedLevel === 'ประถมปลาย') {
+                const type = randInt(1, 3);
+                if (type === 1) {
+                    let a = randInt(12, 45), b = randInt(6, 15);
+                    question = `${a} × ${b}`; answer = a * b;
+                } else if (type === 2) {
+                    let b = randInt(4, 15), ans = randInt(8, 25);
                     let a = b * ans;
                     question = `${a} ÷ ${b}`; answer = ans;
+                } else {
+                    let a = randInt(10, 40), b = randInt(2, 8), c = randInt(5, 30);
+                    question = `(${a} × ${b}) - ${c}`; answer = (a * b) - c;
+                }
+            } else if (selectedLevel === 'ม.ต้น') {
+                const type = randInt(1, 3);
+                if (type === 1) {
+                    let a = randInt(-20, 20); if (a === 0) a = 7;
+                    let b = randInt(-20, 20); if (b === 0) b = -5;
+                    question = `(${a}) - (${b})`; answer = a - b;
+                } else if (type === 2) {
+                    let x = randInt(-10, 15); if (x === 0) x = 4;
+                    let a = randInt(2, 6), b = randInt(2, 20);
+                    let res = a * x + b;
+                    question = `หาค่า x: ${a}x + ${b} = ${res}`; answer = x;
+                } else {
+                    let base = randInt(8, 15), sub = randInt(10, 50);
+                    question = `${base}² - ${sub}`; answer = (base * base) - sub;
+                }
+            } else {
+                const type = randInt(1, 4);
+                if (type === 1) {
+                    const trigList = [
+                        { q: 'sin(30°)', a: 0.5 }, { q: 'cos(60°)', a: 0.5 },
+                        { q: 'tan(45°)', a: 1 }, { q: 'sin(90°)', a: 1 },
+                        { q: 'cos(0°)', a: 1 }, { q: 'sin(0°)', a: 0 }
+                    ];
+                    const item = trigList[randInt(0, trigList.length - 1)];
+                    question = `ค่าของ ${item.q}`; answer = item.a;
+                } else if (type === 2) {
+                    const logList = [
+                        { q: 'log₂(8)', a: 3 }, { q: 'log₃(81)', a: 4 },
+                        { q: 'log₅(25)', a: 2 }, { q: 'log₁₀(1000)', a: 3 }
+                    ];
+                    const item = logList[randInt(0, logList.length - 1)];
+                    question = `ค่าของ ${item.q}`; answer = item.a;
+                } else if (type === 3) {
+                    let n = randInt(3, 5);
+                    let fact = 1; for (let i = 1; i <= n; i++) fact *= i;
+                    let sub = randInt(2, 10);
+                    question = `${n}! - ${sub}`; answer = fact - sub;
+                } else {
+                    let a = randInt(2, 4), b = randInt(3, 5);
+                    let c = randInt(2, 3), d = randInt(2, 4);
+                    question = `(${a}<sup>${b}</sup>) - (${c}<sup>${d}</sup>)`;
+                    answer = Math.pow(a, b) - Math.pow(c, d);
                 }
             }
 
-            // สุ่มตัวเลือก 4 ข้อ
             let choices = [answer];
             while (choices.length < 4) {
-                let offset = randInt(1, 6) * (Math.random() < 0.5 ? 1 : -1);
+                let offset = (selectedLevel === 'ม.ปลาย' && Number.isFloat(answer)) 
+                    ? (Math.random() < 0.5 ? 0.5 : -0.5) 
+                    : randInt(1, 6) * (Math.random() < 0.5 ? 1 : -1);
+                
                 let wrong = answer + offset;
                 if (!choices.includes(wrong)) choices.push(wrong);
             }
@@ -516,7 +718,7 @@
         // ==========================================
         let score = 0;
         let currentAnswer = 0;
-        const maxTime = 45.0; // 45 วิ
+        const maxTime = 45.0;
         let timer = maxTime;
         let timerInterval = null;
         let isPlaying = false;
@@ -527,6 +729,7 @@
             score = 0;
             isPlaying = true;
             document.getElementById('scoreDisplay').innerText = `🌸 คะแนน: ${score}`;
+            document.getElementById('levelBadgeDisplay').innerText = `ระดับ ${selectedLevel}`;
             nextQuestion();
         }
 
@@ -535,15 +738,14 @@
 
             const q = generateMathQuestion();
             currentAnswer = q.answer;
-            document.getElementById('questionDisplay').innerText = q.question;
+            document.getElementById('questionDisplay').innerHTML = q.question;
 
             const buttons = document.querySelectorAll('.btn-answer');
             buttons.forEach((btn, idx) => {
-                btn.innerText = q.choices[idx];
+                btn.innerHTML = q.choices[idx];
                 btn.onclick = (e) => checkAnswer(q.choices[idx], e);
             });
 
-            // Reset 45s Timer
             clearInterval(timerInterval);
             timer = maxTime;
             updateTimerUI();
@@ -570,11 +772,16 @@
             if (!isPlaying) return;
 
             if (selected === currentAnswer) {
-                playSound('correct');
                 score += 1;
                 document.getElementById('scoreDisplay').innerText = `🌸 คะแนน: ${score}`;
                 
-                // Burst Particle Effect on Button Click
+                // 🔥 เช็คมีม 67 (SIX SEVEN)
+                if (score === 67) {
+                    trigger67MemeEffect();
+                } else {
+                    playSound('correct');
+                }
+
                 if (event) {
                     const rect = event.target.getBoundingClientRect();
                     triggerBurst(rect.left + rect.width / 2, rect.top + rect.height / 2);
@@ -591,11 +798,15 @@
             clearInterval(timerInterval);
             playSound('wrong');
 
-            document.getElementById('overlayDesc').innerHTML = `${reason}<br><br><span style="color:#ff1493; font-size:28px; font-weight:900;">ทำได้ทั้งหมด: ${score} คะแนน</span>`;
+            document.querySelectorAll('.troll-flower').forEach(el => el.remove());
+
+            document.getElementById('overlayDesc').innerHTML = `${reason}<br><br><span style="color:#ff1493; font-size:26px; font-weight:900;">[ ${selectedLevel} ] ทำได้ทั้งหมด: ${score} คะแนน</span>`;
             document.querySelector('.overlay-title').innerText = 'GAME OVER 🌸';
             document.getElementById('startBtn').innerText = 'ลองใหม่อีกครั้ง ✨';
             document.getElementById('overlay').style.display = 'flex';
         }
+
+        startTrollLoop();
     </script>
 </body>
 </html>
