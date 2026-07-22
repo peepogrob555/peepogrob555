@@ -2,231 +2,531 @@
 <html lang="th">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Flappy Bird - No External Images</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Flappy Shogun - Deluxe Edition</title>
     <style>
-        * { box-sizing: border-box; }
+        * { box-sizing: border-box; touch-action: manipulation; }
         body {
             margin: 0;
             padding: 0;
-            background-color: #1e1e2e;
-            color: #cdd6f4;
+            background: #090a0f;
+            color: #fff;
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             display: flex;
             flex-direction: column;
             align-items: center;
             justify-content: center;
             min-height: 100vh;
+            overflow: hidden;
         }
-        h1 { margin-bottom: 10px; font-size: 24px; text-align: center; }
+        .game-container {
+            position: relative;
+            box-shadow: 0 0 50px rgba(0, 242, 254, 0.25);
+            border-radius: 16px;
+            overflow: hidden;
+            border: 2px solid rgba(255, 255, 255, 0.1);
+        }
         canvas {
-            border: 3px solid #89b4fa;
-            border-radius: 12px;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
-            background: #70c5ce;
+            display: block;
+            background: #000;
             cursor: pointer;
         }
-        .hint {
+        .credits-footer {
             margin-top: 12px;
             font-size: 14px;
-            color: #a6adc8;
+            letter-spacing: 2px;
+            color: #00f2fe;
+            text-shadow: 0 0 10px rgba(0, 242, 254, 0.5);
+            font-weight: bold;
         }
     </style>
 </head>
 <body>
 
-    <h1>🐥 Flappy Bird (Pure Canvas)</h1>
-    <canvas id="game" width="360" height="540"></canvas>
-    <p class="hint">คลิกเมาส์ หรือ กดปุ่ม Spacebar เพื่อกระโดด</p>
+    <div class="game-container">
+        <canvas id="gameCanvas" width="380" height="580"></canvas>
+    </div>
+    <div class="credits-footer">DEVELOPED BY SHOGUN</div>
 
     <script>
-        const canvas = document.getElementById('game');
+        const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
 
-        // สถานะเกม
+        // ==========================================
+        // 🔊 SOUND ENGINE (Web Audio API - No Files)
+        // ==========================================
+        let audioCtx = null;
+
+        function initAudio() {
+            if (!audioCtx) {
+                audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            }
+        }
+
+        function playSound(type) {
+            if (!audioCtx) return;
+            try {
+                const osc = audioCtx.createOscillator();
+                const gain = audioCtx.createGain();
+                osc.connect(gain);
+                gain.connect(audioCtx.destination);
+                const now = audioCtx.currentTime;
+
+                if (type === 'jump') {
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(350, now);
+                    osc.frequency.exponentialRampToValueAtTime(700, now + 0.12);
+                    gain.gain.setValueAtTime(0.15, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.12);
+                    osc.start(now); osc.stop(now + 0.12);
+                } else if (type === 'score') {
+                    osc.type = 'triangle';
+                    osc.frequency.setValueAtTime(523.25, now); // C5
+                    osc.frequency.setValueAtTime(659.25, now + 0.08); // E5
+                    gain.gain.setValueAtTime(0.15, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.2);
+                    osc.start(now); osc.stop(now + 0.2);
+                } else if (type === 'item') {
+                    osc.type = 'sine';
+                    osc.frequency.setValueAtTime(400, now);
+                    osc.frequency.exponentialRampToValueAtTime(1000, now + 0.25);
+                    gain.gain.setValueAtTime(0.2, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+                    osc.start(now); osc.stop(now + 0.25);
+                } else if (type === 'hit') {
+                    osc.type = 'sawtooth';
+                    osc.frequency.setValueAtTime(180, now);
+                    osc.frequency.exponentialRampToValueAtTime(40, now + 0.3);
+                    gain.gain.setValueAtTime(0.3, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
+                    osc.start(now); osc.stop(now + 0.3);
+                }
+            } catch(e) {}
+        }
+
+        // ==========================================
+        // ⚙️ GAME STATE & VARIABLES
+        // ==========================================
         let gameState = 'START'; // START, PLAYING, GAMEOVER
         let score = 0;
-        let highScore = 0;
+        let highScore = localStorage.getItem('shogun_flappy_high') || 0;
         let frame = 0;
+        let shakeTime = 0;
 
-        // วัตถุนก (วาดด้วยวงกลมและรูปทรงเรขาคณิต)
+        // Player / Bird
         const bird = {
-            x: 60,
-            y: 250,
+            x: 70,
+            y: 260,
             radius: 14,
             velocity: 0,
-            gravity: 0.25,
-            jump: -5.5,
+            gravity: 0.32,
+            jump: -6.2,
+            rotation: 0,
+            hasShield: false,
+            slowTimer: 0,
+
             draw() {
-                // ลำตัวนก
+                ctx.save();
+                ctx.translate(this.x, this.y);
+                ctx.rotate(this.rotation);
+
+                // Shield Effect
+                if (this.hasShield) {
+                    ctx.beginPath();
+                    ctx.arc(0, 0, this.radius + 8, 0, Math.PI * 2);
+                    ctx.fillStyle = 'rgba(0, 242, 254, 0.3)';
+                    ctx.fill();
+                    ctx.strokeStyle = '#00f2fe';
+                    ctx.lineWidth = 2;
+                    ctx.stroke();
+                }
+
+                // Cyber Bird Body
                 ctx.beginPath();
-                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
-                ctx.fillStyle = '#f9e2af';
+                ctx.arc(0, 0, this.radius, 0, Math.PI * 2);
+                const grad = ctx.createLinearGradient(-10, -10, 10, 10);
+                grad.addColorStop(0, '#ff007f');
+                grad.addColorStop(1, '#7928ca');
+                ctx.fillStyle = grad;
                 ctx.fill();
-                ctx.strokeStyle = '#11111b';
+                ctx.strokeStyle = '#ffffff';
                 ctx.lineWidth = 2;
                 ctx.stroke();
 
-                // ดวงตา
+                // Eye
                 ctx.beginPath();
-                ctx.arc(this.x + 6, this.y - 4, 3, 0, Math.PI * 2);
-                ctx.fillStyle = '#11111b';
+                ctx.arc(6, -4, 4, 0, Math.PI * 2);
+                ctx.fillStyle = '#ffffff';
+                ctx.fill();
+                ctx.beginPath();
+                ctx.arc(7, -4, 2, 0, Math.PI * 2);
+                ctx.fillStyle = '#000000';
                 ctx.fill();
 
-                // ปากนก
+                // Beak
                 ctx.beginPath();
-                ctx.moveTo(this.x + 10, this.y);
-                ctx.lineTo(this.x + 18, this.y + 3);
-                ctx.lineTo(this.x + 10, this.y + 7);
-                ctx.fillStyle = '#fab387';
+                ctx.moveTo(10, 0);
+                ctx.lineTo(18, 4);
+                ctx.lineTo(10, 8);
+                ctx.fillStyle = '#ff0055';
                 ctx.fill();
+
+                ctx.restore();
             },
+
             update() {
                 this.velocity += this.gravity;
                 this.y += this.velocity;
 
-                // ชนพื้น
-                if (this.y + this.radius >= canvas.height - 40) {
-                    this.y = canvas.height - 40 - this.radius;
-                    gameOver();
+                // Rotation physics
+                this.rotation = Math.min(Math.PI / 3, Math.max(-Math.PI / 4, this.velocity * 0.08));
+
+                // Particles on move
+                if (frame % 3 === 0 && gameState === 'PLAYING') {
+                    particles.push(new Particle(this.x - 10, this.y, '#ff007f', 3, (Math.random() - 0.5) * 2, (Math.random() - 0.5) * 2));
                 }
 
-                // ชนเพดาน
+                // Slow-mo timer
+                if (this.slowTimer > 0) this.slowTimer--;
+
+                // Collision with Ground/Ceiling
+                if (this.y + this.radius >= canvas.height - 40) {
+                    this.y = canvas.height - 40 - this.radius;
+                    triggerGameOver();
+                }
                 if (this.y - this.radius <= 0) {
                     this.y = this.radius;
                     this.velocity = 0;
                 }
             },
+
             flap() {
                 this.velocity = this.jump;
+                playSound('jump');
+                // Flap particles
+                for (let i = 0; i < 6; i++) {
+                    particles.push(new Particle(this.x - 5, this.y + 10, '#00f2fe', 4, (Math.random() - 0.5) * 4, Math.random() * 2 + 1));
+                }
             },
+
             reset() {
-                this.y = 250;
+                this.y = 260;
                 this.velocity = 0;
+                this.rotation = 0;
+                this.hasShield = false;
+                this.slowTimer = 0;
             }
         };
 
-        // จัดการท่อสิ่งกีดขวาง
+        // ==========================================
+        // 🎆 PARTICLE SYSTEM
+        // ==========================================
+        let particles = [];
+        class Particle {
+            constructor(x, y, color, size, vx, vy) {
+                this.x = x;
+                this.y = y;
+                this.color = color;
+                this.size = size;
+                this.vx = vx;
+                this.vy = vy;
+                this.alpha = 1;
+            }
+            update() {
+                this.x += this.vx;
+                this.y += this.vy;
+                this.alpha -= 0.03;
+            }
+            draw() {
+                ctx.save();
+                ctx.globalAlpha = Math.max(0, this.alpha);
+                ctx.fillStyle = this.color;
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.size, 0, Math.PI * 2);
+                ctx.fill();
+                ctx.restore();
+            }
+        }
+
+        // ==========================================
+        // 🧱 PIPES & POWER-UPS
+        // ==========================================
         let pipes = [];
-        const pipeWidth = 52;
-        const pipeGap = 125;
+        let items = [];
+        const pipeWidth = 58;
+        const pipeGap = 135;
 
         function createPipe() {
-            const topHeight = Math.floor(Math.random() * (canvas.height - pipeGap - 140)) + 40;
+            const minHeight = 50;
+            const maxHeight = canvas.height - pipeGap - 120;
+            const topHeight = Math.floor(Math.random() * (maxHeight - minHeight)) + minHeight;
+
             pipes.push({
                 x: canvas.width,
                 top: topHeight,
                 bottom: canvas.height - topHeight - pipeGap - 40,
                 passed: false
             });
+
+            // Random Item Spawn inside gap (30% chance)
+            if (Math.random() < 0.35) {
+                const types = ['shield', 'star', 'slow'];
+                const selectedType = types[Math.floor(Math.random() * types.length)];
+                items.push({
+                    x: canvas.width + pipeWidth / 2,
+                    y: topHeight + pipeGap / 2 + (Math.random() * 40 - 20),
+                    type: selectedType,
+                    radius: 12,
+                    collected: false
+                });
+            }
         }
 
-        function updatePipes() {
-            if (frame % 100 === 0) {
+        function updatePipesAndItems() {
+            const currentSpeed = bird.slowTimer > 0 ? 1.4 : 2.6;
+
+            if (frame % Math.floor(110 / (currentSpeed / 2.6)) === 0) {
                 createPipe();
             }
 
+            // Pipes
             for (let i = pipes.length - 1; i >= 0; i--) {
                 let p = pipes[i];
-                p.x -= 2;
+                p.x -= currentSpeed;
 
-                // ระบบตรวจการชน
-                if (
-                    bird.x + bird.radius > p.x &&
-                    bird.x - bird.radius < p.x + pipeWidth
-                ) {
-                    if (
-                        bird.y - bird.radius < p.top ||
-                        bird.y + bird.radius > canvas.height - 40 - p.bottom
-                    ) {
-                        gameOver();
+                // Collision
+                if (bird.x + bird.radius > p.x && bird.x - bird.radius < p.x + pipeWidth) {
+                    if (bird.y - bird.radius < p.top || bird.y + bird.radius > canvas.height - 40 - p.bottom) {
+                        if (bird.hasShield) {
+                            bird.hasShield = false;
+                            shakeTime = 10;
+                            playSound('hit');
+                            // Create shield break particles
+                            for(let k=0; k<15; k++) {
+                                particles.push(new Particle(bird.x, bird.y, '#00f2fe', 4, (Math.random()-0.5)*8, (Math.random()-0.5)*8));
+                            }
+                            pipes.splice(i, 1);
+                            continue;
+                        } else {
+                            triggerGameOver();
+                        }
                     }
                 }
 
-                // การนับคะแนน
+                // Score
                 if (p.x + pipeWidth < bird.x && !p.passed) {
                     score++;
-                    if (score > highScore) highScore = score;
+                    if (score > highScore) {
+                        highScore = score;
+                        localStorage.setItem('shogun_flappy_high', highScore);
+                    }
                     p.passed = true;
+                    playSound('score');
                 }
 
-                // ลบท่อที่เลยหน้าจอ
-                if (p.x + pipeWidth < 0) {
-                    pipes.splice(i, 1);
+                if (p.x + pipeWidth < 0) pipes.splice(i, 1);
+            }
+
+            // Items
+            for (let i = items.length - 1; i >= 0; i--) {
+                let it = items[i];
+                it.x -= currentSpeed;
+
+                // Pickup Check
+                const dist = Math.hypot(bird.x - it.x, bird.y - it.y);
+                if (dist < bird.radius + it.radius && !it.collected) {
+                    it.collected = true;
+                    playSound('item');
+                    if (it.type === 'shield') bird.hasShield = true;
+                    if (it.type === 'star') score += 3;
+                    if (it.type === 'slow') bird.slowTimer = 300;
+
+                    for(let k=0; k<12; k++) {
+                        particles.push(new Particle(it.x, it.y, '#fff', 3, (Math.random()-0.5)*6, (Math.random()-0.5)*6));
+                    }
+                    items.splice(i, 1);
+                    continue;
                 }
+
+                if (it.x + it.radius < 0) items.splice(i, 1);
             }
         }
 
-        function drawPipes() {
+        function drawPipesAndItems() {
+            // Draw Pipes
             pipes.forEach(p => {
-                // ท่อด้านบน
-                ctx.fillStyle = '#a6e3a1';
+                // Top Pipe
+                let gradTop = ctx.createLinearGradient(p.x, 0, p.x + pipeWidth, 0);
+                gradTop.addColorStop(0, '#10b981');
+                gradTop.addColorStop(0.5, '#34d399');
+                gradTop.addColorStop(1, '#059669');
+
+                ctx.fillStyle = gradTop;
                 ctx.fillRect(p.x, 0, pipeWidth, p.top);
-                ctx.strokeStyle = '#11111b';
-                ctx.lineWidth = 2;
+                ctx.strokeStyle = '#ffffff';
+                ctx.lineWidth = 1.5;
                 ctx.strokeRect(p.x, 0, pipeWidth, p.top);
 
-                // ท่อด้านล่าง
+                // Bottom Pipe
                 const bottomY = canvas.height - 40 - p.bottom;
                 ctx.fillRect(p.x, bottomY, pipeWidth, p.bottom);
                 ctx.strokeRect(p.x, bottomY, pipeWidth, p.bottom);
             });
+
+            // Draw Items
+            items.forEach(it => {
+                ctx.save();
+                ctx.beginPath();
+                ctx.arc(it.x, it.y, it.radius, 0, Math.PI * 2);
+                if (it.type === 'shield') ctx.fillStyle = '#00f2fe';
+                else if (it.type === 'star') ctx.fillStyle = '#ffbe0b';
+                else if (it.type === 'slow') ctx.fillStyle = '#ff007f';
+
+                ctx.shadowBlur = 12;
+                ctx.shadowColor = ctx.fillStyle;
+                ctx.fill();
+
+                ctx.fillStyle = '#fff';
+                ctx.font = '10px sans-serif';
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                let icon = it.type === 'shield' ? '🛡️' : it.type === 'star' ? '⭐' : '⚡';
+                ctx.fillText(icon, it.x, it.y);
+                ctx.restore();
+            });
         }
 
-        // วาดฉากพื้นหลัง
+        // ==========================================
+        // 🌄 ENVIRONMENT & BACKGROUND
+        // ==========================================
         function drawBackground() {
-            // พื้นดิน
-            ctx.fillStyle = '#e5c890';
-            ctx.fillRect(0, canvas.height - 40, canvas.width, 40);
+            // Dynamic Sky color shift based on score
+            const bgGrad = ctx.createLinearGradient(0, 0, 0, canvas.height);
+            if (score < 10) {
+                bgGrad.addColorStop(0, '#0f2027');
+                bgGrad.addColorStop(1, '#203a43');
+            } else if (score < 25) {
+                bgGrad.addColorStop(0, '#2d0b32');
+                bgGrad.addColorStop(1, '#15052a');
+            } else {
+                bgGrad.addColorStop(0, '#000428');
+                bgGrad.addColorStop(1, '#004e92');
+            }
+            ctx.fillStyle = bgGrad;
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-            // หญ้า
-            ctx.fillStyle = '#a6e3a1';
-            ctx.fillRect(0, canvas.height - 40, canvas.width, 10);
-            ctx.strokeStyle = '#11111b';
-            ctx.lineWidth = 2;
-            ctx.strokeRect(0, canvas.height - 40, canvas.width, 40);
+            // Animated Stars / Grid
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.15)';
+            for (let i = 0; i < 20; i++) {
+                let sx = (i * 45 + frame * 0.5) % canvas.width;
+                let sy = (i * 30) % (canvas.height - 100);
+                ctx.fillRect(sx, sy, 2, 2);
+            }
+
+            // Floor
+            ctx.fillStyle = '#0f172a';
+            ctx.fillRect(0, canvas.height - 40, canvas.width, 40);
+            ctx.fillStyle = '#00f2fe';
+            ctx.fillRect(0, canvas.height - 40, canvas.width, 2); // Neon line
         }
 
-        // หน้าจอ UI
+        // ==========================================
+        // 🖥️ UI & SCREENS
+        // ==========================================
         function drawUI() {
-            ctx.fillStyle = '#ffffff';
-            ctx.font = 'bold 28px sans-serif';
             ctx.textAlign = 'center';
 
+            // Top Watermark (Credit)
+            ctx.font = '900 12px sans-serif';
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.4)';
+            ctx.fillText('FLAPPY SHOGUN • BY SHOGUN', canvas.width / 2, 25);
+
             if (gameState === 'START') {
-                ctx.fillText('กดคลิก หรือ Spacebar', canvas.width / 2, 220);
-                ctx.font = '18px sans-serif';
-                ctx.fillText('เพื่อเริ่มเล่น', canvas.width / 2, 260);
+                ctx.fillStyle = '#ffffff';
+                ctx.font = '900 28px sans-serif';
+                ctx.fillText('FLAPPY BIRD', canvas.width / 2, 190);
+                
+                ctx.fillStyle = '#00f2fe';
+                ctx.font = 'bold 16px sans-serif';
+                ctx.fillText('DELUXE EDITION', canvas.width / 2, 215);
+
+                ctx.fillStyle = '#e2e8f0';
+                ctx.font = '14px sans-serif';
+                ctx.fillText('แตะหน้าจอ หรือ กด Spacebar เพื่อบิน', canvas.width / 2, 310);
+
+                ctx.font = '12px sans-serif';
+                ctx.fillStyle = '#94a3b8';
+                ctx.fillText('🛡️ เกราะ | ⭐ โบนัส | ⚡ ชะลอเวลา', canvas.width / 2, 350);
+
             } else if (gameState === 'PLAYING') {
-                ctx.fillText(score, canvas.width / 2, 60);
+                ctx.fillStyle = '#ffffff';
+                ctx.font = '900 36px sans-serif';
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = 'rgba(0,0,0,0.5)';
+                ctx.fillText(score, canvas.width / 2, 75);
+                ctx.shadowBlur = 0;
+
+                // Slow-Mo Indicator
+                if (bird.slowTimer > 0) {
+                    ctx.fillStyle = '#ff007f';
+                    ctx.font = 'bold 12px sans-serif';
+                    ctx.fillText('⚡ SLOW MOTION ⚡', canvas.width / 2, 100);
+                }
+
             } else if (gameState === 'GAMEOVER') {
-                ctx.fillStyle = '#f38ba8';
-                ctx.fillText('GAME OVER', canvas.width / 2, 200);
+                ctx.fillStyle = '#ff007f';
+                ctx.font = '900 32px sans-serif';
+                ctx.fillText('GAME OVER', canvas.width / 2, 190);
+
+                // Card Box
+                ctx.fillStyle = 'rgba(15, 23, 42, 0.85)';
+                ctx.strokeStyle = 'rgba(255, 255, 255, 0.1)';
+                ctx.lineWidth = 1;
+                ctx.beginPath();
+                ctx.roundRect(canvas.width / 2 - 110, 220, 220, 140, 12);
+                ctx.fill();
+                ctx.stroke();
 
                 ctx.fillStyle = '#ffffff';
-                ctx.font = '20px sans-serif';
-                ctx.fillText(`คะแนน: ${score}`, canvas.width / 2, 250);
-                ctx.fillText(`สถิติสูงสุด: ${highScore}`, canvas.width / 2, 285);
-
                 ctx.font = '16px sans-serif';
-                ctx.fillStyle = '#cdd6f4';
-                ctx.fillText('คลิกเพื่อเล่นใหม่อีกครั้ง', canvas.width / 2, 340);
+                ctx.fillText(`คะแนนรอบนี้: ${score}`, canvas.width / 2, 260);
+                ctx.fillStyle = '#00f2fe';
+                ctx.fillText(`สถิติสูงสุด: ${highScore}`, canvas.width / 2, 295);
+
+                ctx.fillStyle = '#e2e8f0';
+                ctx.font = '13px sans-serif';
+                ctx.fillText('คลิกหรือกด Spacebar เพื่อเล่นใหม่', canvas.width / 2, 400);
+
+                ctx.fillStyle = 'rgba(255,255,255,0.3)';
+                ctx.font = '11px sans-serif';
+                ctx.fillText('Created By Shogun', canvas.width / 2, 430);
             }
         }
 
-        function gameOver() {
+        function triggerGameOver() {
+            if (gameState === 'GAMEOVER') return;
             gameState = 'GAMEOVER';
+            shakeTime = 15;
+            playSound('hit');
+
+            // Explosion Particles
+            for (let i = 0; i < 25; i++) {
+                particles.push(new Particle(bird.x, bird.y, '#ff007f', 4, (Math.random() - 0.5) * 8, (Math.random() - 0.5) * 8));
+            }
         }
 
         function resetGame() {
             bird.reset();
             pipes = [];
+            items = [];
+            particles = [];
             score = 0;
             frame = 0;
             gameState = 'PLAYING';
         }
 
-        function handleInput() {
+        function handleAction() {
+            initAudio();
             if (gameState === 'START') {
                 gameState = 'PLAYING';
                 bird.flap();
@@ -237,33 +537,56 @@
             }
         }
 
-        // ปุ่มควบคุม
+        // ==========================================
+        // 🎮 CONTROLS & LOOP
+        // ==========================================
         window.addEventListener('keydown', (e) => {
-            if (e.code === 'Space') {
+            if (e.code === 'Space' || e.code === 'ArrowUp') {
                 e.preventDefault();
-                handleInput();
+                handleAction();
             }
         });
 
-        canvas.addEventListener('click', () => {
-            handleInput();
+        canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            handleAction();
         });
 
-        // Loop หลักของเกม
+        canvas.addEventListener('mousedown', () => {
+            handleAction();
+        });
+
         function loop() {
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
+            frame++;
+
+            // Screen Shake Effect
+            ctx.save();
+            if (shakeTime > 0) {
+                let dx = (Math.random() - 0.5) * shakeTime;
+                let dy = (Math.random() - 0.5) * shakeTime;
+                ctx.translate(dx, dy);
+                shakeTime--;
+            }
 
             drawBackground();
 
             if (gameState === 'PLAYING') {
-                frame++;
                 bird.update();
-                updatePipes();
+                updatePipesAndItems();
             }
 
-            drawPipes();
+            drawPipesAndItems();
             bird.draw();
+
+            // Particles Update
+            for (let i = particles.length - 1; i >= 0; i--) {
+                particles[i].update();
+                particles[i].draw();
+                if (particles[i].alpha <= 0) particles.splice(i, 1);
+            }
+
             drawUI();
+            ctx.restore();
 
             requestAnimationFrame(loop);
         }
