@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Flappy Bird - No External Images</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #1e1e2e;
+            color: #cdd6f4;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+        }
+        h1 { margin-bottom: 10px; font-size: 24px; text-align: center; }
+        canvas {
+            border: 3px solid #89b4fa;
+            border-radius: 12px;
+            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+            background: #70c5ce;
+            cursor: pointer;
+        }
+        .hint {
+            margin-top: 12px;
+            font-size: 14px;
+            color: #a6adc8;
+        }
+    </style>
+</head>
+<body>
+
+    <h1>🐥 Flappy Bird (Pure Canvas)</h1>
+    <canvas id="game" width="360" height="540"></canvas>
+    <p class="hint">คลิกเมาส์ หรือ กดปุ่ม Spacebar เพื่อกระโดด</p>
+
+    <script>
+        const canvas = document.getElementById('game');
+        const ctx = canvas.getContext('2d');
+
+        // สถานะเกม
+        let gameState = 'START'; // START, PLAYING, GAMEOVER
+        let score = 0;
+        let highScore = 0;
+        let frame = 0;
+
+        // วัตถุนก (วาดด้วยวงกลมและรูปทรงเรขาคณิต)
+        const bird = {
+            x: 60,
+            y: 250,
+            radius: 14,
+            velocity: 0,
+            gravity: 0.25,
+            jump: -5.5,
+            draw() {
+                // ลำตัวนก
+                ctx.beginPath();
+                ctx.arc(this.x, this.y, this.radius, 0, Math.PI * 2);
+                ctx.fillStyle = '#f9e2af';
+                ctx.fill();
+                ctx.strokeStyle = '#11111b';
+                ctx.lineWidth = 2;
+                ctx.stroke();
+
+                // ดวงตา
+                ctx.beginPath();
+                ctx.arc(this.x + 6, this.y - 4, 3, 0, Math.PI * 2);
+                ctx.fillStyle = '#11111b';
+                ctx.fill();
+
+                // ปากนก
+                ctx.beginPath();
+                ctx.moveTo(this.x + 10, this.y);
+                ctx.lineTo(this.x + 18, this.y + 3);
+                ctx.lineTo(this.x + 10, this.y + 7);
+                ctx.fillStyle = '#fab387';
+                ctx.fill();
+            },
+            update() {
+                this.velocity += this.gravity;
+                this.y += this.velocity;
+
+                // ชนพื้น
+                if (this.y + this.radius >= canvas.height - 40) {
+                    this.y = canvas.height - 40 - this.radius;
+                    gameOver();
+                }
+
+                // ชนเพดาน
+                if (this.y - this.radius <= 0) {
+                    this.y = this.radius;
+                    this.velocity = 0;
+                }
+            },
+            flap() {
+                this.velocity = this.jump;
+            },
+            reset() {
+                this.y = 250;
+                this.velocity = 0;
+            }
+        };
+
+        // จัดการท่อสิ่งกีดขวาง
+        let pipes = [];
+        const pipeWidth = 52;
+        const pipeGap = 125;
+
+        function createPipe() {
+            const topHeight = Math.floor(Math.random() * (canvas.height - pipeGap - 140)) + 40;
+            pipes.push({
+                x: canvas.width,
+                top: topHeight,
+                bottom: canvas.height - topHeight - pipeGap - 40,
+                passed: false
+            });
+        }
+
+        function updatePipes() {
+            if (frame % 100 === 0) {
+                createPipe();
+            }
+
+            for (let i = pipes.length - 1; i >= 0; i--) {
+                let p = pipes[i];
+                p.x -= 2;
+
+                // ระบบตรวจการชน
+                if (
+                    bird.x + bird.radius > p.x &&
+                    bird.x - bird.radius < p.x + pipeWidth
+                ) {
+                    if (
+                        bird.y - bird.radius < p.top ||
+                        bird.y + bird.radius > canvas.height - 40 - p.bottom
+                    ) {
+                        gameOver();
+                    }
+                }
+
+                // การนับคะแนน
+                if (p.x + pipeWidth < bird.x && !p.passed) {
+                    score++;
+                    if (score > highScore) highScore = score;
+                    p.passed = true;
+                }
+
+                // ลบท่อที่เลยหน้าจอ
+                if (p.x + pipeWidth < 0) {
+                    pipes.splice(i, 1);
+                }
+            }
+        }
+
+        function drawPipes() {
+            pipes.forEach(p => {
+                // ท่อด้านบน
+                ctx.fillStyle = '#a6e3a1';
+                ctx.fillRect(p.x, 0, pipeWidth, p.top);
+                ctx.strokeStyle = '#11111b';
+                ctx.lineWidth = 2;
+                ctx.strokeRect(p.x, 0, pipeWidth, p.top);
+
+                // ท่อด้านล่าง
+                const bottomY = canvas.height - 40 - p.bottom;
+                ctx.fillRect(p.x, bottomY, pipeWidth, p.bottom);
+                ctx.strokeRect(p.x, bottomY, pipeWidth, p.bottom);
+            });
+        }
+
+        // วาดฉากพื้นหลัง
+        function drawBackground() {
+            // พื้นดิน
+            ctx.fillStyle = '#e5c890';
+            ctx.fillRect(0, canvas.height - 40, canvas.width, 40);
+
+            // หญ้า
+            ctx.fillStyle = '#a6e3a1';
+            ctx.fillRect(0, canvas.height - 40, canvas.width, 10);
+            ctx.strokeStyle = '#11111b';
+            ctx.lineWidth = 2;
+            ctx.strokeRect(0, canvas.height - 40, canvas.width, 40);
+        }
+
+        // หน้าจอ UI
+        function drawUI() {
+            ctx.fillStyle = '#ffffff';
+            ctx.font = 'bold 28px sans-serif';
+            ctx.textAlign = 'center';
+
+            if (gameState === 'START') {
+                ctx.fillText('กดคลิก หรือ Spacebar', canvas.width / 2, 220);
+                ctx.font = '18px sans-serif';
+                ctx.fillText('เพื่อเริ่มเล่น', canvas.width / 2, 260);
+            } else if (gameState === 'PLAYING') {
+                ctx.fillText(score, canvas.width / 2, 60);
+            } else if (gameState === 'GAMEOVER') {
+                ctx.fillStyle = '#f38ba8';
+                ctx.fillText('GAME OVER', canvas.width / 2, 200);
+
+                ctx.fillStyle = '#ffffff';
+                ctx.font = '20px sans-serif';
+                ctx.fillText(`คะแนน: ${score}`, canvas.width / 2, 250);
+                ctx.fillText(`สถิติสูงสุด: ${highScore}`, canvas.width / 2, 285);
+
+                ctx.font = '16px sans-serif';
+                ctx.fillStyle = '#cdd6f4';
+                ctx.fillText('คลิกเพื่อเล่นใหม่อีกครั้ง', canvas.width / 2, 340);
+            }
+        }
+
+        function gameOver() {
+            gameState = 'GAMEOVER';
+        }
+
+        function resetGame() {
+            bird.reset();
+            pipes = [];
+            score = 0;
+            frame = 0;
+            gameState = 'PLAYING';
+        }
+
+        function handleInput() {
+            if (gameState === 'START') {
+                gameState = 'PLAYING';
+                bird.flap();
+            } else if (gameState === 'PLAYING') {
+                bird.flap();
+            } else if (gameState === 'GAMEOVER') {
+                resetGame();
+            }
+        }
+
+        // ปุ่มควบคุม
+        window.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                e.preventDefault();
+                handleInput();
+            }
+        });
+
+        canvas.addEventListener('click', () => {
+            handleInput();
+        });
+
+        // Loop หลักของเกม
+        function loop() {
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            drawBackground();
+
+            if (gameState === 'PLAYING') {
+                frame++;
+                bird.update();
+                updatePipes();
+            }
+
+            drawPipes();
+            bird.draw();
+            drawUI();
+
+            requestAnimationFrame(loop);
+        }
+
+        loop();
+    </script>
+</body>
+</html>
