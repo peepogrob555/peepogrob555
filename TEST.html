@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>CYBER MATH RACER v0.3t</title>
+    <title>PASTEL MATH PRINCESS v0.3t</title>
     <style>
         * {
             box-sizing: border-box;
@@ -16,15 +16,15 @@
             width: 100vw;
             height: 100vh;
             overflow: hidden;
-            background-color: #030308;
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            color: #fff;
+            background: linear-gradient(135deg, #ffc3a0 0%, #ffafbd 50%, #e0c3fc 100%);
+            font-family: 'Kanit', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            color: #5d4037;
             display: flex;
             justify-content: center;
             align-items: center;
         }
 
-        /* 🌌 BACKGROUND SPEED & MOTION BLUR CANVAS */
+        /* 🌸 SOFT PASTEL BUBBLES CANVAS */
         #bgCanvas {
             position: absolute;
             top: 0;
@@ -32,11 +32,11 @@
             width: 100vw;
             height: 100vh;
             z-index: 1;
-            filter: blur(6px) contrast(150%);
-            opacity: 0.75;
+            filter: blur(8px);
+            opacity: 0.8;
         }
 
-        /* 🖼️ MAIN CYBER CONTAINER */
+        /* 🎀 MAIN CONTAINER */
         .game-wrapper {
             position: relative;
             z-index: 10;
@@ -47,177 +47,191 @@
             justify-content: space-between;
             align-items: center;
             padding: 20px;
-            backdrop-filter: blur(16px) brightness(0.8);
-            background: rgba(5, 5, 12, 0.4);
-            border: 2px solid rgba(255, 0, 85, 0.3);
-            box-shadow: inset 0 0 100px rgba(255, 0, 85, 0.2);
+            backdrop-filter: blur(12px) brightness(1.05);
+            background: rgba(255, 255, 255, 0.35);
         }
 
-        /* HEADER & TIMER */
+        /* HEADER & TIMER BAR */
         .header-bar {
             width: 100%;
-            max-width: 800px;
+            max-width: 750px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            background: rgba(15, 15, 25, 0.8);
-            border: 2px solid #00f2fe;
-            box-shadow: 0 0 20px rgba(0, 242, 254, 0.4);
-            border-radius: 12px;
-            padding: 12px 24px;
+            background: rgba(255, 255, 255, 0.85);
+            border: 3px solid #ff85a2;
+            box-shadow: 0 10px 25px rgba(255, 133, 162, 0.3);
+            border-radius: 25px;
+            padding: 12px 28px;
         }
         .score-box {
             font-size: 24px;
-            font-weight: 900;
-            color: #ffe600;
-            text-shadow: 0 0 10px #ffe600;
+            font-weight: 800;
+            color: #ff5277;
+            text-shadow: 1px 1px 0px #fff;
+        }
+        .level-badge {
+            font-size: 14px;
+            font-weight: 700;
+            background: #ffe3e8;
+            color: #ff4081;
+            padding: 4px 14px;
+            border-radius: 20px;
+            border: 1px solid #ff85a2;
         }
         .timer-box {
-            font-size: 28px;
-            font-weight: 900;
-            color: #ff0055;
-            text-shadow: 0 0 12px #ff0055;
+            font-size: 26px;
+            font-weight: 800;
+            color: #7c4dff;
         }
 
-        /* TIMER BAR */
         .timer-bar-container {
             width: 100%;
-            max-width: 800px;
-            height: 10px;
-            background: rgba(255, 255, 255, 0.1);
-            border-radius: 5px;
+            max-width: 750px;
+            height: 12px;
+            background: rgba(255, 255, 255, 0.6);
+            border-radius: 10px;
             margin-top: 10px;
             overflow: hidden;
-            border: 1px solid rgba(0, 242, 254, 0.3);
+            border: 2px solid #ffb7c5;
         }
         .timer-bar-fill {
             height: 100%;
             width: 100%;
-            background: linear-gradient(90deg, #00f2fe, #ff0055);
-            box-shadow: 0 0 15px #ff0055;
+            background: linear-gradient(90deg, #ff85a2, #b57edc);
+            border-radius: 10px;
             transition: width 0.1s linear;
         }
 
-        /* ❓ QUESTION CARD */
+        /* 💖 QUESTION CARD */
         .question-card {
             width: 100%;
-            max-width: 800px;
+            max-width: 750px;
             flex: 1;
-            margin: 20px 0;
+            margin: 18px 0;
             display: flex;
+            flex-direction: column;
             justify-content: center;
             align-items: center;
-            background: rgba(10, 10, 20, 0.7);
-            border: 3px solid #ff0055;
-            box-shadow: 0 0 35px rgba(255, 0, 85, 0.5), inset 0 0 20px rgba(0, 242, 254, 0.2);
-            border-radius: 20px;
+            background: rgba(255, 255, 255, 0.9);
+            border: 4px solid #ff9ebb;
+            box-shadow: 0 15px 35px rgba(255, 158, 187, 0.35);
+            border-radius: 35px;
             padding: 20px;
             text-align: center;
             position: relative;
-            overflow: hidden;
         }
         .question-text {
-            font-size: clamp(32px, 6vw, 56px);
-            font-weight: 900;
-            letter-spacing: 2px;
-            color: #ffffff;
-            text-shadow: 0 0 20px #00f2fe, 0 0 40px #ff0055;
+            font-size: clamp(30px, 5.5vw, 52px);
+            font-weight: 800;
+            color: #4a2c40;
+            text-shadow: 2px 2px 0px #ffe3e8;
         }
 
-        /* 🔘 ANSWERS GRID */
+        /* 🍬 ANSWERS GRID */
         .answers-grid {
             width: 100%;
-            max-width: 800px;
+            max-width: 750px;
             display: grid;
             grid-template-columns: 1fr 1fr;
             gap: 16px;
             margin-bottom: 10px;
         }
         .btn-answer {
-            background: rgba(20, 20, 35, 0.85);
-            border: 2px solid #00f2fe;
-            border-radius: 14px;
-            color: #fff;
+            background: rgba(255, 255, 255, 0.95);
+            border: 3px solid #b57edc;
+            border-radius: 22px;
+            color: #5c2c6d;
             font-size: clamp(22px, 4vw, 36px);
             font-weight: 800;
-            padding: 20px;
+            padding: 18px;
             cursor: pointer;
-            transition: all 0.15s ease;
-            box-shadow: 0 0 15px rgba(0, 242, 254, 0.2);
-            text-shadow: 0 0 10px #00f2fe;
+            transition: all 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+            box-shadow: 0 8px 20px rgba(181, 126, 220, 0.25);
         }
         .btn-answer:hover, .btn-answer:active {
-            background: #00f2fe;
-            color: #000;
-            box-shadow: 0 0 30px #00f2fe;
-            transform: scale(1.03);
-            text-shadow: none;
+            background: #ff85a2;
+            color: #ffffff;
+            border-color: #ff5277;
+            box-shadow: 0 12px 25px rgba(255, 82, 119, 0.4);
+            transform: translateY(-4px) scale(1.02);
         }
 
-        /* 📌 OVERLAY SCREENS (START / GAMEOVER) */
+        /* 🍓 OVERLAY SCREENS */
         .overlay {
             position: absolute;
             top: 0; left: 0;
             width: 100vw; height: 100vh;
-            background: rgba(3, 3, 10, 0.92);
-            backdrop-filter: blur(25px);
+            background: rgba(255, 240, 245, 0.94);
+            backdrop-filter: blur(15px);
             z-index: 100;
             display: flex;
             flex-direction: column;
             justify-content: center;
             align-items: center;
             text-align: center;
-            padding: 20px;
+            padding: 24px;
         }
         .overlay-title {
-            font-size: clamp(36px, 8vw, 72px);
+            font-size: clamp(34px, 7vw, 64px);
             font-weight: 900;
-            color: #ff0055;
-            text-shadow: 0 0 30px #ff0055, 0 0 60px #ff0055;
-            margin-bottom: 10px;
+            color: #ff4081;
+            text-shadow: 3px 3px 0px #ffe3e8;
+            margin-bottom: 8px;
+        }
+        .overlay-subtitle {
+            font-size: 20px;
+            font-weight: 700;
+            color: #7c4dff;
+            background: #ffffff;
+            padding: 6px 20px;
+            border-radius: 20px;
+            border: 2px dashed #b57edc;
+            margin-bottom: 20px;
         }
         .overlay-desc {
-            font-size: 20px;
-            color: #a6adc8;
+            font-size: 18px;
+            color: #6a4c6a;
             margin-bottom: 30px;
+            line-height: 1.6;
         }
         .btn-start {
-            background: linear-gradient(135deg, #ff0055, #7928ca);
-            border: 2px solid #ffffff;
+            background: linear-gradient(135deg, #ff85a2, #b57edc);
+            border: 3px solid #ffffff;
             border-radius: 50px;
             color: #fff;
-            font-size: 28px;
-            font-weight: 900;
-            padding: 16px 48px;
+            font-size: 26px;
+            font-weight: 800;
+            padding: 16px 52px;
             cursor: pointer;
-            box-shadow: 0 0 30px rgba(255, 0, 85, 0.8);
-            transition: all 0.2s;
+            box-shadow: 0 10px 30px rgba(255, 133, 162, 0.5);
+            transition: all 0.2s cubic-bezier(0.175, 0.885, 0.32, 1.275);
         }
         .btn-start:hover {
             transform: scale(1.08);
-            box-shadow: 0 0 50px rgba(255, 0, 85, 1);
+            box-shadow: 0 15px 35px rgba(255, 133, 162, 0.7);
         }
 
-        /* 🏷️ FOOTER CREDIT (ONLY ONE PLACE) */
+        /* 👑 SINGLE CREDIT */
         .credit-footer {
             font-size: 14px;
             font-weight: 700;
-            color: rgba(255, 255, 255, 0.4);
-            letter-spacing: 1.5px;
-            text-transform: uppercase;
+            color: #8e6c88;
+            letter-spacing: 1px;
         }
     </style>
 </head>
 <body>
 
-    <!-- Motion Blur Canvas -->
+    <!-- Cute Pastel Canvas -->
     <canvas id="bgCanvas"></canvas>
 
     <!-- Main Game UI -->
     <div class="game-wrapper">
-        <div style="width: 100%; max-width: 800px; display: flex; flex-direction: column; align-items: center;">
+        <div style="width: 100%; max-width: 750px; display: flex; flex-direction: column; align-items: center;">
             <div class="header-bar">
-                <div class="score-box" id="scoreDisplay">SCORE: 0</div>
+                <div class="score-box" id="scoreDisplay">คะแนน: 0</div>
+                <div class="level-badge">คณิตศาสตร์ระดับ ม.ต้น</div>
                 <div class="timer-box" id="timerDisplay">30.0s</div>
             </div>
             <div class="timer-bar-container">
@@ -226,14 +240,14 @@
         </div>
 
         <div class="question-card">
-            <div class="question-text" id="questionDisplay">READY?</div>
+            <div class="question-text" id="questionDisplay">พร้อมหรือยังคะ?</div>
         </div>
 
         <div class="answers-grid" id="answersGrid">
-            <button class="btn-answer">-</button>
-            <button class="btn-answer">-</button>
-            <button class="btn-answer">-</button>
-            <button class="btn-answer">-</button>
+            <button class="btn-answer">🌸</button>
+            <button class="btn-answer">🎀</button>
+            <button class="btn-answer">✨</button>
+            <button class="btn-answer">🍭</button>
         </div>
 
         <!-- Single Credit Tag -->
@@ -242,14 +256,18 @@
 
     <!-- Start / Game Over Overlay -->
     <div class="overlay" id="overlay">
-        <div class="overlay-title" id="overlayTitle">CYBER MATH RACER</div>
-        <div class="overlay-desc" id="overlayDesc">ตอบคำถามคณิต ม.ต้น | ข้อละ 30 วินาที | ตอบผิดกดเริ่มใหม่</div>
-        <button class="btn-start" id="startBtn" onclick="startGame()">ลุยเลย!</button>
+        <div class="overlay-title" id="overlayTitle">🌸 MATH PRINCESS 🌸</div>
+        <div class="overlay-subtitle">คณิตศาสตร์ระดับ ม.ต้น</div>
+        <div class="overlay-desc" id="overlayDesc">
+            ตอบคำถามตัวเลขวิชาคณิตศาสตร์ ม.ต้น<br>
+            เวลาคิดข้อละ 30 วินาที | ตอบผิดกดเริ่มใหม่ทันทีน้า~
+        </div>
+        <button class="btn-start" id="startBtn" onclick="startGame()">เริ่มเลย!</button>
     </div>
 
     <script>
         // ==========================================
-        // 🔊 SOUND ENGINE (Web Audio API)
+        // 🔊 CUTE SOUND ENGINE (Web Audio API)
         // ==========================================
         let audioCtx = null;
         function initAudio() {
@@ -266,41 +284,44 @@
                 const now = audioCtx.currentTime;
 
                 if (type === 'correct') {
+                    // Cute Chime Sound
                     osc.type = 'sine';
-                    osc.frequency.setValueAtTime(523.25, now);
-                    osc.frequency.exponentialRampToValueAtTime(880, now + 0.15);
-                    gain.gain.setValueAtTime(0.2, now);
-                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.15);
-                    osc.start(now); osc.stop(now + 0.15);
+                    osc.frequency.setValueAtTime(587.33, now); // D5
+                    osc.frequency.setValueAtTime(880, now + 0.1); // A5
+                    gain.gain.setValueAtTime(0.18, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+                    osc.start(now); osc.stop(now + 0.25);
                 } else if (type === 'wrong') {
-                    osc.type = 'sawtooth';
-                    osc.frequency.setValueAtTime(150, now);
-                    osc.frequency.exponentialRampToValueAtTime(40, now + 0.3);
-                    gain.gain.setValueAtTime(0.3, now);
-                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.3);
-                    osc.start(now); osc.stop(now + 0.3);
+                    // Cute Oops Sound
+                    osc.type = 'triangle';
+                    osc.frequency.setValueAtTime(220, now);
+                    osc.frequency.exponentialRampToValueAtTime(110, now + 0.25);
+                    gain.gain.setValueAtTime(0.25, now);
+                    gain.gain.exponentialRampToValueAtTime(0.01, now + 0.25);
+                    osc.start(now); osc.stop(now + 0.25);
                 }
             } catch(e) {}
         }
 
         // ==========================================
-        // 🌌 MOTION BLUR CANVAS BACKGROUND
+        // 🌸 PASTEL BUBBLES CANVAS BACKGROUND
         // ==========================================
         const canvas = document.getElementById('bgCanvas');
         const ctx = canvas.getContext('2d');
-        let lines = [];
+        let bubbles = [];
 
         function resizeCanvas() {
             canvas.width = window.innerWidth;
             canvas.height = window.innerHeight;
-            lines = [];
-            for(let i=0; i<60; i++) {
-                lines.push({
+            bubbles = [];
+            const colors = ['#ff85a2', '#b57edc', '#7c4dff', '#ffc3a0', '#90e0ef'];
+            for(let i=0; i<40; i++) {
+                bubbles.push({
                     x: Math.random() * canvas.width,
                     y: Math.random() * canvas.height,
-                    speed: Math.random() * 15 + 10,
-                    length: Math.random() * 80 + 40,
-                    color: Math.random() > 0.5 ? '#ff0055' : '#00f2fe'
+                    radius: Math.random() * 25 + 10,
+                    speed: Math.random() * 1.5 + 0.5,
+                    color: colors[Math.floor(Math.random() * colors.length)]
                 });
             }
         }
@@ -308,21 +329,18 @@
         resizeCanvas();
 
         function renderBG() {
-            ctx.fillStyle = 'rgba(3, 3, 8, 0.3)';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-            lines.forEach(l => {
+            bubbles.forEach(b => {
                 ctx.beginPath();
-                ctx.moveTo(l.x, l.y);
-                ctx.lineTo(l.x, l.y + l.length);
-                ctx.strokeStyle = l.color;
-                ctx.lineWidth = 3;
-                ctx.stroke();
+                ctx.arc(b.x, b.y, b.radius, 0, Math.PI * 2);
+                ctx.fillStyle = b.color;
+                ctx.fill();
 
-                l.y += l.speed;
-                if (l.y > canvas.height) {
-                    l.y = -l.length;
-                    l.x = Math.random() * canvas.width;
+                b.y -= b.speed;
+                if (b.y + b.radius < 0) {
+                    b.y = canvas.height + b.radius;
+                    b.x = Math.random() * canvas.width;
                 }
             });
 
@@ -338,37 +356,35 @@
         }
 
         function generateMathQuestion() {
-            const types = ['arithmetic', 'signed', 'combined', 'algebra', 'exponent'];
+            const types = ['signed', 'algebra', 'exponent', 'combined', 'arithmetic'];
             const type = types[Math.floor(Math.random() * types.length)];
             let question = '', answer = 0;
 
-            if (type === 'arithmetic') {
-                const op = ['+', '-', '*', '/'][Math.floor(Math.random() * 4)];
-                if (op === '+') {
-                    let a = randInt(35, 180), b = randInt(25, 150);
-                    question = `${a} + ${b}`; answer = a + b;
-                } else if (op === '-') {
-                    let a = randInt(60, 250), b = randInt(35, 180);
-                    question = `${a} - ${b}`; answer = a - b;
-                } else if (op === '*') {
-                    let a = randInt(8, 19), b = randInt(7, 16);
-                    question = `${a} × ${b}`; answer = a * b;
-                } else {
-                    let b = randInt(6, 18), ans = randInt(6, 25);
-                    let a = b * ans;
-                    question = `${a} ÷ ${b}`; answer = ans;
-                }
-            } else if (type === 'signed') {
-                // เลขติดลบ ม.ต้น
+            if (type === 'signed') {
+                // จำนวนเต็มบวก-ลบ (ม.ต้น)
                 const op = ['+', '-', '*'][Math.floor(Math.random() * 3)];
-                let a = randInt(-25, 25); if (a === 0) a = 7;
-                let b = randInt(-25, 25); if (b === 0) b = -5;
+                let a = randInt(-20, 20); if (a === 0) a = 6;
+                let b = randInt(-20, 20); if (b === 0) b = -4;
                 if (op === '+') { question = `(${a}) + (${b})`; answer = a + b; }
                 else if (op === '-') { question = `(${a}) - (${b})`; answer = a - b; }
                 else { question = `(${a}) × (${b})`; answer = a * b; }
+            } else if (type === 'algebra') {
+                // สมการเชิงเส้นตัวแปรเดียว (ม.ต้น)
+                let x = randInt(-10, 15); if (x === 0) x = 3;
+                let a = randInt(2, 6);
+                let b = randInt(2, 20);
+                let res = a * x + b;
+                question = `หาค่า x: ${a}x + ${b} = ${res}`;
+                answer = x;
+            } else if (type === 'exponent') {
+                // เลขยกกำลัง (ม.ต้น)
+                let base = randInt(8, 15);
+                let sub = randInt(10, 50);
+                question = `${base}² - ${sub}`;
+                answer = (base * base) - sub;
             } else if (type === 'combined') {
-                // บวกลบคูณหารระคน
-                let a = randInt(6, 14), b = randInt(5, 12), c = randInt(15, 60);
+                // บวกลบคูณหารระคน (ม.ต้น)
+                let a = randInt(5, 12), b = randInt(4, 10), c = randInt(10, 50);
                 if (Math.random() > 0.5) {
                     question = `(${a} × ${b}) - ${c}`;
                     answer = (a * b) - c;
@@ -376,26 +392,29 @@
                     question = `${c} + (${a} × ${b})`;
                     answer = c + (a * b);
                 }
-            } else if (type === 'algebra') {
-                // สมการเชิงเส้นตัวแปรเดียว
-                let x = randInt(-12, 18); if (x === 0) x = 4;
-                let a = randInt(2, 7);
-                let b = randInt(3, 25);
-                let res = a * x + b;
-                question = `ถ้า ${a}x + ${b} = ${res} แล้ว x = ?`;
-                answer = x;
-            } else if (type === 'exponent') {
-                // เลขยกกำลัง ม.ต้น
-                let base = randInt(9, 16);
-                let sub = randInt(15, 60);
-                question = `${base}² - ${sub}`;
-                answer = (base * base) - sub;
+            } else {
+                // บวก ลบ คูณ หาร ทั่วไป
+                const op = ['+', '-', '*', '/'][Math.floor(Math.random() * 4)];
+                if (op === '+') {
+                    let a = randInt(30, 150), b = randInt(20, 120);
+                    question = `${a} + ${b}`; answer = a + b;
+                } else if (op === '-') {
+                    let a = randInt(50, 200), b = randInt(20, 100);
+                    question = `${a} - ${b}`; answer = a - b;
+                } else if (op === '*') {
+                    let a = randInt(7, 18), b = randInt(6, 15);
+                    question = `${a} × ${b}`; answer = a * b;
+                } else {
+                    let b = randInt(5, 15), ans = randInt(5, 20);
+                    let a = b * ans;
+                    question = `${a} ÷ ${b}`; answer = ans;
+                }
             }
 
-            // ตัวเลือก 4 ข้อ
+            // สุ่มสอยตัวเลือก 4 ข้อ
             let choices = [answer];
             while (choices.length < 4) {
-                let offset = randInt(1, 6) * (Math.random() < 0.5 ? 1 : -1);
+                let offset = randInt(1, 5) * (Math.random() < 0.5 ? 1 : -1);
                 let wrong = answer + offset;
                 if (!choices.includes(wrong)) choices.push(wrong);
             }
@@ -418,7 +437,7 @@
             document.getElementById('overlay').style.display = 'none';
             score = 0;
             isPlaying = true;
-            document.getElementById('scoreDisplay').innerText = `SCORE: ${score}`;
+            document.getElementById('scoreDisplay').innerText = `คะแนน: ${score}`;
             nextQuestion();
         }
 
@@ -447,7 +466,7 @@
                 updateTimerUI();
 
                 if (timer <= 0) {
-                    gameOver('หมดเวลา 30 วินาที!');
+                    gameOver('หมดเวลา 30 วินาทีแล้วน้า~');
                 }
             }, 50);
         }
@@ -464,10 +483,10 @@
             if (selected === currentAnswer) {
                 playSound('correct');
                 score += 1;
-                document.getElementById('scoreDisplay').innerText = `SCORE: ${score}`;
+                document.getElementById('scoreDisplay').innerText = `คะแนน: ${score}`;
                 nextQuestion();
             } else {
-                gameOver(`ตอบผิด! คำตอบที่ถูกต้องคือ ${currentAnswer}`);
+                gameOver(`ตอบผิดน้า~ คำตอบที่ถูกคือ ${currentAnswer}`);
             }
         }
 
@@ -477,8 +496,8 @@
             playSound('wrong');
 
             document.getElementById('overlayTitle').innerText = 'GAME OVER';
-            document.getElementById('overlayDesc').innerHTML = `${reason}<br><br><span style="color:#ffe600; font-size:28px; font-weight:900;">คะแนนรวม: ${score} แต้ม</span>`;
-            document.getElementById('startBtn').innerText = 'เริ่มใหม่';
+            document.getElementById('overlayDesc').innerHTML = `${reason}<br><br><span style="color:#ff4081; font-size:26px; font-weight:800;">ทำได้ทั้งหมด: ${score} คะแนน</span>`;
+            document.getElementById('startBtn').innerText = 'ลองใหม่อีกครั้ง';
             document.getElementById('overlay').style.display = 'flex';
         }
     </script>
