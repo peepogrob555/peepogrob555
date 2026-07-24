@@ -4,7 +4,6 @@ export DEBIAN_FRONTEND=noninteractive
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
-SHAPE_MBIT="${SHAPE_MBIT:-350}"
 RTT_MS="${RTT_MS:-50}"
 TUNNEL_MTU="${TUNNEL_MTU:-1360}"
 CAKE_OVERHEAD="${CAKE_OVERHEAD:-18}"
@@ -12,7 +11,19 @@ MAX_USERS="${MAX_USERS:-100}"
 FLOWS_PER_USER="${FLOWS_PER_USER:-8}"
 TCP_SAFE_BUDGET_MB="${TCP_SAFE_BUDGET_MB:-2048}"
 SWAP_GB="${SWAP_GB:-4}"
-PER_USER_TARGET_MBIT="${PER_USER_TARGET_MBIT:-15}"
+UDPGW_PORT="${UDPGW_PORT:-7300}"
+
+# เป้าหมาย bandwidth ต่อ user (asymmetric: down เยอะกว่า up)
+PER_USER_DOWN_MBIT="${PER_USER_DOWN_MBIT:-15}"
+PER_USER_UP_MBIT="${PER_USER_UP_MBIT:-4}"
+
+# pipe รวมที่ CAKE จะ shape = MAX_USERS x เป้าหมายต่อคน
+# *** ต้องไม่เกิน bandwidth จริงของพอร์ต/ISP เซิร์ฟเวอร์ ไม่งั้น CAKE คุม bufferbloat ไม่ได้จริง ***
+# ถ้าพอร์ตจริงน้อย/มากกว่านี้ ให้ override 2 ตัวนี้ตรง ๆ ตอนรัน เช่น
+#   DOWNLOAD_SHAPE_MBIT=800 UPLOAD_SHAPE_MBIT=200 bash script.sh
+DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-$((MAX_USERS * PER_USER_DOWN_MBIT))}"
+UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-$((MAX_USERS * PER_USER_UP_MBIT))}"
+
 LOG_RAM_MB="${LOG_RAM_MB:-256}"
 JOURNAL_RAM_MB="${JOURNAL_RAM_MB:-64}"
 LOG_CLEAR_HOURS="${LOG_CLEAR_HOURS:-6}"
@@ -38,11 +49,11 @@ if [ -z "$IFACE" ]; then
   exit 1
 fi
 
-DNS_LABEL="Google"
-DNS_V4_A="8.8.8.8"; DNS_V4_B="8.8.4.4"
-DNS_V6_A="2001:4860:4860::8888"; DNS_V6_B="2001:4860:4860::8844"
+DNS_LABEL="Cloudflare+Google"
+DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
+DNS_V6_A="2606:4700:4700::1111"; DNS_V6_B="2001:4860:4860::8888"
 
-echo "IFACE=${IFACE} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Bandwidth=${SHAPE_MBIT}mbit | RTT=${RTT_MS}ms | Max Users=${MAX_USERS}"
+echo "IFACE=${IFACE} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Down=${DOWNLOAD_SHAPE_MBIT}mbit(${PER_USER_DOWN_MBIT}/user) | Up=${UPLOAD_SHAPE_MBIT}mbit(${PER_USER_UP_MBIT}/user) | RTT=${RTT_MS}ms | Max Users=${MAX_USERS}"
 
 UDP_CUSTOM_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CUSTOM_CONFIG" || true)
 if [ -z "$UDP_CUSTOM_PORT" ]; then
@@ -51,7 +62,8 @@ fi
 
 cat > /etc/tunnel-qos.conf << EOF
 IFACE=${IFACE}
-SHAPE_MBIT=${SHAPE_MBIT}
+DOWNLOAD_SHAPE_MBIT=${DOWNLOAD_SHAPE_MBIT}
+UPLOAD_SHAPE_MBIT=${UPLOAD_SHAPE_MBIT}
 RTT_MS=${RTT_MS}
 TUNNEL_MTU=${TUNNEL_MTU}
 CAKE_OVERHEAD=${CAKE_OVERHEAD}
@@ -107,15 +119,34 @@ ufw deny out to any port 53 > /dev/null
 ufw deny out to any port 853 > /dev/null
 ufw --force enable > /dev/null
 
+rm -f /etc/netplan/90-dns-override.yaml
+
+# normalize DNS เดิมใน netplan ให้เป็นชุดใหม่ (เผื่อไฟล์ default ของผู้ให้บริการที่ยังเป็น
+# Cloudflare ล้วน และเผื่อไฟล์ที่เคยถูกสคริปต์รอบก่อนเปลี่ยนเป็น Google ล้วนไปแล้ว - idempotent)
+sed -i \
+  -e 's/1\.0\.0\.1/8.8.8.8/g' \
+  -e 's/8\.8\.4\.4/1.1.1.1/g' \
+  -e 's/2606:4700:4700::1001/2001:4860:4860::8888/g' \
+  -e 's/2001:4860:4860::8844/2606:4700:4700::1111/g' \
+  /etc/netplan/*.yaml 2>/dev/null || true
+
 mkdir -p /etc/systemd/resolved.conf.d
-cat > /etc/systemd/resolved.conf.d/tunnel-dns.conf << EOF
+rm -rf /etc/systemd/resolved.conf.d/* 2>/dev/null
+cat > /etc/systemd/resolved.conf << EOF
 [Resolve]
-DNS=${DNS_V4_A} ${DNS_V4_B}
+DNS=${DNS_V4_A} ${DNS_V4_B} ${DNS_V6_A} ${DNS_V6_B}
 FallbackDNS=
 Domains=~.
 DNSStubListener=yes
+LLMNR=no
+MulticastDNS=no
+DNSSEC=no
+DNSOverTLS=no
 EOF
+
+command -v netplan >/dev/null 2>&1 && netplan apply 2>/dev/null || true
 systemctl restart systemd-resolved 2>/dev/null || true
+systemctl restart systemd-networkd 2>/dev/null || true
 
 ip link set dev "$IFACE" mtu "$TUNNEL_MTU" 2>/dev/null || true
 cat > /etc/systemd/system/set-mtu.service << EOF
@@ -179,21 +210,43 @@ EOF
 systemctl daemon-reload
 systemctl enable --now set-mtu.service mss-clamp.service > /dev/null 2>&1
 
-RMEM_MIN=2097152
-RMEM_CEILING=16777216
-BDP_BYTES=$(( SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
-RMEM_MAX=$(( BDP_BYTES * 4 ))
+RMEM_MIN=262144
+RMEM_CEILING=33554432
+
+# เพดานบนสุด (core.rmem_max / core.wmem_max): ให้ flow เดียวยังใช้ pipe ว่างได้เต็มที่
+# ตอนคนออนไลน์น้อยกว่า MAX_USERS (CAKE แค่แบ่งแฟร์ ไม่ได้ hard-cap รายคน)
+BDP_FULLPIPE_DOWN=$(( DOWNLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
+BDP_FULLPIPE_UP=$(( UPLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
+RMEM_MAX=$(( BDP_FULLPIPE_DOWN * 4 ))
+WMEM_MAX=$(( BDP_FULLPIPE_UP * 4 ))
 [ "$RMEM_MAX" -lt "$RMEM_MIN" ]     && RMEM_MAX=$RMEM_MIN
 [ "$RMEM_MAX" -gt "$RMEM_CEILING" ] && RMEM_MAX=$RMEM_CEILING
+[ "$WMEM_MAX" -lt "$RMEM_MIN" ]     && WMEM_MAX=$RMEM_MIN
+[ "$WMEM_MAX" -gt "$RMEM_CEILING" ] && WMEM_MAX=$RMEM_CEILING
 
 NF_CONNTRACK_MAX=$(( MAX_USERS * 3000 ))
 [ "$NF_CONNTRACK_MAX" -lt 100000 ] && NF_CONNTRACK_MAX=300000
 NF_CONNTRACK_HASHSIZE=$(( NF_CONNTRACK_MAX / 4 ))
 
+# เป้าหมาย tcp_rmem/tcp_wmem จริง: BDP ต่อ user คนเดียวที่ 15/4 Mbps (ไม่ใช่ทั้ง pipe)
+# กันไม่ให้แต่ละ flow จอง buffer เกินความจำเป็นตอนมี user เต็ม 100 คนพร้อมกัน
+BDP_PERUSER_DOWN=$(( PER_USER_DOWN_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
+BDP_PERUSER_UP=$(( PER_USER_UP_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
+PERFLOW_RMEM_TARGET=$(( BDP_PERUSER_DOWN * 4 ))
+PERFLOW_WMEM_TARGET=$(( BDP_PERUSER_UP * 4 ))
+
 TOTAL_FLOWS=$(( MAX_USERS * FLOWS_PER_USER ))
-TCP_FLOW_RMEM_MAX=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / TOTAL_FLOWS / 2 ))
-[ "$TCP_FLOW_RMEM_MAX" -gt "$RMEM_MAX" ] && TCP_FLOW_RMEM_MAX=$RMEM_MAX
-[ "$TCP_FLOW_RMEM_MAX" -lt 1048576 ] && TCP_FLOW_RMEM_MAX=1048576
+BUDGET_PER_FLOW=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / TOTAL_FLOWS / 2 ))
+
+TCP_FLOW_RMEM_MAX=$PERFLOW_RMEM_TARGET
+[ "$TCP_FLOW_RMEM_MAX" -gt "$BUDGET_PER_FLOW" ] && TCP_FLOW_RMEM_MAX=$BUDGET_PER_FLOW
+[ "$TCP_FLOW_RMEM_MAX" -gt "$RMEM_MAX" ]        && TCP_FLOW_RMEM_MAX=$RMEM_MAX
+[ "$TCP_FLOW_RMEM_MAX" -lt 262144 ]             && TCP_FLOW_RMEM_MAX=262144
+
+TCP_FLOW_WMEM_MAX=$PERFLOW_WMEM_TARGET
+[ "$TCP_FLOW_WMEM_MAX" -gt "$BUDGET_PER_FLOW" ] && TCP_FLOW_WMEM_MAX=$BUDGET_PER_FLOW
+[ "$TCP_FLOW_WMEM_MAX" -gt "$WMEM_MAX" ]        && TCP_FLOW_WMEM_MAX=$WMEM_MAX
+[ "$TCP_FLOW_WMEM_MAX" -lt 131072 ]             && TCP_FLOW_WMEM_MAX=131072
 
 cat > /etc/sysctl.d/99-tunnel-optimize.conf << EOF
 net.ipv4.tcp_congestion_control = bbr
@@ -205,11 +258,12 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
 net.core.rmem_max = ${RMEM_MAX}
-net.core.wmem_max = ${RMEM_MAX}
+net.core.wmem_max = ${WMEM_MAX}
 net.ipv4.tcp_rmem = 4096 87380 ${TCP_FLOW_RMEM_MAX}
-net.ipv4.tcp_wmem = 4096 65536 ${TCP_FLOW_RMEM_MAX}
+net.ipv4.tcp_wmem = 4096 65536 ${TCP_FLOW_WMEM_MAX}
 net.core.netdev_max_backlog = 32768
 net.core.netdev_budget = 600
+net.core.rps_sock_flow_entries = 32768
 net.core.somaxconn = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
 net.ipv4.tcp_tw_reuse = 1
@@ -237,14 +291,14 @@ tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
 tc qdisc del dev ifb0 root 2>/dev/null || true
 
 tc qdisc add dev "$IFACE" root cake \
-  bandwidth "${SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
+  bandwidth "${DOWNLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
   besteffort triple-isolate ack-filter
 
 tc qdisc add dev "$IFACE" handle ffff: ingress
 tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
 
 tc qdisc add dev ifb0 root cake \
-  bandwidth "${SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
+  bandwidth "${UPLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
   besteffort triple-isolate ack-filter
 RUNTIME
 chmod +x /usr/local/sbin/qos-root-init.sh
@@ -279,6 +333,12 @@ done
 for rx in /sys/class/net/ifb0/queues/rx-*/rps_cpus; do
   [ -e "$rx" ] && echo "$MASK" > "$rx" 2>/dev/null || true
 done
+for rf in /sys/class/net/"${IFACE}"/queues/rx-*/rps_flow_cnt; do
+  [ -e "$rf" ] && echo 4096 > "$rf" 2>/dev/null || true
+done
+for rf in /sys/class/net/ifb0/queues/rx-*/rps_flow_cnt; do
+  [ -e "$rf" ] && echo 4096 > "$rf" 2>/dev/null || true
+done
 for tx in /sys/class/net/"${IFACE}"/queues/tx-*/xps_cpus; do
   [ -e "$tx" ] && echo "$MASK" > "$tx" 2>/dev/null || true
 done
@@ -306,14 +366,14 @@ systemctl daemon-reload
 systemctl enable --now set-rps.service > /dev/null 2>&1
 
 cp "$UDP_CUSTOM_CONFIG" "${UDP_CUSTOM_CONFIG}.bak.$(date +%s)"
-jq --argjson rb "$RMEM_MAX" --argjson sb "$RMEM_MAX" \
+jq --argjson rb "$TCP_FLOW_RMEM_MAX" --argjson sb "$TCP_FLOW_WMEM_MAX" \
   '.receive_buffer=$rb | .stream_buffer=$sb' \
   "$UDP_CUSTOM_CONFIG" > "${UDP_CUSTOM_CONFIG}.tmp" && mv "${UDP_CUSTOM_CONFIG}.tmp" "$UDP_CUSTOM_CONFIG"
 
 UDPGW_MAX_CLIENTS=$(( MAX_USERS + 30 ))
 UDPGW_MAX_CONN_PER_CLIENT=30
 if [ -f /etc/systemd/system/udpgw.service ]; then
-  sed -i -E "s/--max-clients [0-9]+/--max-clients ${UDPGW_MAX_CLIENTS}/; s/--max-connections-for-client [0-9]+/--max-connections-for-client ${UDPGW_MAX_CONN_PER_CLIENT}/" /etc/systemd/system/udpgw.service
+  sed -i -E "s/--max-clients [0-9]+/--max-clients ${UDPGW_MAX_CLIENTS}/; s/--max-connections-for-client [0-9]+/--max-connections-for-client ${UDPGW_MAX_CONN_PER_CLIENT}/; s/127\.0\.0\.1:[0-9]+/127.0.0.1:${UDPGW_PORT}/" /etc/systemd/system/udpgw.service
 fi
 
 systemctl daemon-reload
@@ -425,5 +485,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (100 Users / 350 Mbps)${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (Max ${MAX_USERS} Users | ${PER_USER_DOWN_MBIT}↓/${PER_USER_UP_MBIT}↑ Mbps ต่อคน | รวม pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit)${NC}"
 echo "=================================================="
