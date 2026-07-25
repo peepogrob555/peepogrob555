@@ -276,6 +276,21 @@ vm.swappiness = 10
 EOF
 echo "options nf_conntrack hashsize=${NF_CONNTRACK_HASHSIZE}" > /etc/modprobe.d/nf_conntrack.conf
 echo "$NF_CONNTRACK_HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+
+# /etc/sysctl.conf ถูก sysctl --system อ่านหลังสุดเสมอ ถ้ามี key ซ้ำค้างจาก image เดิม
+# มันจะทับค่าใน /etc/sysctl.d/99-tunnel-optimize.conf ของเราแบบเงียบ ๆ - comment ทิ้ง (สำรองก่อน)
+if [ -f /etc/sysctl.conf ]; then
+  cp /etc/sysctl.conf "/etc/sysctl.conf.bak.$(date +%s)"
+  for key in net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.ip_forward \
+             net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+             net.core.netdev_max_backlog net.core.netdev_budget net.core.somaxconn \
+             net.ipv4.tcp_max_syn_backlog net.core.rps_sock_flow_entries \
+             net.netfilter.nf_conntrack_max fs.file-max vm.swappiness; do
+    esc_key=$(printf '%s' "$key" | sed 's/\./\\./g')
+    sed -i -E "s|^([[:space:]]*${esc_key}[[:space:]]*=.*)|# [tunnel-qos] overridden by /etc/sysctl.d/99-tunnel-optimize.conf -- \1|" /etc/sysctl.conf
+  done
+fi
+
 sysctl --system > /dev/null 2>&1 || true
 
 cat > /usr/local/sbin/qos-root-init.sh << 'RUNTIME'
