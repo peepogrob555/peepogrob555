@@ -13,14 +13,9 @@ TCP_SAFE_BUDGET_MB="${TCP_SAFE_BUDGET_MB:-2048}"
 SWAP_GB="${SWAP_GB:-4}"
 UDPGW_PORT="${UDPGW_PORT:-7300}"
 
-# เป้าหมาย bandwidth ต่อ user (asymmetric: down เยอะกว่า up)
 PER_USER_DOWN_MBIT="${PER_USER_DOWN_MBIT:-15}"
 PER_USER_UP_MBIT="${PER_USER_UP_MBIT:-4}"
 
-# pipe รวมที่ CAKE จะ shape = MAX_USERS x เป้าหมายต่อคน
-# *** ต้องไม่เกิน bandwidth จริงของพอร์ต/ISP เซิร์ฟเวอร์ ไม่งั้น CAKE คุม bufferbloat ไม่ได้จริง ***
-# ถ้าพอร์ตจริงน้อย/มากกว่านี้ ให้ override 2 ตัวนี้ตรง ๆ ตอนรัน เช่น
-#   DOWNLOAD_SHAPE_MBIT=800 UPLOAD_SHAPE_MBIT=200 bash script.sh
 DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-$((MAX_USERS * PER_USER_DOWN_MBIT))}"
 UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-$((MAX_USERS * PER_USER_UP_MBIT))}"
 
@@ -121,8 +116,6 @@ ufw --force enable > /dev/null
 
 rm -f /etc/netplan/90-dns-override.yaml
 
-# normalize DNS เดิมใน netplan ให้เป็นชุดใหม่ (เผื่อไฟล์ default ของผู้ให้บริการที่ยังเป็น
-# Cloudflare ล้วน และเผื่อไฟล์ที่เคยถูกสคริปต์รอบก่อนเปลี่ยนเป็น Google ล้วนไปแล้ว - idempotent)
 sed -i \
   -e 's/1\.0\.0\.1/8.8.8.8/g' \
   -e 's/8\.8\.4\.4/1.1.1.1/g' \
@@ -213,8 +206,6 @@ systemctl enable --now set-mtu.service mss-clamp.service > /dev/null 2>&1
 RMEM_MIN=262144
 RMEM_CEILING=33554432
 
-# เพดานบนสุด (core.rmem_max / core.wmem_max): ให้ flow เดียวยังใช้ pipe ว่างได้เต็มที่
-# ตอนคนออนไลน์น้อยกว่า MAX_USERS (CAKE แค่แบ่งแฟร์ ไม่ได้ hard-cap รายคน)
 BDP_FULLPIPE_DOWN=$(( DOWNLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 BDP_FULLPIPE_UP=$(( UPLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 RMEM_MAX=$(( BDP_FULLPIPE_DOWN * 4 ))
@@ -228,8 +219,6 @@ NF_CONNTRACK_MAX=$(( MAX_USERS * 3000 ))
 [ "$NF_CONNTRACK_MAX" -lt 100000 ] && NF_CONNTRACK_MAX=300000
 NF_CONNTRACK_HASHSIZE=$(( NF_CONNTRACK_MAX / 4 ))
 
-# เป้าหมาย tcp_rmem/tcp_wmem จริง: BDP ต่อ user คนเดียวที่ 15/4 Mbps (ไม่ใช่ทั้ง pipe)
-# กันไม่ให้แต่ละ flow จอง buffer เกินความจำเป็นตอนมี user เต็ม 100 คนพร้อมกัน
 BDP_PERUSER_DOWN=$(( PER_USER_DOWN_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 BDP_PERUSER_UP=$(( PER_USER_UP_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 PERFLOW_RMEM_TARGET=$(( BDP_PERUSER_DOWN * 4 ))
@@ -277,8 +266,6 @@ EOF
 echo "options nf_conntrack hashsize=${NF_CONNTRACK_HASHSIZE}" > /etc/modprobe.d/nf_conntrack.conf
 echo "$NF_CONNTRACK_HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
 
-# /etc/sysctl.conf ถูก sysctl --system อ่านหลังสุดเสมอ ถ้ามี key ซ้ำค้างจาก image เดิม
-# มันจะทับค่าใน /etc/sysctl.d/99-tunnel-optimize.conf ของเราแบบเงียบ ๆ - comment ทิ้ง (สำรองก่อน)
 if [ -f /etc/sysctl.conf ]; then
   cp /etc/sysctl.conf "/etc/sysctl.conf.bak.$(date +%s)"
   for key in net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.ip_forward \
@@ -287,7 +274,7 @@ if [ -f /etc/sysctl.conf ]; then
              net.ipv4.tcp_max_syn_backlog net.core.rps_sock_flow_entries \
              net.netfilter.nf_conntrack_max fs.file-max vm.swappiness; do
     esc_key=$(printf '%s' "$key" | sed 's/\./\\./g')
-    sed -i -E "s|^([[:space:]]*${esc_key}[[:space:]]*=.*)|# [tunnel-qos] overridden by /etc/sysctl.d/99-tunnel-optimize.conf -- \1|" /etc/sysctl.conf
+    sed -i -E "/^[[:space:]]*${esc_key}[[:space:]]*=/d" /etc/sysctl.conf
   done
 fi
 
