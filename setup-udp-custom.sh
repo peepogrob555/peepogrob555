@@ -27,12 +27,12 @@ LOG_WATCHDOG_THRESHOLD_MB="${LOG_WATCHDOG_THRESHOLD_MB:-128}"
 UDP_CUSTOM_CONFIG="/root/udp/config.json"
 
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}เธ•เนเธญเธเธฃเธฑเธเธ”เนเธงเธข root: sudo bash $0${NC}"
+  echo -e "${RED}ต้องรันด้วย root: sudo bash $0${NC}"
   exit 1
 fi
 
 if [ ! -f "$UDP_CUSTOM_CONFIG" ]; then
-  echo -e "${RED}เนเธกเนเธเธ ${UDP_CUSTOM_CONFIG} เธเธฃเธธเธ“เธฒเธ•เธดเธ”เธ•เธฑเนเธ udp-custom เธเนเธญเธ${NC}"
+  echo -e "${RED}ไม่พบ ${UDP_CUSTOM_CONFIG} กรุณาติดตั้ง udp-custom ก่อน${NC}"
   exit 1
 fi
 
@@ -40,7 +40,7 @@ OS_VER=$(grep -oP '(?<=^VERSION_ID=")[^"]+' /etc/os-release 2>/dev/null || true)
 
 IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
 if [ -z "$IFACE" ]; then
-  echo -e "${RED}เธซเธฒ default interface เนเธกเนเน€เธเธญ เธขเธเน€เธฅเธดเธ${NC}"
+  echo -e "${RED}หา default interface ไม่เจอ ยกเลิก${NC}"
   exit 1
 fi
 
@@ -52,7 +52,7 @@ echo "IFACE=${IFACE} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Down=${DOWNLOAD_SH
 
 UDP_CUSTOM_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CUSTOM_CONFIG" || true)
 if [ -z "$UDP_CUSTOM_PORT" ]; then
-  read -rp "เนเธชเนเธเธญเธฃเนเธ• UDP เธ—เธตเน udp-custom เนเธเนเธเธฃเธดเธ: " UDP_CUSTOM_PORT
+  read -rp "ใส่พอร์ต UDP ที่ udp-custom ใช้จริง: " UDP_CUSTOM_PORT
 fi
 
 cat > /etc/tunnel-qos.conf << EOF
@@ -519,5 +519,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}เธ•เธดเธ”เธ•เธฑเนเธ/เธเธฃเธฑเธเธเธนเธเธฃเธฐเธเธเน€เธฃเธตเธขเธเธฃเนเธญเธข (Max ${MAX_USERS} Users | ${PER_USER_DOWN_MBIT}โ“/${PER_USER_UP_MBIT}โ‘ Mbps เธ•เนเธญเธเธ | เธฃเธงเธก pipe ${DOWNLOAD_SHAPE_MBIT}โ“/${UPLOAD_SHAPE_MBIT}โ‘ Mbit)${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (Max ${MAX_USERS} Users | ${PER_USER_DOWN_MBIT}↓/${PER_USER_UP_MBIT}↑ Mbps ต่อคน | รวม pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit)${NC}"
 echo "=================================================="
