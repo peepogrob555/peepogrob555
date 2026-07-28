@@ -1,206 +1,219 @@
 #!/bin/bash
+# verify-tunnel-qos.sh — เช็คสถานะจริงของทุกอย่างที่ tunnel-qos.sh ตั้งค่าไว้
+# ใช้: sudo bash verify-tunnel-qos.sh
 
-GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
-PASS=0
-FAIL=0
-WARN=0
+GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-ok() { echo -e "  ${GREEN}[OK]${NC} $1"; PASS=$((PASS+1)); }
-bad() { echo -e "  ${RED}[FAIL]${NC} $1"; FAIL=$((FAIL+1)); }
-warn() { echo -e "  ${YELLOW}[WARN]${NC} $1"; WARN=$((WARN+1)); }
-section() { echo ""; echo -e "${CYAN}== $1 ==${NC}"; }
+TUNNEL_QOS_CONF="/etc/tunnel-qos.conf"
+UDP_CUSTOM_CONFIG="${UDP_CUSTOM_CONFIG:-/root/udp/config.json}"
+UDPGW_SERVICE="/etc/systemd/system/udpgw.service"
+
+ok()    { echo -e "  ${GREEN}✔${NC} $1"; }
+warn()  { echo -e "  ${YELLOW}⚠${NC} $1"; }
+bad()   { echo -e "  ${RED}✘${NC} $1"; }
+info()  { echo -e "  ${CYAN}ℹ${NC} $1"; }
+head1() { echo ""; echo -e "${BOLD}== $1 ==${NC}"; }
 
 if [ "$EUID" -ne 0 ]; then
   echo -e "${RED}ต้องรันด้วย root: sudo bash $0${NC}"
   exit 1
 fi
 
-if [ ! -f /etc/tunnel-qos.conf ]; then
-  echo -e "${RED}ไม่พบ /etc/tunnel-qos.conf — ยังไม่เคยรัน install-tunnel-qos.sh สำเร็จ${NC}"
+if [ ! -f "$TUNNEL_QOS_CONF" ]; then
+  bad "ไม่พบ $TUNNEL_QOS_CONF — ยังไม่เคยรัน tunnel-qos.sh"
   exit 1
 fi
-source /etc/tunnel-qos.conf
+# shellcheck disable=SC1090
+source "$TUNNEL_QOS_CONF"
 
-section "1. เวลาบูตล่าสุด (เช็คว่ารีบูตจริงหรือแค่รัน service ใหม่)"
-echo "  $(who -b 2>/dev/null || uptime -s)"
-echo "  uptime: $(uptime -p 2>/dev/null)"
+echo -e "${BOLD}=================================================="
+echo " TUNNEL QOS VERIFY REPORT - $(date '+%Y-%m-%d %H:%M:%S')"
+echo -e "==================================================${NC}"
 
-section "2. Dropbear (SSH tunnel port)"
-if systemctl is-active dropbear >/dev/null 2>&1; then
-  ok "dropbear.service active"
-else
-  bad "dropbear.service ไม่ active — journalctl -xeu dropbear -n 30 --no-pager"
-fi
-ALL_PORTS="${DROPBEAR_MAIN_PORT} ${DROPBEAR_EXTRA_PORTS}"
-for p in $ALL_PORTS; do
-  if ss -tlnp 2>/dev/null | grep -q ":${p} "; then
-    ok "port ${p} (dropbear) กำลัง listen"
-  else
-    bad "port ${p} (dropbear) ไม่มีใคร listen อยู่"
-  fi
-done
-
-section "3. BadVPN UDP Gateway (2 instance, แยก core)"
-for s in badvpn-udpgw1 badvpn-udpgw2; do
-  systemctl is-active "$s" >/dev/null 2>&1 && ok "${s} active" || bad "${s} ไม่ active"
-done
-for p in "$BADVPN_PORT1" "$BADVPN_PORT2"; do
-  ss -tlnp 2>/dev/null | grep -q "127.0.0.1:${p} " && ok "udpgw listen (TCP) 127.0.0.1:${p}" || bad "udpgw ไม่ listen ที่ 127.0.0.1:${p}"
-done
-PID1=$(systemctl show -p MainPID --value badvpn-udpgw1 2>/dev/null)
-PID2=$(systemctl show -p MainPID --value badvpn-udpgw2 2>/dev/null)
-if [ -n "$PID1" ] && [ "$PID1" != "0" ]; then
-  AFF1=$(taskset -cp "$PID1" 2>/dev/null | awk -F: '{print $2}' | tr -d ' ')
-  echo "  badvpn-udpgw1 (pid $PID1) CPU affinity: ${AFF1:-อ่านไม่ได้}"
-fi
-if [ -n "$PID2" ] && [ "$PID2" != "0" ]; then
-  AFF2=$(taskset -cp "$PID2" 2>/dev/null | awk -F: '{print $2}' | tr -d ' ')
-  echo "  badvpn-udpgw2 (pid $PID2) CPU affinity: ${AFF2:-อ่านไม่ได้}"
-fi
-
-section "4. UFW Firewall + DNS lock"
-if systemctl is-active ufw >/dev/null 2>&1 || ufw status 2>/dev/null | grep -q "Status: active"; then
-  ok "ufw active"
-else
-  bad "ufw ไม่ active"
-fi
-if ufw status 2>/dev/null | grep -q "53.*DENY"; then
-  ok "ufw deny out port 53 (กัน DNS leak) มีอยู่"
-else
-  warn "ไม่เจอ rule deny port 53 ใน ufw status (เช็คมือ: ufw status numbered)"
-fi
-if ufw status 2>/dev/null | grep -q "${DNS_V4_A}.*53"; then
-  ok "ufw allow DNS ไป ${DNS_V4_A}:53 มีอยู่"
-else
-  warn "ไม่เจอ allow rule ไป ${DNS_V4_A}:53"
-fi
-RESOLV=$(resolvectl dns 2>/dev/null || cat /etc/resolv.conf 2>/dev/null)
-if echo "$RESOLV" | grep -q "$DNS_V4_A"; then
-  ok "system DNS ใช้ ${DNS_LABEL} (${DNS_V4_A}) จริง"
-else
-  warn "system DNS ดูไม่ตรงกับ ${DNS_LABEL} ที่ตั้งไว้ — เช็ค: resolvectl status"
-fi
-
-section "5. MTU + MSS clamp"
-CUR_MTU=$(ip -o link show dev "$IFACE" 2>/dev/null | grep -oP 'mtu \K[0-9]+')
+head1 "1) Interface & MTU"
+CUR_MTU=$(ip -o link show "$IFACE" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="mtu") print $(i+1)}')
+info "IFACE=$IFACE"
 if [ "$CUR_MTU" = "$TUNNEL_MTU" ]; then
-  ok "MTU ${IFACE} = ${CUR_MTU} ตรงกับที่ตั้งไว้ (${TUNNEL_MTU})"
+  ok "MTU ปัจจุบัน=$CUR_MTU (ตรงกับที่ตั้งไว้)"
 else
-  bad "MTU ${IFACE} = ${CUR_MTU} แต่ควรเป็น ${TUNNEL_MTU} — เช็ค: systemctl status set-mtu.service"
+  warn "MTU ปัจจุบัน=$CUR_MTU ต่างจากที่ตั้งไว้ ($TUNNEL_MTU)"
 fi
-if iptables -t mangle -S FORWARD 2>/dev/null | grep -q TCPMSS; then
-  ok "MSS clamp rule (mangle FORWARD) มีอยู่"
-else
-  bad "ไม่เจอ MSS clamp rule — เช็ค: systemctl status mss-clamp.service"
-fi
+systemctl is-active --quiet set-mtu.service && ok "set-mtu.service: active" || bad "set-mtu.service: ไม่ active"
 
-section "6. Sysctl (BBR + CAKE + forwarding)"
-CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
-[ "$CC" = "bbr" ] && ok "tcp_congestion_control = bbr" || bad "tcp_congestion_control = ${CC} (ควรเป็น bbr)"
-QD=$(sysctl -n net.core.default_qdisc 2>/dev/null)
-[ "$QD" = "cake" ] && ok "default_qdisc = cake" || bad "default_qdisc = ${QD} (ควรเป็น cake)"
-FWD=$(sysctl -n net.ipv4.ip_forward 2>/dev/null)
-[ "$FWD" = "1" ] && ok "ip_forward = 1" || bad "ip_forward = ${FWD} (ควรเป็น 1)"
-BBR_LOADED=$(lsmod | grep -c tcp_bbr)
-[ "$BBR_LOADED" -gt 0 ] && ok "kernel module tcp_bbr โหลดอยู่" || warn "module tcp_bbr ไม่โหลด (อาจ built-in อยู่แล้วในเคอร์เนลนี้ ไม่ต้องกังวลถ้า sysctl ข้างบน = bbr)"
-
-section "7. Per-user Shaper (HTB root + CAKE, ทั้ง down/up)"
-systemctl is-active tunnel-shaper >/dev/null 2>&1 && ok "tunnel-shaper.service active" || bad "tunnel-shaper.service ไม่ active"
-if tc qdisc show dev "$IFACE" 2>/dev/null | grep -q "htb 1:"; then
-  ok "HTB root qdisc มีอยู่บน ${IFACE} (ขาดาวน์โหลด)"
+head1 "2) CAKE QoS shaping (download/upload แยกฝั่ง)"
+if tc qdisc show dev "$IFACE" 2>/dev/null | grep -q cake; then
+  ok "CAKE บน $IFACE (download/egress) ทำงานอยู่:"
+  tc qdisc show dev "$IFACE" | grep cake | sed 's/^/      /'
 else
-  bad "ไม่เจอ HTB root qdisc บน ${IFACE} — เช็ค: journalctl -u tunnel-shaper -n 30 --no-pager"
+  bad "ไม่พบ CAKE qdisc บน $IFACE"
 fi
-if ip link show ifb0 >/dev/null 2>&1; then
-  ok "ifb0 มีอยู่ (สำหรับ shape ขาอัพโหลด)"
-  if tc qdisc show dev ifb0 2>/dev/null | grep -q "htb 1:"; then
-    ok "HTB root qdisc มีอยู่บน ifb0 (ขาอัพโหลด)"
+if ip link show ifb0 &>/dev/null && tc qdisc show dev ifb0 2>/dev/null | grep -q cake; then
+  ok "CAKE บน ifb0 (upload/ingress redirect) ทำงานอยู่:"
+  tc qdisc show dev ifb0 | grep cake | sed 's/^/      /'
+else
+  bad "ไม่พบ CAKE qdisc บน ifb0 (upload shaping)"
+fi
+info "ตั้งไว้ใน config: Download=${DOWNLOAD_SHAPE_MBIT}mbit | Upload=${UPLOAD_SHAPE_MBIT}mbit | RTT=${RTT_MS}ms"
+systemctl is-active --quiet tunnel-shaper.service && ok "tunnel-shaper.service: active" || bad "tunnel-shaper.service: ไม่ active"
+
+head1 "3) Kernel network sysctl"
+declare -A EXPECT_SYSCTL=(
+  ["net.ipv4.tcp_congestion_control"]="bbr"
+  ["net.core.default_qdisc"]="cake"
+  ["net.ipv4.ip_forward"]="1"
+)
+for k in "${!EXPECT_SYSCTL[@]}"; do
+  v=$(sysctl -n "$k" 2>/dev/null)
+  if [ "$v" = "${EXPECT_SYSCTL[$k]}" ]; then
+    ok "$k = $v"
   else
-    bad "ไม่เจอ HTB root qdisc บน ifb0"
+    warn "$k = $v (คาดหวัง ${EXPECT_SYSCTL[$k]})"
   fi
-else
-  bad "ไม่มี interface ifb0 — โมดูล ifb อาจไม่ถูกโหลด"
-fi
-if tc qdisc show dev "$IFACE" 2>/dev/null | grep -q ingress; then
-  ok "ingress redirect (mirred -> ifb0) ตั้งอยู่"
-else
-  bad "ไม่เจอ ingress qdisc บน ${IFACE}"
-fi
-NUSER=$(wc -l < /var/run/tunnel-shaper/ip_classid.map 2>/dev/null || echo 0)
-echo "  จำนวน user ที่ shaper กำลังคุมอยู่ตอนนี้: ${NUSER} (0 = ปกติถ้ายังไม่มีใครต่อ)"
+done
+info "core.rmem_max = $(sysctl -n net.core.rmem_max 2>/dev/null) bytes"
+info "core.wmem_max = $(sysctl -n net.core.wmem_max 2>/dev/null) bytes"
+info "tcp_rmem = $(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)"
+info "tcp_wmem = $(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)"
+info "rps_sock_flow_entries = $(sysctl -n net.core.rps_sock_flow_entries 2>/dev/null)"
 
-section "8. RPS (กระจาย core)"
-systemctl is-active set-rps >/dev/null 2>&1 && ok "set-rps.service active" || bad "set-rps.service ไม่ active"
-RPS_SAMPLE=$(cat /sys/class/net/"${IFACE}"/queues/rx-0/rps_cpus 2>/dev/null)
-if echo "$RPS_SAMPLE" | grep -qE '^0+$'; then
-  warn "rps_cpus บน ${IFACE} rx-0 = ${RPS_SAMPLE:-อ่านไม่ได้} (ยังเป็น 0)"
-elif [ -n "$RPS_SAMPLE" ]; then
-  ok "rps_cpus บน ${IFACE} rx-0 = ${RPS_SAMPLE} (ไม่ใช่ 0 = ทำงานอยู่)"
+RMEM_CEILING=33554432
+EXP_BDP_DOWN=$(( DOWNLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
+EXP_BDP_UP=$(( UPLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
+EXP_RMEM_MAX=$(( EXP_BDP_DOWN * 4 ))
+EXP_WMEM_MAX=$(( EXP_BDP_UP * 4 ))
+[ "$EXP_RMEM_MAX" -gt "$RMEM_CEILING" ] && EXP_RMEM_MAX=$RMEM_CEILING
+[ "$EXP_WMEM_MAX" -gt "$RMEM_CEILING" ] && EXP_WMEM_MAX=$RMEM_CEILING
+LIVE_RMEM_MAX=$(sysctl -n net.core.rmem_max 2>/dev/null)
+LIVE_WMEM_MAX=$(sysctl -n net.core.wmem_max 2>/dev/null)
+LIVE_TCP_RMEM_MAX=$(awk '{print $3}' <<< "$(sysctl -n net.ipv4.tcp_rmem 2>/dev/null)")
+LIVE_TCP_WMEM_MAX=$(awk '{print $3}' <<< "$(sysctl -n net.ipv4.tcp_wmem 2>/dev/null)")
+if [ "$LIVE_RMEM_MAX" = "$EXP_RMEM_MAX" ] && [ "$LIVE_TCP_RMEM_MAX" = "$EXP_RMEM_MAX" ]; then
+  ok "ไม่มี lock: rmem ceiling = เต็ม pipe (${EXP_RMEM_MAX} bytes) ตรงทั้ง core.rmem_max และ tcp_rmem[max]"
 else
-  warn "rps_cpus บน ${IFACE} rx-0 อ่านไม่ได้"
+  warn "rmem ceiling ไม่ตรงที่คำนวณไว้ - คาดหวัง ${EXP_RMEM_MAX} แต่ core.rmem_max=${LIVE_RMEM_MAX} tcp_rmem[max]=${LIVE_TCP_RMEM_MAX} (เช็คว่ามีอะไรมาทับทีหลังหรือเปล่า)"
 fi
-
-section "9. Safe-reboot timer"
-systemctl is-active safe-reboot.timer >/dev/null 2>&1 && ok "safe-reboot.timer active" || bad "safe-reboot.timer ไม่ active"
-systemctl list-timers safe-reboot.timer --no-pager 2>/dev/null | sed -n '2p' | awk '{print "  รอบถัดไป: "$0}'
-
-section "10. udpgw-loadbalance (ถ้าเคยรัน patch นี้)"
-if systemctl list-unit-files 2>/dev/null | grep -q '^udpgw-loadbalance.service'; then
-  systemctl is-active udpgw-loadbalance >/dev/null 2>&1 && ok "udpgw-loadbalance.service active" || bad "udpgw-loadbalance.service ไม่ active"
-  if iptables -t nat -S OUTPUT 2>/dev/null | grep -q "dport ${BADVPN_PORT1} .*nth"; then
-    ok "NAT load-balance rule (${BADVPN_PORT1} -> ${BADVPN_PORT2} ครึ่งหนึ่ง) มีอยู่"
-  else
-    bad "ไม่เจอ NAT load-balance rule — เช็ค: iptables -t nat -L OUTPUT -n --line-numbers"
-  fi
+if [ "$LIVE_WMEM_MAX" = "$EXP_WMEM_MAX" ] && [ "$LIVE_TCP_WMEM_MAX" = "$EXP_WMEM_MAX" ]; then
+  ok "ไม่มี lock: wmem ceiling = เต็ม pipe (${EXP_WMEM_MAX} bytes) ตรงทั้ง core.wmem_max และ tcp_wmem[max]"
 else
-  warn "ยังไม่เคยรัน udpgw-loadbalance-patch.sh (ข้ามได้ถ้าตั้งใจไม่ใช้)"
+  warn "wmem ceiling ไม่ตรงที่คำนวณไว้ - คาดหวัง ${EXP_WMEM_MAX} แต่ core.wmem_max=${LIVE_WMEM_MAX} tcp_wmem[max]=${LIVE_TCP_WMEM_MAX} (เช็คว่ามีอะไรมาทับทีหลังหรือเปล่า)"
 fi
 
-section "11. udp-custom (ถ้าเคยรัน post-udpcustom-patch.sh)"
-if [ -n "${UDP_CUSTOM_PORT:-}" ]; then
-  echo "  UDP_CUSTOM_PORT ที่บันทึกไว้ = ${UDP_CUSTOM_PORT}"
-  if systemctl list-unit-files 2>/dev/null | grep -q '^udp-custom.service'; then
-    systemctl is-active udp-custom >/dev/null 2>&1 && ok "udp-custom.service active" || bad "udp-custom.service ไม่ active"
-  else
-    warn "ไม่เจอ udp-custom.service (ชื่อ unit อาจต่างออกไป เช็คมือ: systemctl list-units | grep -i udp)"
-  fi
-  if ss -ulnp 2>/dev/null | grep -q ":${UDP_CUSTOM_PORT} "; then
-    ok "udp-custom listen port ${UDP_CUSTOM_PORT} จริง"
-  else
-    bad "ไม่มีใคร listen udp port ${UDP_CUSTOM_PORT}"
-  fi
-  if systemctl list-unit-files 2>/dev/null | grep -q '^udpgw.service'; then
-    ST=$(systemctl is-enabled udpgw.service 2>/dev/null)
-    [ "$ST" = "disabled" ] && ok "udpgw.service (ตัวซ้ำจาก udp-custom) ปิดอยู่แล้ว" || warn "udpgw.service ยัง enabled อยู่ (ควรปิด กันซ้ำกับ badvpn-udpgw1/2)"
-  fi
-else
-  warn "ยังไม่เคยรัน post-udpcustom-patch.sh (UDP_CUSTOM_PORT ว่าง) — ข้ามได้ถ้าตั้งใจไม่ใช้"
-fi
-
-section "12. irqbalance (ถ้าเคยรัน patch สุดท้าย)"
-if command -v irqbalance >/dev/null 2>&1; then
-  systemctl is-active irqbalance >/dev/null 2>&1 && ok "irqbalance active" || warn "irqbalance ติดตั้งแล้วแต่ไม่ active"
-else
-  warn "ยังไม่ได้ติดตั้ง irqbalance"
-fi
-
-section "13. Conntrack / เพดานการเชื่อมต่อ"
+head1 "4) Conntrack"
+CT_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null || echo "?")
 CT_MAX=$(sysctl -n net.netfilter.nf_conntrack_max 2>/dev/null)
-CT_CUR=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)
-echo "  conntrack: ${CT_CUR:-?} / ${CT_MAX:-?}"
+info "ใช้อยู่ ${CT_COUNT} / ${CT_MAX}"
+HASH=$(cat /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || echo "?")
+info "hashsize=${HASH}"
 
-section "สรุป"
-echo -e "  ${GREEN}ผ่าน: ${PASS}${NC}   ${YELLOW}เตือน: ${WARN}${NC}   ${RED}ไม่ผ่าน: ${FAIL}${NC}"
-echo ""
-if [ "$FAIL" -eq 0 ]; then
-  echo -e "${GREEN}ระบบดูปกติหลังรีบูต ไม่มี service ไหนพัง${NC}"
-else
-  echo -e "${RED}มี ${FAIL} รายการไม่ผ่าน ดูรายละเอียดคำสั่งที่แนะนำไว้ในแต่ละหัวข้อด้านบน${NC}"
+head1 "5) RPS/RFS + irqbalance"
+systemctl is-active --quiet irqbalance && ok "irqbalance: active" || bad "irqbalance: ไม่ active"
+systemctl is-active --quiet set-rps.service && ok "set-rps.service: active" || bad "set-rps.service: ไม่ active"
+for rx in /sys/class/net/"$IFACE"/queues/rx-*/rps_cpus; do
+  [ -e "$rx" ] && info "$IFACE $(basename "$(dirname "$rx")") rps_cpus=$(cat "$rx")"
+done
+for rf in /sys/class/net/"$IFACE"/queues/rx-*/rps_flow_cnt; do
+  [ -e "$rf" ] && info "$IFACE $(basename "$(dirname "$rf")") rps_flow_cnt=$(cat "$rf")"
+done
+if ip link show ifb0 &>/dev/null; then
+  for rx in /sys/class/net/ifb0/queues/rx-*/rps_cpus; do
+    [ -e "$rx" ] && info "ifb0 $(basename "$(dirname "$rx")") rps_cpus=$(cat "$rx")"
+  done
 fi
+
+head1 "6) MSS clamp"
+systemctl is-active --quiet mss-clamp.service && ok "mss-clamp.service: active" || bad "mss-clamp.service: ไม่ active"
+if iptables -t mangle -S 2>/dev/null | grep -q TCPMSS; then
+  ok "พบ iptables TCPMSS rule:"
+  iptables -t mangle -S | grep TCPMSS | sed 's/^/      /'
+else
+  bad "ไม่พบ TCPMSS rule"
+fi
+
+head1 "7) DNS lock"
+info "ตั้งไว้ใน config: ${DNS_LABEL} (${DNS_V4_A}, ${DNS_V4_B}, ${DNS_V6_A}, ${DNS_V6_B})"
+if [ -f /etc/systemd/resolved.conf ]; then
+  CUR_DNS=$(grep -E '^DNS=' /etc/systemd/resolved.conf | cut -d= -f2)
+  if echo "$CUR_DNS" | grep -q "$DNS_V4_A"; then
+    ok "resolved.conf DNS=$CUR_DNS"
+  else
+    warn "resolved.conf DNS=$CUR_DNS (ไม่ตรงกับที่ตั้งไว้)"
+  fi
+else
+  bad "ไม่พบ /etc/systemd/resolved.conf"
+fi
+if [ -d /etc/systemd/resolved.conf.d ] && [ -z "$(ls -A /etc/systemd/resolved.conf.d 2>/dev/null)" ]; then
+  ok "resolved.conf.d ว่าง (ไม่มี drop-in ค้าง)"
+else
+  warn "resolved.conf.d ยังมีไฟล์ค้างอยู่: $(ls /etc/systemd/resolved.conf.d 2>/dev/null | tr '\n' ' ')"
+fi
+if [ -f /etc/netplan/90-dns-override.yaml ]; then
+  warn "ยังมีไฟล์ 90-dns-override.yaml ค้างอยู่"
+else
+  ok "ไม่มีไฟล์ 90-dns-override.yaml ค้าง"
+fi
+if grep -lE '8\.8\.4\.4|1\.0\.0\.1' /etc/netplan/*.yaml >/dev/null 2>&1; then
+  warn "ยังพบ DNS IP เก่าค้างใน netplan"
+else
+  ok "ไม่พบ DNS IP เก่าค้างใน netplan"
+fi
+if [ -f /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg ]; then
+  ok "ปิด cloud-init network config แล้ว (กัน netplan ถูกเขียนทับตอน reboot)"
+else
+  warn "ไม่พบ /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg - netplan อาจถูกคืนค่าเดิมตอน reboot"
+fi
+if grep -lE '^\s*nameservers:' /etc/netplan/*.yaml >/dev/null 2>&1; then
+  warn "ยังมี per-link nameservers: block ค้างใน netplan (DNS อาจโดน override เฉพาะ interface)"
+else
+  ok "ไม่มี per-link nameservers: block ใน netplan แล้ว"
+fi
+resolvectl status 2>/dev/null | grep -A2 "Current DNS Server\|DNS Servers" | sed 's/^/      /'
+
+head1 "8) UFW"
+ufw status verbose 2>/dev/null | sed -n '1,15p' | sed 's/^/      /'
+
+head1 "9) Swap"
+swapon --show 2>/dev/null | sed 's/^/      /'
+free -h | sed 's/^/      /'
+
+head1 "10) udp-custom buffer"
+if [ -f "$UDP_CUSTOM_CONFIG" ]; then
+  RB=$(jq -r '.receive_buffer // "N/A"' "$UDP_CUSTOM_CONFIG" 2>/dev/null)
+  SB=$(jq -r '.stream_buffer // "N/A"' "$UDP_CUSTOM_CONFIG" 2>/dev/null)
+  info "receive_buffer=${RB} bytes | stream_buffer=${SB} bytes"
+  systemctl is-active --quiet udp-custom && ok "udp-custom: active" || warn "udp-custom: ไม่ active"
+else
+  bad "ไม่พบ $UDP_CUSTOM_CONFIG"
+fi
+UDP_CUSTOM_SERVICE="/etc/systemd/system/udp-custom.service"
+if [ -f "$UDP_CUSTOM_SERVICE" ] && grep -q '99-tunnel-optimize' "$UDP_CUSTOM_SERVICE"; then
+  ok "udp-custom.service มี ExecStartPost re-apply sysctl (กัน binary เขียนทับ rmem/wmem เอง)"
+else
+  warn "udp-custom.service ไม่มี ExecStartPost re-apply - ถ้า binary auto-tune เอง ค่า rmem/wmem อาจโดนทับกลับตอน restart"
+fi
+CUR_RMEM=$(sysctl -n net.core.rmem_max 2>/dev/null)
+if [ "$CUR_RMEM" != "$EXP_RMEM_MAX" ]; then
+  warn "core.rmem_max ตอนนี้ (${CUR_RMEM}) ไม่ตรงที่ควรเป็น (${EXP_RMEM_MAX}) - อาจโดนทับหลัง udp-custom restart ล่าสุด ลอง: systemctl restart udp-custom แล้วรอ 5 วิค่อยเช็คซ้ำ"
+fi
+
+head1 "11) udpgw (badvpn)"
+if [ -f "$UDPGW_SERVICE" ]; then
+  PORT=$(grep -oP '127\.0\.0\.1:\K[0-9]+' "$UDPGW_SERVICE" | head -1)
+  MC=$(grep -oP -- '--max-clients \K[0-9]+' "$UDPGW_SERVICE")
+  MCC=$(grep -oP -- '--max-connections-for-client \K[0-9]+' "$UDPGW_SERVICE")
+  info "listen port=${PORT} | max-clients=${MC} | max-connections-for-client=${MCC}"
+  systemctl is-active --quiet udpgw && ok "udpgw: active" || warn "udpgw: ไม่ active"
+else
+  bad "ไม่พบ $UDPGW_SERVICE"
+fi
+
+head1 "12) Log-to-RAM"
+mount | grep -q "on /var/log type tmpfs" && ok "/var/log เป็น tmpfs" || bad "/var/log ไม่ใช่ tmpfs"
+STORAGE=$(grep -oP '^Storage=\K.*' /etc/systemd/journald.conf.d/ram-only.conf 2>/dev/null)
+if [ "$STORAGE" = "volatile" ]; then ok "journald Storage=volatile"; else warn "journald Storage=${STORAGE:-ไม่พบ}"; fi
+systemctl is-active --quiet log-clear.timer && ok "log-clear.timer: active" || warn "log-clear.timer: ไม่ active"
+systemctl is-active --quiet log-watchdog.timer && ok "log-watchdog.timer: active" || warn "log-watchdog.timer: ไม่ active"
+
 echo ""
-echo "คำสั่งเสริมเช็คแบบ real-time:"
-echo "  journalctl -t tunnel-shaper -f"
-echo "  journalctl -t safe-reboot -f"
-echo "  tc -s qdisc show dev ${IFACE}"
-echo "  tc -s qdisc show dev ifb0"
-echo "  watch -n2 'ss -tn state established | grep -E \":(${DROPBEAR_MAIN_PORT// /|:})\"'"
+echo -e "${BOLD}=================================================="
+echo " จบรายงาน"
+echo -e "==================================================${NC}"
