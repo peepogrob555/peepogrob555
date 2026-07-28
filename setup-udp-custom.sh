@@ -13,11 +13,11 @@ TCP_SAFE_BUDGET_MB="${TCP_SAFE_BUDGET_MB:-2048}"
 SWAP_GB="${SWAP_GB:-4}"
 UDPGW_PORT="${UDPGW_PORT:-7300}"
 
-PER_USER_DOWN_MBIT="${PER_USER_DOWN_MBIT:-15}"
+PER_USER_DOWN_MBIT="${PER_USER_DOWN_MBIT:-20}"
 PER_USER_UP_MBIT="${PER_USER_UP_MBIT:-4}"
 
-DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-$((MAX_USERS * PER_USER_DOWN_MBIT))}"
-UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-$((MAX_USERS * PER_USER_UP_MBIT))}"
+DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-1500}"
+UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-400}"
 
 LOG_RAM_MB="${LOG_RAM_MB:-256}"
 JOURNAL_RAM_MB="${JOURNAL_RAM_MB:-64}"
@@ -48,7 +48,7 @@ DNS_LABEL="Cloudflare+Google"
 DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
 DNS_V6_A="2606:4700:4700::1111"; DNS_V6_B="2001:4860:4860::8888"
 
-echo "IFACE=${IFACE} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Down=${DOWNLOAD_SHAPE_MBIT}mbit(${PER_USER_DOWN_MBIT}/user) | Up=${UPLOAD_SHAPE_MBIT}mbit(${PER_USER_UP_MBIT}/user) | RTT=${RTT_MS}ms | Max Users=${MAX_USERS}"
+echo "IFACE=${IFACE} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Pipe: Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit (ไม่ล็อคต่อคน แชร์กันตามจริง) | Buffer ref: ${PER_USER_DOWN_MBIT}/${PER_USER_UP_MBIT} Mbps | RTT=${RTT_MS}ms | Max Users=${MAX_USERS}"
 
 UDP_CUSTOM_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CUSTOM_CONFIG" || true)
 if [ -z "$UDP_CUSTOM_PORT" ]; then
@@ -247,21 +247,24 @@ NF_CONNTRACK_HASHSIZE=$(( NF_CONNTRACK_MAX / 4 ))
 
 BDP_PERUSER_DOWN=$(( PER_USER_DOWN_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 BDP_PERUSER_UP=$(( PER_USER_UP_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
-PERFLOW_RMEM_TARGET=$(( BDP_PERUSER_DOWN * 4 ))
-PERFLOW_WMEM_TARGET=$(( BDP_PERUSER_UP * 4 ))
+
+TCP_DEFAULT_RMEM=$(( BDP_PERUSER_DOWN * 2 ))
+TCP_DEFAULT_WMEM=$(( BDP_PERUSER_UP * 2 ))
+[ "$TCP_DEFAULT_RMEM" -lt 87380 ] && TCP_DEFAULT_RMEM=87380
+[ "$TCP_DEFAULT_WMEM" -lt 65536 ] && TCP_DEFAULT_WMEM=65536
+[ "$TCP_DEFAULT_RMEM" -gt "$RMEM_MAX" ] && TCP_DEFAULT_RMEM=$RMEM_MAX
+[ "$TCP_DEFAULT_WMEM" -gt "$WMEM_MAX" ] && TCP_DEFAULT_WMEM=$WMEM_MAX
 
 TOTAL_FLOWS=$(( MAX_USERS * FLOWS_PER_USER ))
 BUDGET_PER_FLOW=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / TOTAL_FLOWS / 2 ))
 
-TCP_FLOW_RMEM_MAX=$PERFLOW_RMEM_TARGET
-[ "$TCP_FLOW_RMEM_MAX" -gt "$BUDGET_PER_FLOW" ] && TCP_FLOW_RMEM_MAX=$BUDGET_PER_FLOW
-[ "$TCP_FLOW_RMEM_MAX" -gt "$RMEM_MAX" ]        && TCP_FLOW_RMEM_MAX=$RMEM_MAX
-[ "$TCP_FLOW_RMEM_MAX" -lt 262144 ]             && TCP_FLOW_RMEM_MAX=262144
+UDP_CUSTOM_RBUF=$(( BDP_PERUSER_DOWN * 4 ))
+[ "$UDP_CUSTOM_RBUF" -gt "$BUDGET_PER_FLOW" ] && UDP_CUSTOM_RBUF=$BUDGET_PER_FLOW
+[ "$UDP_CUSTOM_RBUF" -lt 262144 ]             && UDP_CUSTOM_RBUF=262144
 
-TCP_FLOW_WMEM_MAX=$PERFLOW_WMEM_TARGET
-[ "$TCP_FLOW_WMEM_MAX" -gt "$BUDGET_PER_FLOW" ] && TCP_FLOW_WMEM_MAX=$BUDGET_PER_FLOW
-[ "$TCP_FLOW_WMEM_MAX" -gt "$WMEM_MAX" ]        && TCP_FLOW_WMEM_MAX=$WMEM_MAX
-[ "$TCP_FLOW_WMEM_MAX" -lt 131072 ]             && TCP_FLOW_WMEM_MAX=131072
+UDP_CUSTOM_SBUF=$(( BDP_PERUSER_UP * 4 ))
+[ "$UDP_CUSTOM_SBUF" -gt "$BUDGET_PER_FLOW" ] && UDP_CUSTOM_SBUF=$BUDGET_PER_FLOW
+[ "$UDP_CUSTOM_SBUF" -lt 131072 ]             && UDP_CUSTOM_SBUF=131072
 
 cat > /etc/sysctl.d/99-tunnel-optimize.conf << EOF
 net.ipv4.tcp_congestion_control = bbr
@@ -274,8 +277,8 @@ net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
 net.core.rmem_max = ${RMEM_MAX}
 net.core.wmem_max = ${WMEM_MAX}
-net.ipv4.tcp_rmem = 4096 87380 ${TCP_FLOW_RMEM_MAX}
-net.ipv4.tcp_wmem = 4096 65536 ${TCP_FLOW_WMEM_MAX}
+net.ipv4.tcp_rmem = 4096 ${TCP_DEFAULT_RMEM} ${RMEM_MAX}
+net.ipv4.tcp_wmem = 4096 ${TCP_DEFAULT_WMEM} ${WMEM_MAX}
 net.core.netdev_max_backlog = 32768
 net.core.netdev_budget = 600
 net.core.rps_sock_flow_entries = 32768
@@ -394,7 +397,7 @@ systemctl daemon-reload
 systemctl enable --now set-rps.service > /dev/null 2>&1
 
 cp "$UDP_CUSTOM_CONFIG" "${UDP_CUSTOM_CONFIG}.bak.$(date +%s)"
-jq --argjson rb "$TCP_FLOW_RMEM_MAX" --argjson sb "$TCP_FLOW_WMEM_MAX" \
+jq --argjson rb "$UDP_CUSTOM_RBUF" --argjson sb "$UDP_CUSTOM_SBUF" \
   '.receive_buffer=$rb | .stream_buffer=$sb' \
   "$UDP_CUSTOM_CONFIG" > "${UDP_CUSTOM_CONFIG}.tmp" && mv "${UDP_CUSTOM_CONFIG}.tmp" "$UDP_CUSTOM_CONFIG"
 
@@ -519,5 +522,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (Max ${MAX_USERS} Users | ${PER_USER_DOWN_MBIT}↓/${PER_USER_UP_MBIT}↑ Mbps ต่อคน | รวม pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit)${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (Max ${MAX_USERS} Users | ไม่ล็อคต่อคน แชร์ pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit ตามจริง | buffer อ้างอิงคนละ ${PER_USER_DOWN_MBIT}↓/${PER_USER_UP_MBIT}↑ Mbps)${NC}"
 echo "=================================================="
