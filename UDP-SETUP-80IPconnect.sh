@@ -16,10 +16,8 @@ UDPGW_PORT="${UDPGW_PORT:-7300}"
 DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-300}"
 UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-300}"
 
-LOG_RAM_MB="${LOG_RAM_MB:-128}"
-JOURNAL_RAM_MB="${JOURNAL_RAM_MB:-32}"
-LOG_CLEAR_HOURS="${LOG_CLEAR_HOURS:-6}"
-LOG_WATCHDOG_THRESHOLD_MB="${LOG_WATCHDOG_THRESHOLD_MB:-64}"
+LOG_RAM_MB="${LOG_RAM_MB:-2048}"
+JOURNAL_RAM_MB="${JOURNAL_RAM_MB:-256}"
 
 UDP_CUSTOM_CONFIG="/root/udp/config.json"
 
@@ -448,6 +446,14 @@ systemctl disable --now safe-reboot.timer > /dev/null 2>&1 || true
 rm -f /etc/systemd/system/safe-reboot.timer /etc/systemd/system/safe-reboot.service /usr/local/sbin/safe-reboot.sh
 systemctl daemon-reload
 
+systemctl disable --now log-clear.timer > /dev/null 2>&1 || true
+systemctl disable --now log-watchdog.timer > /dev/null 2>&1 || true
+rm -f /etc/systemd/system/log-clear.timer /etc/systemd/system/log-watchdog.service /etc/systemd/system/log-watchdog.timer /usr/local/sbin/log-watchdog.sh
+systemctl daemon-reload
+
+systemctl disable --now logrotate.timer > /dev/null 2>&1 || true
+[ -f /etc/cron.daily/logrotate ] && chmod -x /etc/cron.daily/logrotate
+
 mkdir -p /etc/systemd/journald.conf.d
 cat > /etc/systemd/journald.conf.d/ram-only.conf << EOF
 [Journal]
@@ -478,75 +484,11 @@ find /var/log -maxdepth 3 -type f -exec truncate -s 0 {} \; 2>/dev/null || true
 RUNTIME
 chmod +x /usr/local/sbin/log-clear.sh
 
-cat > /etc/systemd/system/log-clear.service << 'EOF'
-[Unit]
-Description=Clear logs in place
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/log-clear.sh
-EOF
-
-cat > /etc/systemd/system/log-clear.timer << EOF
-[Unit]
-Description=Run log-clear every ${LOG_CLEAR_HOURS}h
-
-[Timer]
-OnBootSec=10min
-OnUnitActiveSec=${LOG_CLEAR_HOURS}h
-Persistent=false
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now log-clear.timer > /dev/null 2>&1
-
-cat > /usr/local/sbin/log-watchdog.sh << EOF
-#!/bin/bash
-THRESHOLD_MB=${LOG_WATCHDOG_THRESHOLD_MB}
-for i in 1 2 3 4 5 6; do
-  USED_MB=\$(df --output=used -BM /var/log 2>/dev/null | tail -1 | tr -dc '0-9')
-  [ -z "\$USED_MB" ] && USED_MB=0
-  if [ "\$USED_MB" -ge "\$THRESHOLD_MB" ]; then
-    /usr/local/sbin/log-clear.sh
-  fi
-  sleep 10
-done
-EOF
-chmod +x /usr/local/sbin/log-watchdog.sh
-
-cat > /etc/systemd/system/log-watchdog.service << 'EOF'
-[Unit]
-Description=Check /var/log every 10s
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/log-watchdog.sh
-EOF
-
-cat > /etc/systemd/system/log-watchdog.timer << 'EOF'
-[Unit]
-Description=Re-run log-watchdog
-
-[Timer]
-OnBootSec=1min
-OnUnitActiveSec=1min
-Persistent=false
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now log-watchdog.timer > /dev/null 2>&1
-
 systemctl restart rsyslog 2>/dev/null || true
 systemctl restart cron 2>/dev/null || true
 systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (สูงสุด ${MAX_USERS} IP/connect | pipe รวม ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | โหมด best-effort ไม่บังคับหารเท่ากัน ใครใช้มากได้มาก | UDPGW พอร์ต ${UDPGW_PORT})${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (สูงสุด ${MAX_USERS} IP/connect | pipe รวม ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | โหมด best-effort ไม่บังคับหารเท่ากัน ใครใช้มากได้มาก | UDPGW พอร์ต ${UDPGW_PORT} | Log RAM cap /var/log=${LOG_RAM_MB}MB journald=${JOURNAL_RAM_MB}MB ไม่มี auto-clear เคลียร์เองด้วย: /usr/local/sbin/log-clear.sh)${NC}"
 echo "=================================================="
