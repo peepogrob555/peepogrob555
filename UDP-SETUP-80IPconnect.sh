@@ -16,8 +16,10 @@ UDPGW_PORT="${UDPGW_PORT:-7300}"
 DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-300}"
 UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-300}"
 
-LOG_RAM_MB="${LOG_RAM_MB:-2048}"
-JOURNAL_RAM_MB="${JOURNAL_RAM_MB:-256}"
+JOURNAL_MAX_RETENTION="${JOURNAL_MAX_RETENTION:-1h}"
+JOURNAL_DISK_MAX_MB="${JOURNAL_DISK_MAX_MB:-512}"
+LOG_MAX_AGE_MIN="${LOG_MAX_AGE_MIN:-60}"
+LOG_CHECK_MINUTES="${LOG_CHECK_MINUTES:-10}"
 
 UDP_CUSTOM_CONFIG="/root/udp/config.json"
 
@@ -444,45 +446,88 @@ systemctl restart tunnel-shaper.service
 
 systemctl disable --now safe-reboot.timer > /dev/null 2>&1 || true
 rm -f /etc/systemd/system/safe-reboot.timer /etc/systemd/system/safe-reboot.service /usr/local/sbin/safe-reboot.sh
-systemctl daemon-reload
 
 systemctl disable --now log-clear.timer > /dev/null 2>&1 || true
 systemctl disable --now log-watchdog.timer > /dev/null 2>&1 || true
-rm -f /etc/systemd/system/log-clear.timer /etc/systemd/system/log-watchdog.service /etc/systemd/system/log-watchdog.timer /usr/local/sbin/log-watchdog.sh
-systemctl daemon-reload
+rm -f /etc/systemd/system/log-clear.timer /etc/systemd/system/log-clear.service /etc/systemd/system/log-watchdog.service /etc/systemd/system/log-watchdog.timer /usr/local/sbin/log-watchdog.sh
 
 systemctl disable --now logrotate.timer > /dev/null 2>&1 || true
 [ -f /etc/cron.daily/logrotate ] && chmod -x /etc/cron.daily/logrotate
 
+if mountpoint -q /var/log; then
+  FSTYPE=$(findmnt -no FSTYPE /var/log 2>/dev/null || true)
+  if [ "$FSTYPE" = "tmpfs" ]; then
+    umount /var/log 2>/dev/null || umount -l /var/log 2>/dev/null || true
+  fi
+fi
+sed -i '/^tmpfs \/var\/log tmpfs/d' /etc/fstab
+
 mkdir -p /etc/systemd/journald.conf.d
-cat > /etc/systemd/journald.conf.d/ram-only.conf << EOF
+rm -f /etc/systemd/journald.conf.d/ram-only.conf
+cat > /etc/systemd/journald.conf.d/disk-hourly.conf << EOF
 [Journal]
-Storage=volatile
-RuntimeMaxUse=${JOURNAL_RAM_MB}M
-RuntimeMaxFileSize=$((JOURNAL_RAM_MB / 4))M
+Storage=persistent
+SystemMaxUse=${JOURNAL_DISK_MAX_MB}M
+SystemMaxFileSize=$((JOURNAL_DISK_MAX_MB / 4))M
+MaxRetentionSec=${JOURNAL_MAX_RETENTION}
 ForwardToSyslog=yes
 EOF
 systemctl restart systemd-journald
 
-if ! grep -q '^tmpfs /var/log tmpfs' /etc/fstab; then
-  echo "tmpfs /var/log tmpfs defaults,mode=0755,size=${LOG_RAM_MB}M 0 0" >> /etc/fstab
-fi
-mount -t tmpfs -o defaults,mode=0755,size="${LOG_RAM_MB}"M tmpfs /var/log 2>/dev/null || mount -o remount /var/log
-
 mkdir -p /etc/tmpfiles.d
-cat > /etc/tmpfiles.d/varlog-ram.conf << 'EOF'
+rm -f /etc/tmpfiles.d/varlog-ram.conf
+cat > /etc/tmpfiles.d/varlog-perms.conf << 'EOF'
 d /var/log/apt 0755 root root -
 d /var/log/private 0700 root root -
 EOF
-systemd-tmpfiles --create /etc/tmpfiles.d/varlog-ram.conf > /dev/null 2>&1 || true
+systemd-tmpfiles --create /etc/tmpfiles.d/varlog-perms.conf > /dev/null 2>&1 || true
 
-cat > /usr/local/sbin/log-clear.sh << 'RUNTIME'
+cat > /usr/local/sbin/log-clear.sh << EOF
 #!/bin/bash
-journalctl --rotate > /dev/null 2>&1 || true
-journalctl --vacuum-time=1s > /dev/null 2>&1 || true
+journalctl --vacuum-time=${JOURNAL_MAX_RETENTION} > /dev/null 2>&1 || true
 find /var/log -maxdepth 3 -type f -exec truncate -s 0 {} \; 2>/dev/null || true
-RUNTIME
+EOF
 chmod +x /usr/local/sbin/log-clear.sh
+
+cat > /usr/local/sbin/log-age-clear.sh << RUNTIME
+#!/bin/bash
+STAMP=/var/lib/log-clear.stamp
+MAX_AGE_SEC=\$(( ${LOG_MAX_AGE_MIN} * 60 ))
+NOW=\$(date +%s)
+LAST=0
+[ -f "\$STAMP" ] && LAST=\$(cat "\$STAMP" 2>/dev/null || echo 0)
+AGE=\$(( NOW - LAST ))
+if [ "\$AGE" -ge "\$MAX_AGE_SEC" ]; then
+  /usr/local/sbin/log-clear.sh
+  echo "\$NOW" > "\$STAMP"
+fi
+RUNTIME
+chmod +x /usr/local/sbin/log-age-clear.sh
+
+cat > /etc/systemd/system/log-age-clear.service << 'EOF'
+[Unit]
+Description=Clear logs older than retention window
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/log-age-clear.sh
+EOF
+
+cat > /etc/systemd/system/log-age-clear.timer << EOF
+[Unit]
+Description=Check log age every ${LOG_CHECK_MINUTES} minutes
+
+[Timer]
+OnBootSec=${LOG_CHECK_MINUTES}min
+OnUnitActiveSec=${LOG_CHECK_MINUTES}min
+Persistent=false
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now log-age-clear.timer > /dev/null 2>&1
 
 systemctl restart rsyslog 2>/dev/null || true
 systemctl restart cron 2>/dev/null || true
@@ -490,5 +535,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (สูงสุด ${MAX_USERS} IP/connect | pipe รวม ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | โหมด best-effort ไม่บังคับหารเท่ากัน ใครใช้มากได้มาก | UDPGW พอร์ต ${UDPGW_PORT} | Log RAM cap /var/log=${LOG_RAM_MB}MB journald=${JOURNAL_RAM_MB}MB ไม่มี auto-clear เคลียร์เองด้วย: /usr/local/sbin/log-clear.sh)${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (สูงสุด ${MAX_USERS} IP/connect | pipe รวม ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | โหมด best-effort ไม่บังคับหารเท่ากัน ใครใช้มากได้มาก | UDPGW พอร์ต ${UDPGW_PORT} | Log เก็บบนดิสก์ ไม่ใช้ RAM | auto-clear log เก่ากว่า ${LOG_MAX_AGE_MIN} นาที เช็คทุก ${LOG_CHECK_MINUTES} นาที | journald retention ${JOURNAL_MAX_RETENTION})${NC}"
 echo "=================================================="
