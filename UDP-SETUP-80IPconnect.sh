@@ -191,7 +191,7 @@ cat > /usr/local/sbin/set-multiqueue.sh << 'RUNTIME'
 source /etc/tunnel-qos.conf 2>/dev/null || true
 NCPU=$(nproc)
 Q=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Combined:/ {print $2; exit}')
-if [ -n "$Q" ] && [ "$Q" -gt 1 ] 2>/dev/null; then
+if [ -n "$Q" ] && [ "$Q" -gt 1 ] 2>/dev/null && [ "$Q" != "$NCPU" ]; then
   ethtool -L "$IFACE" combined "$NCPU" 2>/dev/null || true
 fi
 ethtool -C "$IFACE" adaptive-rx off adaptive-tx off rx-usecs 8 tx-usecs 8 2>/dev/null || true
@@ -267,6 +267,9 @@ WMEM_MAX=$(( BDP_FULLPIPE_UP * 4 ))
 [ "$WMEM_MAX" -lt "$RMEM_MIN" ]     && WMEM_MAX=$RMEM_MIN
 [ "$WMEM_MAX" -gt "$RMEM_CEILING" ] && WMEM_MAX=$RMEM_CEILING
 
+VM_MIN_FREE_KB=$(( TOTAL_RAM_MB * 1024 * 2 / 100 ))
+[ "$VM_MIN_FREE_KB" -lt 65536 ] && VM_MIN_FREE_KB=65536
+
 NF_CONNTRACK_MAX=$(( MAX_USERS * 5000 ))
 [ "$NF_CONNTRACK_MAX" -lt 20000 ] && NF_CONNTRACK_MAX=20000
 NF_CONNTRACK_HASHSIZE=$(( NF_CONNTRACK_MAX / 4 ))
@@ -310,6 +313,11 @@ net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_frto = 2
+net.ipv4.tcp_ecn = 1
+net.ipv4.tcp_syncookies = 1
+net.ipv4.tcp_keepalive_time = 60
+net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_probes = 3
 net.core.rmem_max = ${RMEM_MAX}
 net.core.wmem_max = ${WMEM_MAX}
 net.ipv4.tcp_rmem = 4096 ${TCP_DEFAULT_RMEM} ${RMEM_MAX}
@@ -326,7 +334,10 @@ net.netfilter.nf_conntrack_max = ${NF_CONNTRACK_MAX}
 net.netfilter.nf_conntrack_udp_timeout = 30
 net.netfilter.nf_conntrack_udp_timeout_stream = 180
 fs.file-max = 1048576
-vm.swappiness = 10
+vm.swappiness = 1
+vm.dirty_ratio = 10
+vm.dirty_background_ratio = 5
+vm.min_free_kbytes = ${VM_MIN_FREE_KB}
 EOF
 echo "options nf_conntrack hashsize=${NF_CONNTRACK_HASHSIZE}" > /etc/modprobe.d/nf_conntrack.conf
 echo "$NF_CONNTRACK_HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
@@ -337,6 +348,9 @@ if [ -f /etc/sysctl.conf ]; then
              net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
              net.core.netdev_max_backlog net.core.netdev_budget net.core.netdev_budget_usecs net.core.somaxconn \
              net.ipv4.tcp_max_syn_backlog net.core.rps_sock_flow_entries net.ipv4.tcp_frto \
+             net.ipv4.tcp_ecn net.ipv4.tcp_syncookies net.ipv4.tcp_keepalive_time \
+             net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes \
+             vm.dirty_ratio vm.dirty_background_ratio vm.min_free_kbytes \
              net.netfilter.nf_conntrack_max fs.file-max vm.swappiness; do
     esc_key=$(printf '%s' "$key" | sed 's/\./\\./g')
     sed -i -E "/^[[:space:]]*${esc_key}[[:space:]]*=/d" /etc/sysctl.conf
@@ -344,6 +358,29 @@ if [ -f /etc/sysctl.conf ]; then
 fi
 
 sysctl --system > /dev/null 2>&1 || true
+
+cat > /usr/local/sbin/set-thp-madvise.sh << 'RUNTIME'
+#!/bin/bash
+[ -f /sys/kernel/mm/transparent_hugepage/enabled ] && echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
+[ -f /sys/kernel/mm/transparent_hugepage/defrag ]  && echo madvise > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+RUNTIME
+chmod +x /usr/local/sbin/set-thp-madvise.sh
+
+cat > /etc/systemd/system/set-thp-madvise.service << 'EOF'
+[Unit]
+Description=Keep THP in madvise mode to avoid compaction stalls under high memory pressure
+After=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/set-thp-madvise.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now set-thp-madvise.service > /dev/null 2>&1
 
 cat > /usr/local/sbin/qos-root-init.sh << 'RUNTIME'
 #!/bin/bash
@@ -432,6 +469,48 @@ EOF
 systemctl daemon-reload
 systemctl enable --now set-rps.service > /dev/null 2>&1
 
+cat > /usr/local/sbin/tunnel-selfheal.sh << 'RUNTIME'
+#!/bin/bash
+source /etc/tunnel-qos.conf 2>/dev/null || true
+
+CUR_MTU=$(cat /sys/class/net/"${IFACE}"/mtu 2>/dev/null || echo 0)
+[ "$CUR_MTU" != "$TUNNEL_MTU" ] && ip link set dev "${IFACE}" mtu "$TUNNEL_MTU" 2>/dev/null || true
+
+if ! tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc cake" || \
+   ! tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc cake"; then
+  /usr/local/sbin/qos-root-init.sh >/dev/null 2>&1
+fi
+
+/usr/local/sbin/set-multiqueue.sh >/dev/null 2>&1
+/usr/local/sbin/set-rps.sh >/dev/null 2>&1
+RUNTIME
+chmod +x /usr/local/sbin/tunnel-selfheal.sh
+
+cat > /etc/systemd/system/tunnel-selfheal.service << 'EOF'
+[Unit]
+Description=Detect and silently repair tunnel network config drift (MTU/CAKE/multiqueue/RPS)
+After=tunnel-shaper.service set-rps.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tunnel-selfheal.sh
+EOF
+
+cat > /etc/systemd/system/tunnel-selfheal.timer << 'EOF'
+[Unit]
+Description=Run tunnel-selfheal every 5 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now tunnel-selfheal.timer > /dev/null 2>&1
+
 cp "$UDP_CUSTOM_CONFIG" "${UDP_CUSTOM_CONFIG}.bak.$(date +%s)"
 jq --argjson rb "$UDP_CUSTOM_RBUF" --argjson sb "$UDP_CUSTOM_SBUF" \
   '.receive_buffer=$rb | .stream_buffer=$sb' \
@@ -444,6 +523,10 @@ if [ -f "$UDP_CUSTOM_SERVICE" ]; then
 
   mkdir -p "${UDP_CUSTOM_SERVICE}.d"
   cat > "${UDP_CUSTOM_SERVICE}.d/99-tuning.conf" << EOF
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=20
+
 [Service]
 Environment=GOMAXPROCS=${NCPU}
 Nice=-5
@@ -453,6 +536,9 @@ OOMScoreAdjust=-500
 LimitNOFILE=1048576
 MemoryHigh=${UDP_CUSTOM_MEM_HIGH_MB}M
 MemoryMax=${UDP_CUSTOM_MEM_MAX_MB}M
+CPUWeight=600
+Restart=always
+RestartSec=2
 ExecStartPost=/bin/bash -c 'sleep 3; sysctl -p /etc/sysctl.d/99-tunnel-optimize.conf >/dev/null 2>&1; /usr/local/sbin/set-rps.sh >/dev/null 2>&1'
 EOF
   systemctl daemon-reload
@@ -476,16 +562,19 @@ cat > /etc/systemd/system/udpgw.service << EOF
 [Unit]
 Description=BadVPN UDPGW
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=20
 
 [Service]
 ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:${UDPGW_PORT} --max-clients ${UDPGW_MAX_CLIENTS} --max-connections-for-client ${UDPGW_MAX_CONN_PER_CLIENT}
 Restart=always
-RestartSec=3
+RestartSec=2
 LimitNOFILE=51200
 Nice=-5
 IOSchedulingClass=best-effort
 IOSchedulingPriority=2
 OOMScoreAdjust=-500
+CPUWeight=300
 MemoryMax=512M
 
 [Install]
@@ -584,5 +673,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU (ใช้เต็มถึง 90%, ${UDP_CUSTOM_MEM_HIGH_MB}MB เป็นจุดหน่วงก่อนแตะเพดาน ${UDP_CUSTOM_MEM_MAX_MB}MB) | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | best-effort เต็มสปีดต่อคน ให้ cake แบ่งเอง | สูงสุด ${MAX_USERS} IP/connect, ${FLOWS_PER_USER} flow/user | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} + priority สูงให้ udp-custom/udpgw | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU (ใช้เต็มถึง 90%, ${UDP_CUSTOM_MEM_HIGH_MB}MB เป็นจุดหน่วงก่อนแตะเพดาน ${UDP_CUSTOM_MEM_MAX_MB}MB) | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | best-effort เต็มสปีดต่อคน ให้ cake แบ่งเอง | สูงสุด ${MAX_USERS} IP/connect, ${FLOWS_PER_USER} flow/user | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} + CPUWeight/priority สูงให้ udp-custom/udpgw + auto-restart | ECN+syncookies+keepalive+dirty-ratio+min_free_kbytes(${VM_MIN_FREE_KB}KB)+THP=madvise | self-heal watchdog เช็ค MTU/CAKE/RPS ทุก 5 นาที | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
 echo "=================================================="
