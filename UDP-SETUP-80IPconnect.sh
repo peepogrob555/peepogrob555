@@ -4,22 +4,28 @@ export DEBIAN_FRONTEND=noninteractive
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
-RTT_MS="${RTT_MS:-80}"
-TUNNEL_MTU="${TUNNEL_MTU:-1500}"
+RTT_MS="${RTT_MS:-65}"
+TUNNEL_MTU="${TUNNEL_MTU:-1440}"
 CAKE_OVERHEAD="${CAKE_OVERHEAD:-18}"
 MAX_USERS="${MAX_USERS:-80}"
-FLOWS_PER_USER="${FLOWS_PER_USER:-24}"
-TCP_SAFE_BUDGET_MB="${TCP_SAFE_BUDGET_MB:-2048}"
+FLOWS_PER_USER="${FLOWS_PER_USER:-330}"
 SWAP_GB="${SWAP_GB:-4}"
 UDPGW_PORT="${UDPGW_PORT:-7300}"
 
-DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-300}"
-UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-300}"
+DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-330}"
+UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-330}"
 
-JOURNAL_MAX_RETENTION="${JOURNAL_MAX_RETENTION:-1h}"
+TOTAL_RAM_MB=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 6144)
+TOTAL_RAM_MB="${TOTAL_RAM_MB:-6144}"
+NCPU=$(nproc)
+
+TCP_SAFE_BUDGET_MB="${TCP_SAFE_BUDGET_MB:-$(( TOTAL_RAM_MB * 90 / 100 ))}"   
+UDP_CUSTOM_MEM_HIGH_MB="${UDP_CUSTOM_MEM_HIGH_MB:-$(( TOTAL_RAM_MB * 80 / 100 ))}"
+UDP_CUSTOM_MEM_MAX_MB="${UDP_CUSTOM_MEM_MAX_MB:-$(( TOTAL_RAM_MB * 90 / 100 ))}"
+
+JOURNAL_MAX_RETENTION="${JOURNAL_MAX_RETENTION:-1d}"
 JOURNAL_DISK_MAX_MB="${JOURNAL_DISK_MAX_MB:-512}"
-LOG_MAX_AGE_MIN="${LOG_MAX_AGE_MIN:-60}"
-LOG_CHECK_MINUTES="${LOG_CHECK_MINUTES:-10}"
+DAILY_CLEAR_TIME="${DAILY_CLEAR_TIME:-00:00:00}"
 
 UDP_CUSTOM_CONFIG="/root/udp/config.json"
 
@@ -45,7 +51,7 @@ DNS_LABEL="Cloudflare+Google"
 DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
 DNS_V6_A="2606:4700:4700::1111"; DNS_V6_B="2001:4860:4860::8888"
 
-echo "IFACE=${IFACE} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Pipe: Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit (best-effort ไม่หารตายตัว รองรับสูงสุด ${MAX_USERS} IP/connect) | RTT=${RTT_MS}ms"
+echo "IFACE=${IFACE} | RAM=${TOTAL_RAM_MB}MB | vCPU=${NCPU} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Pipe: Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit (best-effort ไม่หารตายตัว รองรับสูงสุด ${MAX_USERS} IP/connect) | RTT=${RTT_MS}ms"
 
 UDP_CUSTOM_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CUSTOM_CONFIG" || true)
 if [ -z "$UDP_CUSTOM_PORT" ]; then
@@ -180,11 +186,33 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
+cat > /usr/local/sbin/set-multiqueue.sh << 'RUNTIME'
+#!/bin/bash
+source /etc/tunnel-qos.conf 2>/dev/null || true
 NCPU=$(nproc)
-QUEUES=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Combined:/ {print $2; exit}')
-if [ -n "$QUEUES" ] && [ "$QUEUES" -gt 1 ] 2>/dev/null; then
+Q=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Combined:/ {print $2; exit}')
+if [ -n "$Q" ] && [ "$Q" -gt 1 ] 2>/dev/null; then
   ethtool -L "$IFACE" combined "$NCPU" 2>/dev/null || true
 fi
+RUNTIME
+chmod +x /usr/local/sbin/set-multiqueue.sh
+
+cat > /etc/systemd/system/set-multiqueue.service << 'EOF'
+[Unit]
+Description=Restore NIC multi-queue (combined) count across all vCPU after reboot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/set-multiqueue.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+systemctl enable --now set-multiqueue.service > /dev/null 2>&1
 
 MSS_V4=$((TUNNEL_MTU - 40))
 cat > /usr/local/sbin/mss-clamp.sh << EOF
@@ -250,22 +278,25 @@ AVG_SHARE_UP_MBIT=$(( UPLOAD_SHAPE_MBIT / MAX_USERS ))
 BDP_AVG_DOWN=$(( AVG_SHARE_DOWN_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 BDP_AVG_UP=$(( AVG_SHARE_UP_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 
+TOTAL_FLOWS=$(( MAX_USERS * FLOWS_PER_USER ))
+BUDGET_PER_FLOW=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / TOTAL_FLOWS / 2 ))
+BUDGET_PER_USER=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / MAX_USERS / 2 ))
+
 TCP_DEFAULT_RMEM=$(( BDP_AVG_DOWN * 2 ))
 TCP_DEFAULT_WMEM=$(( BDP_AVG_UP * 2 ))
 [ "$TCP_DEFAULT_RMEM" -lt 87380 ] && TCP_DEFAULT_RMEM=87380
 [ "$TCP_DEFAULT_WMEM" -lt 65536 ] && TCP_DEFAULT_WMEM=65536
-[ "$TCP_DEFAULT_RMEM" -gt "$RMEM_MAX" ] && TCP_DEFAULT_RMEM=$RMEM_MAX
-[ "$TCP_DEFAULT_WMEM" -gt "$WMEM_MAX" ] && TCP_DEFAULT_WMEM=$WMEM_MAX
+[ "$TCP_DEFAULT_RMEM" -gt "$RMEM_MAX" ]       && TCP_DEFAULT_RMEM=$RMEM_MAX
+[ "$TCP_DEFAULT_WMEM" -gt "$WMEM_MAX" ]       && TCP_DEFAULT_WMEM=$WMEM_MAX
+[ "$TCP_DEFAULT_RMEM" -gt "$BUDGET_PER_FLOW" ] && TCP_DEFAULT_RMEM=$BUDGET_PER_FLOW
+[ "$TCP_DEFAULT_WMEM" -gt "$BUDGET_PER_FLOW" ] && TCP_DEFAULT_WMEM=$BUDGET_PER_FLOW
 
-TOTAL_FLOWS=$(( MAX_USERS * FLOWS_PER_USER ))
-BUDGET_PER_FLOW=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / TOTAL_FLOWS / 2 ))
-
-UDP_CUSTOM_RBUF=$(( BDP_AVG_DOWN * 4 ))
-[ "$UDP_CUSTOM_RBUF" -gt "$BUDGET_PER_FLOW" ] && UDP_CUSTOM_RBUF=$BUDGET_PER_FLOW
+UDP_CUSTOM_RBUF=$(( BDP_FULLPIPE_DOWN * 2 ))
+[ "$UDP_CUSTOM_RBUF" -gt "$BUDGET_PER_USER" ] && UDP_CUSTOM_RBUF=$BUDGET_PER_USER
 [ "$UDP_CUSTOM_RBUF" -lt 262144 ]             && UDP_CUSTOM_RBUF=262144
 
-UDP_CUSTOM_SBUF=$(( BDP_AVG_UP * 4 ))
-[ "$UDP_CUSTOM_SBUF" -gt "$BUDGET_PER_FLOW" ] && UDP_CUSTOM_SBUF=$BUDGET_PER_FLOW
+UDP_CUSTOM_SBUF=$(( BDP_FULLPIPE_UP * 2 ))
+[ "$UDP_CUSTOM_SBUF" -gt "$BUDGET_PER_USER" ] && UDP_CUSTOM_SBUF=$BUDGET_PER_USER
 [ "$UDP_CUSTOM_SBUF" -lt 131072 ]             && UDP_CUSTOM_SBUF=131072
 
 cat > /etc/sysctl.d/99-tunnel-optimize.conf << EOF
@@ -339,7 +370,7 @@ chmod +x /usr/local/sbin/qos-root-init.sh
 cat > /etc/systemd/system/tunnel-shaper.service << 'EOF'
 [Unit]
 Description=CAKE best-effort QoS
-After=network-online.target
+After=network-online.target set-multiqueue.service
 Wants=network-online.target
 
 [Service]
@@ -384,7 +415,7 @@ chmod +x /usr/local/sbin/set-rps.sh
 cat > /etc/systemd/system/set-rps.service << 'EOF'
 [Unit]
 Description=Spread RX+TX packet steering across all CPU cores
-After=network-online.target tunnel-shaper.service
+After=network-online.target set-multiqueue.service tunnel-shaper.service
 Wants=network-online.target
 
 [Service]
@@ -404,9 +435,24 @@ jq --argjson rb "$UDP_CUSTOM_RBUF" --argjson sb "$UDP_CUSTOM_SBUF" \
   "$UDP_CUSTOM_CONFIG" > "${UDP_CUSTOM_CONFIG}.tmp" && mv "${UDP_CUSTOM_CONFIG}.tmp" "$UDP_CUSTOM_CONFIG"
 
 UDP_CUSTOM_SERVICE="/etc/systemd/system/udp-custom.service"
-if [ -f "$UDP_CUSTOM_SERVICE" ] && ! grep -q '99-tunnel-optimize' "$UDP_CUSTOM_SERVICE"; then
+if [ -f "$UDP_CUSTOM_SERVICE" ]; then
   cp "$UDP_CUSTOM_SERVICE" "${UDP_CUSTOM_SERVICE}.bak.$(date +%s)"
-  sed -i "/^ExecStart=/a ExecStartPost=/bin/bash -c 'sleep 3; sysctl -p /etc/sysctl.d/99-tunnel-optimize.conf >/dev/null 2>&1'" "$UDP_CUSTOM_SERVICE"
+  sed -i '/99-tunnel-optimize/d' "$UDP_CUSTOM_SERVICE" 2>/dev/null || true
+
+  mkdir -p "${UDP_CUSTOM_SERVICE}.d"
+  cat > "${UDP_CUSTOM_SERVICE}.d/99-tuning.conf" << EOF
+[Service]
+Environment=GOMAXPROCS=${NCPU}
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+OOMScoreAdjust=-500
+LimitNOFILE=1048576
+MemoryHigh=${UDP_CUSTOM_MEM_HIGH_MB}M
+MemoryMax=${UDP_CUSTOM_MEM_MAX_MB}M
+ExecStartPost=/bin/bash -c 'sleep 3; sysctl -p /etc/sysctl.d/99-tunnel-optimize.conf >/dev/null 2>&1; /usr/local/sbin/set-rps.sh >/dev/null 2>&1'
+EOF
+  systemctl daemon-reload
 fi
 
 if [ ! -x /usr/local/bin/badvpn-udpgw ]; then
@@ -433,6 +479,11 @@ ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:${UDPGW_PORT} --ma
 Restart=always
 RestartSec=3
 LimitNOFILE=51200
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+OOMScoreAdjust=-500
+MemoryMax=512M
 
 [Install]
 WantedBy=multi-user.target
@@ -449,7 +500,11 @@ rm -f /etc/systemd/system/safe-reboot.timer /etc/systemd/system/safe-reboot.serv
 
 systemctl disable --now log-clear.timer > /dev/null 2>&1 || true
 systemctl disable --now log-watchdog.timer > /dev/null 2>&1 || true
-rm -f /etc/systemd/system/log-clear.timer /etc/systemd/system/log-clear.service /etc/systemd/system/log-watchdog.service /etc/systemd/system/log-watchdog.timer /usr/local/sbin/log-watchdog.sh
+systemctl disable --now log-age-clear.timer > /dev/null 2>&1 || true
+rm -f /etc/systemd/system/log-clear.timer /etc/systemd/system/log-clear.service \
+      /etc/systemd/system/log-watchdog.service /etc/systemd/system/log-watchdog.timer \
+      /etc/systemd/system/log-age-clear.service /etc/systemd/system/log-age-clear.timer \
+      /usr/local/sbin/log-watchdog.sh /usr/local/sbin/log-clear.sh /usr/local/sbin/log-age-clear.sh
 
 systemctl disable --now logrotate.timer > /dev/null 2>&1 || true
 [ -f /etc/cron.daily/logrotate ] && chmod -x /etc/cron.daily/logrotate
@@ -482,52 +537,43 @@ d /var/log/private 0700 root root -
 EOF
 systemd-tmpfiles --create /etc/tmpfiles.d/varlog-perms.conf > /dev/null 2>&1 || true
 
-cat > /usr/local/sbin/log-clear.sh << EOF
+cat > /usr/local/sbin/daily-cache-log-clear.sh << 'RUNTIME'
 #!/bin/bash
-journalctl --vacuum-time=${JOURNAL_MAX_RETENTION} > /dev/null 2>&1 || true
-find /var/log -maxdepth 3 -type f -exec truncate -s 0 {} \; 2>/dev/null || true
-EOF
-chmod +x /usr/local/sbin/log-clear.sh
-
-cat > /usr/local/sbin/log-age-clear.sh << RUNTIME
-#!/bin/bash
-STAMP=/var/lib/log-clear.stamp
-MAX_AGE_SEC=\$(( ${LOG_MAX_AGE_MIN} * 60 ))
-NOW=\$(date +%s)
-LAST=0
-[ -f "\$STAMP" ] && LAST=\$(cat "\$STAMP" 2>/dev/null || echo 0)
-AGE=\$(( NOW - LAST ))
-if [ "\$AGE" -ge "\$MAX_AGE_SEC" ]; then
-  /usr/local/sbin/log-clear.sh
-  echo "\$NOW" > "\$STAMP"
-fi
+journalctl --rotate > /dev/null 2>&1 || true
+journalctl --vacuum-time=1s > /dev/null 2>&1 || true
+find /var/log -maxdepth 4 -type f -exec truncate -s 0 {} \; 2>/dev/null || true
+apt-get clean > /dev/null 2>&1 || true
+find /tmp -mindepth 1 -mtime +1 -delete 2>/dev/null || true
+sync
+echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
 RUNTIME
-chmod +x /usr/local/sbin/log-age-clear.sh
+chmod +x /usr/local/sbin/daily-cache-log-clear.sh
 
-cat > /etc/systemd/system/log-age-clear.service << 'EOF'
+cat > /etc/systemd/system/daily-cache-log-clear.service << 'EOF'
 [Unit]
-Description=Clear logs older than retention window
+Description=Daily full log + cache clear
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/log-age-clear.sh
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/sbin/daily-cache-log-clear.sh
 EOF
 
-cat > /etc/systemd/system/log-age-clear.timer << EOF
+cat > /etc/systemd/system/daily-cache-log-clear.timer << EOF
 [Unit]
-Description=Check log age every ${LOG_CHECK_MINUTES} minutes
+Description=Run daily-cache-log-clear every day at ${DAILY_CLEAR_TIME}
 
 [Timer]
-OnBootSec=${LOG_CHECK_MINUTES}min
-OnUnitActiveSec=${LOG_CHECK_MINUTES}min
-Persistent=false
+OnCalendar=*-*-* ${DAILY_CLEAR_TIME}
+Persistent=true
 
 [Install]
 WantedBy=timers.target
 EOF
 
 systemctl daemon-reload
-systemctl enable --now log-age-clear.timer > /dev/null 2>&1
+systemctl enable --now daily-cache-log-clear.timer > /dev/null 2>&1
 
 systemctl restart rsyslog 2>/dev/null || true
 systemctl restart cron 2>/dev/null || true
@@ -535,5 +581,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย (สูงสุด ${MAX_USERS} IP/connect | pipe รวม ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | โหมด best-effort ไม่บังคับหารเท่ากัน ใครใช้มากได้มาก | UDPGW พอร์ต ${UDPGW_PORT} | Log เก็บบนดิสก์ ไม่ใช้ RAM | auto-clear log เก่ากว่า ${LOG_MAX_AGE_MIN} นาที เช็คทุก ${LOG_CHECK_MINUTES} นาที | journald retention ${JOURNAL_MAX_RETENTION})${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | best-effort เต็มสปีดต่อคน ให้ cake แบ่งเอง | สูงสุด ${MAX_USERS} IP/connect | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} + priority สูงให้ udp-custom/udpgw | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
 echo "=================================================="
