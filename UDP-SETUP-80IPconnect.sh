@@ -19,8 +19,8 @@ TOTAL_RAM_MB=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/nul
 TOTAL_RAM_MB="${TOTAL_RAM_MB:-6144}"
 NCPU=$(nproc)
 
-TCP_SAFE_BUDGET_MB="${TCP_SAFE_BUDGET_MB:-$(( TOTAL_RAM_MB * 90 / 100 ))}"   
-UDP_CUSTOM_MEM_HIGH_MB="${UDP_CUSTOM_MEM_HIGH_MB:-$(( TOTAL_RAM_MB * 80 / 100 ))}"
+TCP_SAFE_BUDGET_MB="${TCP_SAFE_BUDGET_MB:-$(( TOTAL_RAM_MB * 90 / 100 ))}"
+UDP_CUSTOM_MEM_HIGH_MB="${UDP_CUSTOM_MEM_HIGH_MB:-$(( TOTAL_RAM_MB * 85 / 100 ))}"
 UDP_CUSTOM_MEM_MAX_MB="${UDP_CUSTOM_MEM_MAX_MB:-$(( TOTAL_RAM_MB * 90 / 100 ))}"
 
 JOURNAL_MAX_RETENTION="${JOURNAL_MAX_RETENTION:-1d}"
@@ -194,6 +194,7 @@ Q=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Combined:/ {print $2; exit}')
 if [ -n "$Q" ] && [ "$Q" -gt 1 ] 2>/dev/null; then
   ethtool -L "$IFACE" combined "$NCPU" 2>/dev/null || true
 fi
+ethtool -C "$IFACE" adaptive-rx off adaptive-tx off rx-usecs 8 tx-usecs 8 2>/dev/null || true
 RUNTIME
 chmod +x /usr/local/sbin/set-multiqueue.sh
 
@@ -255,7 +256,7 @@ systemctl daemon-reload
 systemctl enable --now set-mtu.service mss-clamp.service > /dev/null 2>&1
 
 RMEM_MIN=262144
-RMEM_CEILING=33554432
+RMEM_CEILING=50331648
 
 BDP_FULLPIPE_DOWN=$(( DOWNLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 BDP_FULLPIPE_UP=$(( UPLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
@@ -291,11 +292,11 @@ TCP_DEFAULT_WMEM=$(( BDP_AVG_UP * 2 ))
 [ "$TCP_DEFAULT_RMEM" -gt "$BUDGET_PER_FLOW" ] && TCP_DEFAULT_RMEM=$BUDGET_PER_FLOW
 [ "$TCP_DEFAULT_WMEM" -gt "$BUDGET_PER_FLOW" ] && TCP_DEFAULT_WMEM=$BUDGET_PER_FLOW
 
-UDP_CUSTOM_RBUF=$(( BDP_FULLPIPE_DOWN * 2 ))
+UDP_CUSTOM_RBUF=$(( BDP_FULLPIPE_DOWN * 4 ))
 [ "$UDP_CUSTOM_RBUF" -gt "$BUDGET_PER_USER" ] && UDP_CUSTOM_RBUF=$BUDGET_PER_USER
 [ "$UDP_CUSTOM_RBUF" -lt 262144 ]             && UDP_CUSTOM_RBUF=262144
 
-UDP_CUSTOM_SBUF=$(( BDP_FULLPIPE_UP * 2 ))
+UDP_CUSTOM_SBUF=$(( BDP_FULLPIPE_UP * 4 ))
 [ "$UDP_CUSTOM_SBUF" -gt "$BUDGET_PER_USER" ] && UDP_CUSTOM_SBUF=$BUDGET_PER_USER
 [ "$UDP_CUSTOM_SBUF" -lt 131072 ]             && UDP_CUSTOM_SBUF=131072
 
@@ -308,12 +309,14 @@ net.ipv4.tcp_notsent_lowat = 16384
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_frto = 2
 net.core.rmem_max = ${RMEM_MAX}
 net.core.wmem_max = ${WMEM_MAX}
 net.ipv4.tcp_rmem = 4096 ${TCP_DEFAULT_RMEM} ${RMEM_MAX}
 net.ipv4.tcp_wmem = 4096 ${TCP_DEFAULT_WMEM} ${WMEM_MAX}
 net.core.netdev_max_backlog = 32768
 net.core.netdev_budget = 600
+net.core.netdev_budget_usecs = 5000
 net.core.rps_sock_flow_entries = 32768
 net.core.somaxconn = 8192
 net.ipv4.tcp_max_syn_backlog = 8192
@@ -332,8 +335,8 @@ if [ -f /etc/sysctl.conf ]; then
   cp /etc/sysctl.conf "/etc/sysctl.conf.bak.$(date +%s)"
   for key in net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.ip_forward \
              net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
-             net.core.netdev_max_backlog net.core.netdev_budget net.core.somaxconn \
-             net.ipv4.tcp_max_syn_backlog net.core.rps_sock_flow_entries \
+             net.core.netdev_max_backlog net.core.netdev_budget net.core.netdev_budget_usecs net.core.somaxconn \
+             net.ipv4.tcp_max_syn_backlog net.core.rps_sock_flow_entries net.ipv4.tcp_frto \
              net.netfilter.nf_conntrack_max fs.file-max vm.swappiness; do
     esc_key=$(printf '%s' "$key" | sed 's/\./\\./g')
     sed -i -E "/^[[:space:]]*${esc_key}[[:space:]]*=/d" /etc/sysctl.conf
@@ -581,5 +584,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | best-effort เต็มสปีดต่อคน ให้ cake แบ่งเอง | สูงสุด ${MAX_USERS} IP/connect | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} + priority สูงให้ udp-custom/udpgw | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU (ใช้เต็มถึง 90%, ${UDP_CUSTOM_MEM_HIGH_MB}MB เป็นจุดหน่วงก่อนแตะเพดาน ${UDP_CUSTOM_MEM_MAX_MB}MB) | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | best-effort เต็มสปีดต่อคน ให้ cake แบ่งเอง | สูงสุด ${MAX_USERS} IP/connect, ${FLOWS_PER_USER} flow/user | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} + priority สูงให้ udp-custom/udpgw | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
 echo "=================================================="
