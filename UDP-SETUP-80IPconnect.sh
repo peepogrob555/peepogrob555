@@ -4,16 +4,17 @@ export DEBIAN_FRONTEND=noninteractive
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
-RTT_MS="${RTT_MS:-80}"
-TUNNEL_MTU="${TUNNEL_MTU:-1500}"
-CAKE_OVERHEAD="${CAKE_OVERHEAD:-18}"
+RTT_MS="${RTT_MS:-65}"
+TUNNEL_MTU="${TUNNEL_MTU:-1440}"
+CAKE_OVERHEAD="${CAKE_OVERHEAD:-32}"
 MAX_USERS="${MAX_USERS:-80}"
-FLOWS_PER_USER="${FLOWS_PER_USER:-30}"
+FLOWS_PER_USER="${FLOWS_PER_USER:-20}"
+PER_USER_TARGET_MBIT="${PER_USER_TARGET_MBIT:-20}"
 SWAP_GB="${SWAP_GB:-4}"
 UDPGW_PORT="${UDPGW_PORT:-7300}"
 
-DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-321}"
-UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-321}"
+DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-330}"
+UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-330}"
 
 TOTAL_RAM_MB=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 6144)
 TOTAL_RAM_MB="${TOTAL_RAM_MB:-6144}"
@@ -51,7 +52,13 @@ DNS_LABEL="Cloudflare+Google"
 DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
 DNS_V6_A="2606:4700:4700::1111"; DNS_V6_B="2001:4860:4860::8888"
 
-echo "IFACE=${IFACE} | RAM=${TOTAL_RAM_MB}MB | vCPU=${NCPU} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Pipe: Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit (best-effort ไม่หารตายตัว รองรับสูงสุด ${MAX_USERS} IP/connect) | RTT=${RTT_MS}ms"
+echo "IFACE=${IFACE} | RAM=${TOTAL_RAM_MB}MB | vCPU=${NCPU} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Pipe: Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit (best-effort ไม่หารตายตัว รองรับสูงสุด ${MAX_USERS} IP/connect) | RTT=${RTT_MS}ms | เป้าต่อ user/connect=${PER_USER_TARGET_MBIT}mbit ${FLOWS_PER_USER}flow/user"
+
+if grep -qm1 aes /proc/cpuinfo 2>/dev/null; then
+  echo -e "${GREEN}AES-NI: พร้อมใช้งาน (hardware มีให้) — ถอดรหัสจะเร็ว${NC}"
+else
+  echo -e "${YELLOW}AES-NI: ไม่เจอ flag นี้ใน /proc/cpuinfo — ถ้า udp-custom เข้ารหัสแบบ AES จะตกไปใช้ software ล้วนซึ่งกิน CPU หนักและอาจเป็นคอขวดตอนโหลดสูง (เรื่องนี้แก้จากใน VM ไม่ได้ ต้องเช็คกับผู้ให้บริการโฮสต์ว่า expose flag นี้ให้ guest หรือเปล่า)${NC}"
+fi
 
 UDP_CUSTOM_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CUSTOM_CONFIG" || true)
 if [ -z "$UDP_CUSTOM_PORT" ]; then
@@ -194,7 +201,6 @@ Q=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Combined:/ {print $2; exit}')
 if [ -n "$Q" ] && [ "$Q" -gt 1 ] 2>/dev/null && [ "$Q" != "$NCPU" ]; then
   ethtool -L "$IFACE" combined "$NCPU" 2>/dev/null || true
 fi
-ethtool -C "$IFACE" adaptive-rx off adaptive-tx off rx-usecs 8 tx-usecs 8 2>/dev/null || true
 RUNTIME
 chmod +x /usr/local/sbin/set-multiqueue.sh
 
@@ -274,20 +280,14 @@ NF_CONNTRACK_MAX=$(( MAX_USERS * 5000 ))
 [ "$NF_CONNTRACK_MAX" -lt 20000 ] && NF_CONNTRACK_MAX=20000
 NF_CONNTRACK_HASHSIZE=$(( NF_CONNTRACK_MAX / 4 ))
 
-AVG_SHARE_DOWN_MBIT=$(( DOWNLOAD_SHAPE_MBIT / MAX_USERS ))
-AVG_SHARE_UP_MBIT=$(( UPLOAD_SHAPE_MBIT / MAX_USERS ))
-[ "$AVG_SHARE_DOWN_MBIT" -lt 1 ] && AVG_SHARE_DOWN_MBIT=1
-[ "$AVG_SHARE_UP_MBIT" -lt 1 ]   && AVG_SHARE_UP_MBIT=1
-
-BDP_AVG_DOWN=$(( AVG_SHARE_DOWN_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
-BDP_AVG_UP=$(( AVG_SHARE_UP_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
+BDP_PER_USER=$(( PER_USER_TARGET_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 
 TOTAL_FLOWS=$(( MAX_USERS * FLOWS_PER_USER ))
 BUDGET_PER_FLOW=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / TOTAL_FLOWS / 2 ))
 BUDGET_PER_USER=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / MAX_USERS / 2 ))
 
-TCP_DEFAULT_RMEM=$(( BDP_AVG_DOWN * 2 ))
-TCP_DEFAULT_WMEM=$(( BDP_AVG_UP * 2 ))
+TCP_DEFAULT_RMEM=$(( BDP_PER_USER * 2 ))
+TCP_DEFAULT_WMEM=$(( BDP_PER_USER * 2 ))
 [ "$TCP_DEFAULT_RMEM" -lt 87380 ] && TCP_DEFAULT_RMEM=87380
 [ "$TCP_DEFAULT_WMEM" -lt 65536 ] && TCP_DEFAULT_WMEM=65536
 [ "$TCP_DEFAULT_RMEM" -gt "$RMEM_MAX" ]       && TCP_DEFAULT_RMEM=$RMEM_MAX
@@ -320,6 +320,8 @@ net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 3
 net.core.rmem_max = ${RMEM_MAX}
 net.core.wmem_max = ${WMEM_MAX}
+net.core.rmem_default = ${TCP_DEFAULT_RMEM}
+net.core.wmem_default = ${TCP_DEFAULT_WMEM}
 net.ipv4.tcp_rmem = 4096 ${TCP_DEFAULT_RMEM} ${RMEM_MAX}
 net.ipv4.tcp_wmem = 4096 ${TCP_DEFAULT_WMEM} ${WMEM_MAX}
 net.core.netdev_max_backlog = 32768
@@ -345,7 +347,8 @@ echo "$NF_CONNTRACK_HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/
 if [ -f /etc/sysctl.conf ]; then
   cp /etc/sysctl.conf "/etc/sysctl.conf.bak.$(date +%s)"
   for key in net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.ip_forward \
-             net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+             net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default \
+             net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
              net.core.netdev_max_backlog net.core.netdev_budget net.core.netdev_budget_usecs net.core.somaxconn \
              net.ipv4.tcp_max_syn_backlog net.core.rps_sock_flow_entries net.ipv4.tcp_frto \
              net.ipv4.tcp_ecn net.ipv4.tcp_syncookies net.ipv4.tcp_keepalive_time \
@@ -529,6 +532,8 @@ StartLimitBurst=20
 
 [Service]
 Environment=GOMAXPROCS=${NCPU}
+Environment=GOGC=400
+Environment=GOMEMLIMIT=${UDP_CUSTOM_MEM_HIGH_MB}MiB
 Nice=-5
 IOSchedulingClass=best-effort
 IOSchedulingPriority=2
@@ -673,5 +678,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU (ใช้เต็มถึง 90%, ${UDP_CUSTOM_MEM_HIGH_MB}MB เป็นจุดหน่วงก่อนแตะเพดาน ${UDP_CUSTOM_MEM_MAX_MB}MB) | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | best-effort เต็มสปีดต่อคน ให้ cake แบ่งเอง | สูงสุด ${MAX_USERS} IP/connect, ${FLOWS_PER_USER} flow/user | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} + CPUWeight/priority สูงให้ udp-custom/udpgw + auto-restart | ECN+syncookies+keepalive+dirty-ratio+min_free_kbytes(${VM_MIN_FREE_KB}KB)+THP=madvise | self-heal watchdog เช็ค MTU/CAKE/RPS ทุก 5 นาที | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU (ใช้เต็มถึง 90%, ${UDP_CUSTOM_MEM_HIGH_MB}MB เป็นจุดหน่วงก่อนแตะเพดาน ${UDP_CUSTOM_MEM_MAX_MB}MB) | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | บัพต่อ user/connect คิดที่ ${PER_USER_TARGET_MBIT}mbit ทั้งสองทาง (rmem/wmem default ${TCP_DEFAULT_RMEM}B) | สูงสุด ${MAX_USERS} IP/connect, ${FLOWS_PER_USER} flow/user | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} GOGC=400 GOMEMLIMIT=${UDP_CUSTOM_MEM_HIGH_MB}MiB + CPUWeight/priority สูงให้ udp-custom/udpgw + auto-restart | ECN+syncookies+keepalive+dirty-ratio+min_free_kbytes(${VM_MIN_FREE_KB}KB)+THP=madvise | self-heal watchdog เช็ค MTU/CAKE/RPS ทุก 5 นาที | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
 echo "=================================================="
