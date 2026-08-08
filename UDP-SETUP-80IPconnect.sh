@@ -9,7 +9,8 @@ TUNNEL_MTU="${TUNNEL_MTU:-1440}"
 CAKE_OVERHEAD="${CAKE_OVERHEAD:-32}"
 MAX_USERS="${MAX_USERS:-80}"
 FLOWS_PER_USER="${FLOWS_PER_USER:-20}"
-PER_USER_TARGET_MBIT="${PER_USER_TARGET_MBIT:-20}"
+PER_USER_DOWN_MBIT="${PER_USER_DOWN_MBIT:-2}"   # matched to client's locked RX speed (2Mbit)
+PER_USER_UP_MBIT="${PER_USER_UP_MBIT:-10}"      # matched to client's locked TX speed (10Mbit)
 SWAP_GB="${SWAP_GB:-4}"
 UDPGW_PORT="${UDPGW_PORT:-7300}"
 
@@ -52,12 +53,12 @@ DNS_LABEL="Cloudflare+Google"
 DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
 DNS_V6_A="2606:4700:4700::1111"; DNS_V6_B="2001:4860:4860::8888"
 
-echo "IFACE=${IFACE} | RAM=${TOTAL_RAM_MB}MB | vCPU=${NCPU} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Pipe: Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit (best-effort ไม่หารตายตัว รองรับสูงสุด ${MAX_USERS} IP/connect) | RTT=${RTT_MS}ms | เป้าต่อ user/connect=${PER_USER_TARGET_MBIT}mbit ${FLOWS_PER_USER}flow/user"
+echo "IFACE=${IFACE} | RAM=${TOTAL_RAM_MB}MB | vCPU=${NCPU} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Pipe: Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit (best-effort ไม่หารตายตัว รองรับสูงสุด ${MAX_USERS} IP/connect) | RTT=${RTT_MS}ms | เป้าต่อ user/connect down=${PER_USER_DOWN_MBIT}mbit up=${PER_USER_UP_MBIT}mbit ${FLOWS_PER_USER}flow/user"
 
 if grep -qm1 aes /proc/cpuinfo 2>/dev/null; then
-  echo -e "${GREEN}AES-NI: พร้อมใช้งาน (hardware มีให้) — ถอดรหัสจะเร็ว${NC}"
+  echo -e "${GREEN}AES-NI: พร้อมใช้งาน (hardware มีให้) — ถอดรหัส AES-256 จะเร็ว${NC}"
 else
-  echo -e "${YELLOW}AES-NI: ไม่เจอ flag นี้ใน /proc/cpuinfo — ถ้า udp-custom เข้ารหัสแบบ AES จะตกไปใช้ software ล้วนซึ่งกิน CPU หนักและอาจเป็นคอขวดตอนโหลดสูง (เรื่องนี้แก้จากใน VM ไม่ได้ ต้องเช็คกับผู้ให้บริการโฮสต์ว่า expose flag นี้ให้ guest หรือเปล่า)${NC}"
+  echo -e "${YELLOW}AES-NI: ไม่เจอ flag นี้ใน /proc/cpuinfo — ถ้า udp-custom เข้ารหัสแบบ AES-256 จะตกไปใช้ software ล้วนซึ่งกิน CPU หนักและอาจเป็นคอขวดตอนโหลดสูง (เรื่องนี้แก้จากใน VM ไม่ได้ ต้องเช็คกับผู้ให้บริการโฮสต์ว่า expose flag นี้ให้ guest หรือเปล่า)${NC}"
 fi
 
 UDP_CUSTOM_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CUSTOM_CONFIG" || true)
@@ -91,15 +92,24 @@ echo "tcp_bbr" > /etc/modules-load.d/tunnel.conf
 
 systemctl enable --now irqbalance > /dev/null 2>&1 || true
 
-if ! swapon --show | grep -q .; then
+ZRAM_ACTIVE=0
+swapon --show=NAME --noheadings 2>/dev/null | grep -q '^/dev/zram' && ZRAM_ACTIVE=1
+
+if ! swapon --show | grep -qv '^/dev/zram' 2>/dev/null; then
   AVAIL_KB=$(df --output=avail -k / | tail -1)
   NEED_KB=$(( SWAP_GB * 1024 * 1024 ))
   if [ "$AVAIL_KB" -gt "$((NEED_KB + 2097152))" ]; then
     fallocate -l "${SWAP_GB}G" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_GB*1024)) status=none
     chmod 600 /swapfile
     mkswap /swapfile > /dev/null
-    swapon /swapfile
-    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    if [ "$ZRAM_ACTIVE" -eq 1 ]; then
+      # zram stays untouched and preferred; swapfile is only a last-resort spillover
+      swapon -p 0 /swapfile
+      grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw,pri=0 0 0' >> /etc/fstab
+    else
+      swapon /swapfile
+      grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+    fi
   fi
 fi
 
@@ -280,14 +290,19 @@ NF_CONNTRACK_MAX=$(( MAX_USERS * 5000 ))
 [ "$NF_CONNTRACK_MAX" -lt 20000 ] && NF_CONNTRACK_MAX=20000
 NF_CONNTRACK_HASHSIZE=$(( NF_CONNTRACK_MAX / 4 ))
 
-BDP_PER_USER=$(( PER_USER_TARGET_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
+# Per-user BDP, asymmetric: down matches client RX 2Mbit cap, up matches client TX 10Mbit cap.
+# Client's advertised receive window is tiny, so we deliberately do NOT inflate buffers
+# beyond ~2x this per-user BDP — bigger buffers just sit unused behind the client's own
+# flow-control ceiling and add queuing delay instead of throughput.
+BDP_PER_USER_DOWN=$(( PER_USER_DOWN_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
+BDP_PER_USER_UP=$(( PER_USER_UP_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
 
 TOTAL_FLOWS=$(( MAX_USERS * FLOWS_PER_USER ))
 BUDGET_PER_FLOW=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / TOTAL_FLOWS / 2 ))
 BUDGET_PER_USER=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / MAX_USERS / 2 ))
 
-TCP_DEFAULT_RMEM=$(( BDP_PER_USER * 2 ))
-TCP_DEFAULT_WMEM=$(( BDP_PER_USER * 2 ))
+TCP_DEFAULT_RMEM=$(( BDP_PER_USER_DOWN * 2 ))
+TCP_DEFAULT_WMEM=$(( BDP_PER_USER_UP * 2 ))
 [ "$TCP_DEFAULT_RMEM" -lt 87380 ] && TCP_DEFAULT_RMEM=87380
 [ "$TCP_DEFAULT_WMEM" -lt 65536 ] && TCP_DEFAULT_WMEM=65536
 [ "$TCP_DEFAULT_RMEM" -gt "$RMEM_MAX" ]       && TCP_DEFAULT_RMEM=$RMEM_MAX
@@ -295,13 +310,26 @@ TCP_DEFAULT_WMEM=$(( BDP_PER_USER * 2 ))
 [ "$TCP_DEFAULT_RMEM" -gt "$BUDGET_PER_FLOW" ] && TCP_DEFAULT_RMEM=$BUDGET_PER_FLOW
 [ "$TCP_DEFAULT_WMEM" -gt "$BUDGET_PER_FLOW" ] && TCP_DEFAULT_WMEM=$BUDGET_PER_FLOW
 
-UDP_CUSTOM_RBUF=$(( BDP_FULLPIPE_DOWN * 4 ))
+# udp-custom buffers: RBUF is what the server receives on (client's upload direction = TX 10Mbit),
+# SBUF is what the server sends on (client's download direction = RX 2Mbit). Capped at 2x per-user
+# BDP rather than 4x, matching the client's tiny receive window so we don't build a standing queue
+# it can never drain — that queue is exactly what causes the "ping spikes / stalls" this profile
+# is meant to avoid.
+UDP_CUSTOM_RBUF=$(( BDP_PER_USER_UP * 2 ))
 [ "$UDP_CUSTOM_RBUF" -gt "$BUDGET_PER_USER" ] && UDP_CUSTOM_RBUF=$BUDGET_PER_USER
-[ "$UDP_CUSTOM_RBUF" -lt 262144 ]             && UDP_CUSTOM_RBUF=262144
+[ "$UDP_CUSTOM_RBUF" -lt 65536 ]              && UDP_CUSTOM_RBUF=65536
 
-UDP_CUSTOM_SBUF=$(( BDP_FULLPIPE_UP * 4 ))
+UDP_CUSTOM_SBUF=$(( BDP_PER_USER_DOWN * 2 ))
 [ "$UDP_CUSTOM_SBUF" -gt "$BUDGET_PER_USER" ] && UDP_CUSTOM_SBUF=$BUDGET_PER_USER
-[ "$UDP_CUSTOM_SBUF" -lt 131072 ]             && UDP_CUSTOM_SBUF=131072
+[ "$UDP_CUSTOM_SBUF" -lt 32768 ]              && UDP_CUSTOM_SBUF=32768
+
+# Client's remote payload buffer is locked at 32768B — round server-side buffers to
+# multiples of that chunk size so reads/writes stay aligned with what the client actually sends
+CHUNK=32768
+UDP_CUSTOM_RBUF=$(( (UDP_CUSTOM_RBUF / CHUNK) * CHUNK ))
+UDP_CUSTOM_SBUF=$(( (UDP_CUSTOM_SBUF / CHUNK) * CHUNK ))
+[ "$UDP_CUSTOM_RBUF" -lt "$CHUNK" ] && UDP_CUSTOM_RBUF=$CHUNK
+[ "$UDP_CUSTOM_SBUF" -lt "$CHUNK" ] && UDP_CUSTOM_SBUF=$CHUNK
 
 cat > /etc/sysctl.d/99-tunnel-optimize.conf << EOF
 net.ipv4.tcp_congestion_control = bbr
@@ -399,14 +427,14 @@ tc qdisc del dev ifb0 root 2>/dev/null || true
 
 tc qdisc add dev "$IFACE" root cake \
   bandwidth "${DOWNLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
-  besteffort flows ack-filter
+  besteffort triple-isolate
 
 tc qdisc add dev "$IFACE" handle ffff: ingress
 tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
 
 tc qdisc add dev ifb0 root cake \
   bandwidth "${UPLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
-  besteffort flows ack-filter
+  besteffort triple-isolate
 RUNTIME
 chmod +x /usr/local/sbin/qos-root-init.sh
 
@@ -499,13 +527,16 @@ Type=oneshot
 ExecStart=/usr/local/sbin/tunnel-selfheal.sh
 EOF
 
+# Client has auto-reconnect OFF and stop-on-failure OFF, so it will never recover a
+# stuck tunnel on its own — the server side has to notice and fix drift fast.
+# Tightened from 5min to 30s for that reason.
 cat > /etc/systemd/system/tunnel-selfheal.timer << 'EOF'
 [Unit]
-Description=Run tunnel-selfheal every 5 minutes
+Description=Run tunnel-selfheal every 30 seconds (client won't auto-reconnect, so server self-heal must be fast)
 
 [Timer]
-OnBootSec=5min
-OnUnitActiveSec=5min
+OnBootSec=30s
+OnUnitActiveSec=30s
 Persistent=true
 
 [Install]
@@ -678,5 +709,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU (ใช้เต็มถึง 90%, ${UDP_CUSTOM_MEM_HIGH_MB}MB เป็นจุดหน่วงก่อนแตะเพดาน ${UDP_CUSTOM_MEM_MAX_MB}MB) | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | บัพต่อ user/connect คิดที่ ${PER_USER_TARGET_MBIT}mbit ทั้งสองทาง (rmem/wmem default ${TCP_DEFAULT_RMEM}B) | สูงสุด ${MAX_USERS} IP/connect, ${FLOWS_PER_USER} flow/user | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} GOGC=400 GOMEMLIMIT=${UDP_CUSTOM_MEM_HIGH_MB}MiB + CPUWeight/priority สูงให้ udp-custom/udpgw + auto-restart | ECN+syncookies+keepalive+dirty-ratio+min_free_kbytes(${VM_MIN_FREE_KB}KB)+THP=madvise | self-heal watchdog เช็ค MTU/CAKE/RPS ทุก 5 นาที | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
+echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU (ใช้เต็มถึง 90%, ${UDP_CUSTOM_MEM_HIGH_MB}MB เป็นจุดหน่วงก่อนแตะเพดาน ${UDP_CUSTOM_MEM_MAX_MB}MB) | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | ต่อ user: down ${PER_USER_DOWN_MBIT}mbit / up ${PER_USER_UP_MBIT}mbit (rmem default ${TCP_DEFAULT_RMEM}B, wmem default ${TCP_DEFAULT_WMEM}B, udp rbuf ${UDP_CUSTOM_RBUF}B sbuf ${UDP_CUSTOM_SBUF}B) | สูงสุด ${MAX_USERS} IP/connect, ${FLOWS_PER_USER} flow/user | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} GOGC=400 GOMEMLIMIT=${UDP_CUSTOM_MEM_HIGH_MB}MiB + CPUWeight/priority สูงให้ udp-custom/udpgw + auto-restart | ECN+syncookies+keepalive+dirty-ratio+min_free_kbytes(${VM_MIN_FREE_KB}KB)+THP=madvise | self-heal watchdog เช็ค MTU/CAKE/RPS ทุก 30 วินาที (client ไม่ auto-reconnect) | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
 echo "=================================================="
