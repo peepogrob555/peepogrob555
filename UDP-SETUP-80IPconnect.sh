@@ -118,20 +118,18 @@ sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
 ufw default deny incoming > /dev/null
 ufw default allow outgoing > /dev/null
 ufw default deny routed > /dev/null
-for p in 21 23 25 111 135 137 138 139 445 512 513 514 1433 2049 3306 3389 5432 5900 6379 11211 27017; do
+# Per request: open everything except a short genuinely-dangerous list —
+# SMB/NetBIOS, RPC, RDP, Redis, Memcached, Telnet. Everything else (FTP, SMTP,
+# rexec/rlogin/rsh, MSSQL, NFS, MySQL, PostgreSQL, VNC, MongoDB, chargen, TFTP,
+# NTP, SNMP, SSDP, mDNS, and outbound DNS/DoT to any resolver) is now open.
+for p in 23 111 135 137 138 139 445 3389 6379 11211; do
   ufw deny "${p}/tcp" > /dev/null
 done
-for p in 19 69 111 123 137 138 161 162 1900 3389 5353 11211; do
+for p in 111 137 138 3389 11211; do
   ufw deny "${p}/udp" > /dev/null
 done
 ufw allow 1:65535/tcp > /dev/null
 ufw allow 1:65535/udp > /dev/null
-ufw allow out to "$DNS_V4_A" port 53 > /dev/null
-ufw allow out to "$DNS_V4_B" port 53 > /dev/null
-ufw allow out to "$DNS_V6_A" port 53 > /dev/null
-ufw allow out to "$DNS_V6_B" port 53 > /dev/null
-ufw deny out to any port 53 > /dev/null
-ufw deny out to any port 853 > /dev/null
 ufw --force enable > /dev/null
 
 rm -f /etc/netplan/90-dns-override.yaml
