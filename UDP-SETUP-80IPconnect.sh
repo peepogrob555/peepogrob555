@@ -13,6 +13,7 @@ CAKE_OVERHEAD=40
 SWAP_GB=4
 UDPGW_PORT=7300
 
+# ปรับจำกัดท่อหลักเป็น 300 Mbps ให้เหมาะกับสเปคเครื่อง
 DOWNLOAD_SHAPE_MBIT=300
 UPLOAD_SHAPE_MBIT=300
 PER_USER_DOWN_MBIT=20
@@ -108,7 +109,7 @@ DNS_LABEL="Cloudflare+Google"
 DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
 DNS_V6_A="2606:4700:4700::1111"; DNS_V6_B="2001:4860:4860::8888"
 
-echo "SPEC: RAM=${TOTAL_RAM_MB}MB vCPU=${NCPU} | IFACE=${IFACE} | MTU=${TUNNEL_MTU} | Per-User Down/Up=${PER_USER_DOWN_MBIT}/${PER_USER_UP_MBIT} Mbps | Hash Divisor=${HASH_DIVISOR} | Low Latency Buffer Tuned"
+echo "SPEC: RAM=${TOTAL_RAM_MB}MB vCPU=${NCPU} | IFACE=${IFACE} | MTU=${TUNNEL_MTU} | Pipeline Down/Up=${DOWNLOAD_SHAPE_MBIT}/${UPLOAD_SHAPE_MBIT} Mbps | Per-User=${PER_USER_DOWN_MBIT}/${PER_USER_UP_MBIT} Mbps | Low Latency Buffer Tuned"
 
 if grep -qm1 aes /proc/cpuinfo 2>/dev/null; then
   echo -e "${GREEN}AES-NI: พร้อมใช้งาน${NC}"
@@ -147,10 +148,14 @@ HEALTHCHECK_FAIL_STREAK_LIMIT=${HEALTHCHECK_FAIL_STREAK_LIMIT}
 EOF
 
 apt-get update -qq
-apt-get install -y ufw iptables conntrack ethtool iproute2 jq irqbalance rsyslog cmake build-essential git netcat-openbsd > /dev/null 2>&1
+apt-get install -y ufw iptables conntrack ethtool iproute2 jq irqbalance rsyslog cmake build-essential git netcat-openbsd linux-modules-extra-$(uname -r) > /dev/null 2>&1 || true
 
 modprobe sch_htb 2>/dev/null || true
 modprobe sch_fq_codel 2>/dev/null || true
+modprobe cls_flow 2>/dev/null || true
+modprobe cls_u32 2>/dev/null || true
+modprobe act_mirred 2>/dev/null || true
+modprobe ifb numifbs=1 2>/dev/null || true
 modprobe tcp_bbr 2>/dev/null || true
 echo "tcp_bbr" > /etc/modules-load.d/tunnel.conf
 
@@ -431,48 +436,74 @@ EOF
 systemctl daemon-reload
 systemctl enable --now set-thp-madvise.service > /dev/null 2>&1
 
+# ===== สคริปต์ qos-root-init.sh ที่แก้ไขสมบูรณ์แล้ว =====
 cat > /usr/local/sbin/qos-root-init.sh << 'RUNTIME'
 #!/bin/bash
-source /etc/tunnel-qos.conf
+source /etc/tunnel-qos.conf 2>/dev/null || true
 
+IFACE="${IFACE:-eth0}"
+DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-300}"
+UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-300}"
+PER_USER_DOWN_MBIT="${PER_USER_DOWN_MBIT:-20}"
+PER_USER_UP_MBIT="${PER_USER_UP_MBIT:-20}"
+PER_USER_GUAR_MBIT="${PER_USER_GUAR_MBIT:-2}"
+HASH_DIVISOR="${HASH_DIVISOR:-1024}"
+TXQUEUELEN="${TXQUEUELEN:-10000}"
+
+# โหลด modules ที่จำเป็น
 modprobe sch_htb 2>/dev/null || true
 modprobe sch_fq_codel 2>/dev/null || true
+modprobe cls_flow 2>/dev/null || true
+modprobe cls_u32 2>/dev/null || true
+modprobe act_mirred 2>/dev/null || true
 modprobe ifb numifbs=1 2>/dev/null || true
-ip link set dev ifb0 up 2>/dev/null || true
 
-ip link set dev "$IFACE" txqueuelen "${TXQUEUELEN:-10000}" 2>/dev/null || true
-ip link set dev ifb0 txqueuelen "${TXQUEUELEN:-10000}" 2>/dev/null || true
+# ตั้งค่า txqueuelen
+ip link set dev "$IFACE" txqueuelen "$TXQUEUELEN" 2>/dev/null || true
 
+# ล้าง Qdisc เก่า
 tc qdisc del dev "$IFACE" root 2>/dev/null || true
 tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
 tc qdisc del dev ifb0 root 2>/dev/null || true
 
-DIV=${HASH_DIVISOR:-1024}
-GUAR=${PER_USER_GUAR_MBIT:-2}
+DIV=$HASH_DIVISOR
+GUAR=$PER_USER_GUAR_MBIT
 BASE=16
+BASE_HEX=$(printf '%x' $BASE)
 
-tc qdisc add dev "$IFACE" root handle 1: htb default 1
-tc class add dev "$IFACE" parent 1: classid 1:1 htb rate "${DOWNLOAD_SHAPE_MBIT}"mbit ceil "${DOWNLOAD_SHAPE_MBIT}"mbit
+# 1. Download Traffic Shaping (eth0)
+tc qdisc add dev "$IFACE" root handle 1: htb default 1 2>/dev/null || true
+tc class add dev "$IFACE" parent 1: classid 1:1 htb rate "${DOWNLOAD_SHAPE_MBIT}mbit" ceil "${DOWNLOAD_SHAPE_MBIT}mbit" 2>/dev/null || true
+
 for i in $(seq 0 $((DIV-1))); do
   MINOR=$(printf '%x' $((BASE+i)))
   HANDLE=$(printf '%x' $((0x2000+i)))
-  tc class add dev "$IFACE" parent 1:1 classid 1:"$MINOR" htb rate "${GUAR}"mbit ceil "${PER_USER_DOWN_MBIT}"mbit quantum 1514 prio 1
-  tc qdisc add dev "$IFACE" parent 1:"$MINOR" handle "$HANDLE": fq_codel target 3ms interval 40ms ecn
+  tc class add dev "$IFACE" parent 1:1 classid 1:"$MINOR" htb rate "${GUAR}mbit" ceil "${PER_USER_DOWN_MBIT}mbit" quantum 1514 prio 1 2>/dev/null || true
+  tc qdisc add dev "$IFACE" parent 1:"$MINOR" handle "$HANDLE": fq_codel target 3ms interval 40ms ecn 2>/dev/null || true
 done
-tc filter add dev "$IFACE" parent 1:0 protocol ip prio 1 flow hash keys dst divisor "$DIV" baseclass 1:$(printf '%x' $BASE)
+tc filter add dev "$IFACE" parent 1: protocol ip prio 1 handle 1 flow hash keys dst divisor "$DIV" baseclass 1:"$BASE_HEX" 2>/dev/null || true
 
-tc qdisc add dev "$IFACE" handle ffff: ingress
-tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
+# 2. Upload Traffic Shaping (ifb0)
+if ip link show ifb0 >/dev/null 2>&1; then
+  ip link set dev ifb0 up 2>/dev/null || true
+  ip link set dev ifb0 txqueuelen "$TXQUEUELEN" 2>/dev/null || true
 
-tc qdisc add dev ifb0 root handle 1: htb default 1
-tc class add dev ifb0 parent 1: classid 1:1 htb rate "${UPLOAD_SHAPE_MBIT}"mbit ceil "${UPLOAD_SHAPE_MBIT}"mbit
-for i in $(seq 0 $((DIV-1))); do
-  MINOR=$(printf '%x' $((BASE+i)))
-  HANDLE=$(printf '%x' $((0x3000+i)))
-  tc class add dev ifb0 parent 1:1 classid 1:"$MINOR" htb rate "${GUAR}"mbit ceil "${PER_USER_UP_MBIT}"mbit quantum 1514 prio 1
-  tc qdisc add dev ifb0 parent 1:"$MINOR" handle "$HANDLE": fq_codel target 3ms interval 40ms ecn
-done
-tc filter add dev ifb0 parent 1:0 protocol ip prio 1 flow hash keys src divisor "$DIV" baseclass 1:$(printf '%x' $BASE)
+  tc qdisc add dev "$IFACE" handle ffff: ingress 2>/dev/null || true
+  tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
+
+  tc qdisc add dev ifb0 root handle 1: htb default 1 2>/dev/null || true
+  tc class add dev ifb0 parent 1: classid 1:1 htb rate "${UPLOAD_SHAPE_MBIT}mbit" ceil "${UPLOAD_SHAPE_MBIT}mbit" 2>/dev/null || true
+
+  for i in $(seq 0 $((DIV-1))); do
+    MINOR=$(printf '%x' $((BASE+i)))
+    HANDLE=$(printf '%x' $((0x3000+i)))
+    tc class add dev ifb0 parent 1:1 classid 1:"$MINOR" htb rate "${GUAR}mbit" ceil "${PER_USER_UP_MBIT}mbit" quantum 1514 prio 1 2>/dev/null || true
+    tc qdisc add dev ifb0 parent 1:"$MINOR" handle "$HANDLE": fq_codel target 3ms interval 40ms ecn 2>/dev/null || true
+  done
+  tc filter add dev ifb0 parent 1: protocol ip prio 1 handle 1 flow hash keys src divisor "$DIV" baseclass 1:"$BASE_HEX" 2>/dev/null || true
+fi
+
+exit 0
 RUNTIME
 chmod +x /usr/local/sbin/qos-root-init.sh
 
@@ -657,13 +688,15 @@ fi
 
 if [ ! -x /usr/local/bin/badvpn-udpgw ]; then
   rm -rf /usr/local/src/badvpn
-  git clone --depth 1 https://github.com/ambrop72/badvpn.git /usr/local/src/badvpn > /dev/null 2>&1
-  mkdir -p /usr/local/src/badvpn/badvpn-build
-  cd /usr/local/src/badvpn/badvpn-build
-  cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 > /dev/null 2>&1
-  make -j4 > /dev/null 2>&1
-  cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
-  cd /
+  git clone --depth 1 https://github.com/ambrop72/badvpn.git /usr/local/src/badvpn > /dev/null 2>&1 || true
+  if [ -d /usr/local/src/badvpn ]; then
+    mkdir -p /usr/local/src/badvpn/badvpn-build
+    cd /usr/local/src/badvpn/badvpn-build
+    cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 > /dev/null 2>&1 || true
+    make -j4 > /dev/null 2>&1 || true
+    [ -f udpgw/badvpn-udpgw ] && cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw || true
+    cd /
+  fi
 fi
 
 UDPGW_CPU_DIRECTIVES=""
@@ -790,5 +823,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ปรับแต่งระบบสำเร็จ | Per-User Limiter: ${PER_USER_DOWN_MBIT}Mbit↓ / ${PER_USER_UP_MBIT}Mbit↑ | Low-Latency BDP Buffer & FQ-CoDel Active${NC}"
+echo -e "${GREEN}ปรับแต่งระบบสำเร็จ | Tunnel Pipeline: ${DOWNLOAD_SHAPE_MBIT}Mbit↓ / ${UPLOAD_SHAPE_MBIT}Mbit↑ | Per-User: ${PER_USER_DOWN_MBIT}Mbit↓ / ${PER_USER_UP_MBIT}Mbit↑${NC}"
 echo "=================================================="
