@@ -4,66 +4,117 @@ export DEBIAN_FRONTEND=noninteractive
 
 GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
 
-RTT_MS="${RTT_MS:-65}"
-TUNNEL_MTU="${TUNNEL_MTU:-1440}"
-CAKE_OVERHEAD="${CAKE_OVERHEAD:-32}"
-MAX_USERS="${MAX_USERS:-80}"
-FLOWS_PER_USER="${FLOWS_PER_USER:-20}"
-PER_USER_DOWN_MBIT="${PER_USER_DOWN_MBIT:-2}"   # matched to client's locked RX speed (2Mbit)
-PER_USER_UP_MBIT="${PER_USER_UP_MBIT:-10}"      # matched to client's locked TX speed (10Mbit)
-SWAP_GB="${SWAP_GB:-4}"
-UDPGW_PORT="${UDPGW_PORT:-7300}"
+TOTAL_RAM_MB=6144
+NCPU=4
 
-DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-330}"
-UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-330}"
+RTT_MS=65
+TUNNEL_MTU=1500
+CAKE_OVERHEAD=40
+SWAP_GB=4
+UDPGW_PORT=7300
 
-TOTAL_RAM_MB=$(awk '/^MemTotal:/{printf "%d", $2/1024}' /proc/meminfo 2>/dev/null || echo 6144)
-TOTAL_RAM_MB="${TOTAL_RAM_MB:-6144}"
-NCPU=$(nproc)
+DOWNLOAD_SHAPE_MBIT=300
+UPLOAD_SHAPE_MBIT=300
 
-TCP_SAFE_BUDGET_MB="${TCP_SAFE_BUDGET_MB:-$(( TOTAL_RAM_MB * 90 / 100 ))}"
-UDP_CUSTOM_MEM_HIGH_MB="${UDP_CUSTOM_MEM_HIGH_MB:-$(( TOTAL_RAM_MB * 85 / 100 ))}"
-UDP_CUSTOM_MEM_MAX_MB="${UDP_CUSTOM_MEM_MAX_MB:-$(( TOTAL_RAM_MB * 90 / 100 ))}"
+TCP_MSS_V4=1380
+TCP_MSS_V6=1380
 
-JOURNAL_MAX_RETENTION="${JOURNAL_MAX_RETENTION:-1d}"
-JOURNAL_DISK_MAX_MB="${JOURNAL_DISK_MAX_MB:-512}"
-DAILY_CLEAR_TIME="${DAILY_CLEAR_TIME:-00:00:00}"
+TCP_RMEM_DEFAULT=262144
+TCP_RMEM_MAX=8388608
+TCP_WMEM_DEFAULT=262144
+TCP_WMEM_MAX=8388608
+
+UDP_CUSTOM_RBUF=4194304
+UDP_CUSTOM_SBUF=4194304
+
+NF_CONNTRACK_MAX=500000
+NF_CONNTRACK_HASHSIZE=125000
+NF_CONNTRACK_UDP_TIMEOUT=30
+NF_CONNTRACK_UDP_TIMEOUT_STREAM=300
+NF_CONNTRACK_TCP_TIMEOUT_ESTABLISHED=7200
+UDPGW_MAX_CLIENTS=2048
+UDPGW_MAX_CONN_PER_CLIENT=128
+
+NETDEV_MAX_BACKLOG=50000
+NETDEV_BUDGET=800
+NETDEV_BUDGET_USECS=5000
+RPS_SOCK_FLOW_ENTRIES=65536
+SOMAXCONN=16384
+TCP_MAX_SYN_BACKLOG=16384
+TCP_RETRIES2=15
+TCP_SYN_RETRIES=6
+
+UDP_CUSTOM_MEM_HIGH_MB=4915
+UDP_CUSTOM_MEM_MAX_MB=5530
+VM_MIN_FREE_KB=125829
+
+JOURNAL_MAX_RETENTION=1d
+JOURNAL_DISK_MAX_MB=512
+DAILY_CLEAR_TIME=00:00:00
+CLEAR_TIMEZONE=Asia/Bangkok
 
 UDP_CUSTOM_CONFIG="/root/udp/config.json"
 
+RESERVE_LAST_CPU_FOR_UDPGW=1
+UDPGW_RT_PRIORITY=15
+TXQUEUELEN=20000
+SELFHEAL_INTERVAL_SEC=10
+HEALTHCHECK_FAIL_STREAK_LIMIT=3
+
+UDP_KERNEL_MEM_MIN_MB=256
+UDP_KERNEL_MEM_PRESSURE_MB=512
+UDP_KERNEL_MEM_MAX_MB=4096
+UDP_RMEM_MIN=131072
+UDP_WMEM_MIN=131072
+
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}ต้องรันด้วย root: sudo bash $0${NC}"
+  echo -e "${RED}เธ•เนเธญเธเธฃเธฑเธเธ”เนเธงเธข root: sudo bash $0${NC}"
   exit 1
 fi
 
 if [ ! -f "$UDP_CUSTOM_CONFIG" ]; then
-  echo -e "${RED}ไม่พบ ${UDP_CUSTOM_CONFIG} กรุณาติดตั้ง udp-custom ก่อน${NC}"
+  echo -e "${RED}เนเธกเนเธเธ ${UDP_CUSTOM_CONFIG} เธเธฃเธธเธ“เธฒเธ•เธดเธ”เธ•เธฑเนเธ udp-custom เธเนเธญเธ${NC}"
   exit 1
 fi
 
-OS_VER=$(grep -oP '(?<=^VERSION_ID=")[^"]+' /etc/os-release 2>/dev/null || true)
-
 IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
 if [ -z "$IFACE" ]; then
-  echo -e "${RED}หา default interface ไม่เจอ ยกเลิก${NC}"
+  echo -e "${RED}เธซเธฒ default interface เนเธกเนเน€เธเธญ เธขเธเน€เธฅเธดเธ${NC}"
   exit 1
+fi
+
+APP_CPU=-1
+if [ "$RESERVE_LAST_CPU_FOR_UDPGW" -eq 1 ] && [ "$NCPU" -ge 3 ]; then
+  APP_CPU=$((NCPU-1))
+fi
+if [ "$APP_CPU" -ge 0 ]; then
+  UDPCUSTOM_GOMAXPROCS=$((NCPU-1))
+  UDPCUSTOM_CPU_RANGE="0-$((NCPU-2))"
+else
+  UDPCUSTOM_GOMAXPROCS=$NCPU
+  UDPCUSTOM_CPU_RANGE=""
+fi
+
+NAT_MODE=0
+if command -v iptables >/dev/null 2>&1; then
+  iptables -t nat -S 2>/dev/null | grep -qi masquerade && NAT_MODE=1
 fi
 
 DNS_LABEL="Cloudflare+Google"
 DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
 DNS_V6_A="2606:4700:4700::1111"; DNS_V6_B="2001:4860:4860::8888"
 
-echo "IFACE=${IFACE} | RAM=${TOTAL_RAM_MB}MB | vCPU=${NCPU} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} | Pipe: Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit (best-effort ไม่หารตายตัว รองรับสูงสุด ${MAX_USERS} IP/connect) | RTT=${RTT_MS}ms | เป้าต่อ user/connect down=${PER_USER_DOWN_MBIT}mbit up=${PER_USER_UP_MBIT}mbit ${FLOWS_PER_USER}flow/user"
+echo "SPEC เธเธเธ—เธตเน: RAM=${TOTAL_RAM_MB}MB vCPU=${NCPU} (AMD, Ubuntu 24.04) | IFACE=${IFACE} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} MSS v4/v6=${TCP_MSS_V4}/${TCP_MSS_V6} overhead=${CAKE_OVERHEAD} | Pipe เธฃเธงเธก Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit เนเธกเนเธเธณเธเธฑเธ”เธเธณเธเธงเธเธเธ เนเธกเนเธกเธต per-user cap (CAKE fair-queue เนเธเธฃเนเน€เธญเธ) | RTT=${RTT_MS}ms | เธเธฑเธเน€เธเธญเธฃเน/เธฅเธดเธกเธดเธ•เธเธณเธเธงเธ“เธชเธณเธซเธฃเธฑเธเนเธซเธฅเธ” 100 เธเธเธเธฃเนเธญเธกเธเธฑเธเน€เธ•เนเธกเธชเน€เธเธ | CPU เนเธขเธเธเธฒเธ: core เธชเธณเธซเธฃเธฑเธเน€เธเธฃเธทเธญเธเนเธฒเธข (RPS) เธเธฑเธ core เน€เธเธเธฒเธฐ UDPGW=${APP_CPU} (jitter เธ•เนเธณ) | NAT_MODE=${NAT_MODE}"
 
 if grep -qm1 aes /proc/cpuinfo 2>/dev/null; then
-  echo -e "${GREEN}AES-NI: พร้อมใช้งาน (hardware มีให้) — ถอดรหัส AES-256 จะเร็ว${NC}"
+  echo -e "${GREEN}AES-NI: เธเธฃเนเธญเธกเนเธเนเธเธฒเธ${NC}"
 else
-  echo -e "${YELLOW}AES-NI: ไม่เจอ flag นี้ใน /proc/cpuinfo — ถ้า udp-custom เข้ารหัสแบบ AES-256 จะตกไปใช้ software ล้วนซึ่งกิน CPU หนักและอาจเป็นคอขวดตอนโหลดสูง (เรื่องนี้แก้จากใน VM ไม่ได้ ต้องเช็คกับผู้ให้บริการโฮสต์ว่า expose flag นี้ให้ guest หรือเปล่า)${NC}"
+  echo -e "${YELLOW}AES-NI: เนเธกเนเน€เธเธญ flag เธเธตเนเนเธ /proc/cpuinfo โ€” เน€เธเนเธเธเธฑเธเธเธนเนเนเธซเนเธเธฃเธดเธเธฒเธฃเนเธฎเธชเธ•เนเธงเนเธฒ expose flag เธเธตเนเนเธซเน guest เธซเธฃเธทเธญเน€เธเธฅเนเธฒ${NC}"
 fi
 
 UDP_CUSTOM_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CUSTOM_CONFIG" || true)
 if [ -z "$UDP_CUSTOM_PORT" ]; then
-  read -rp "ใส่พอร์ต UDP ที่ udp-custom ใช้จริง: " UDP_CUSTOM_PORT
+  read -rp "เนเธชเนเธเธญเธฃเนเธ• UDP เธ—เธตเน udp-custom เนเธเนเธเธฃเธดเธ: " UDP_CUSTOM_PORT
 fi
 
 cat > /etc/tunnel-qos.conf << EOF
@@ -73,24 +124,40 @@ UPLOAD_SHAPE_MBIT=${UPLOAD_SHAPE_MBIT}
 RTT_MS=${RTT_MS}
 TUNNEL_MTU=${TUNNEL_MTU}
 CAKE_OVERHEAD=${CAKE_OVERHEAD}
-MAX_USERS=${MAX_USERS}
 DNS_LABEL=${DNS_LABEL}
 DNS_V4_A=${DNS_V4_A}
 DNS_V4_B=${DNS_V4_B}
 DNS_V6_A=${DNS_V6_A}
 DNS_V6_B=${DNS_V6_B}
 UDP_CUSTOM_PORT=${UDP_CUSTOM_PORT}
-FAIRSHARE_MODE=0
+UDPGW_PORT=${UDPGW_PORT}
+NCPU=${NCPU}
+APP_CPU=${APP_CPU}
+TXQUEUELEN=${TXQUEUELEN}
+NAT_MODE=${NAT_MODE}
+HEALTHCHECK_FAIL_STREAK_LIMIT=${HEALTHCHECK_FAIL_STREAK_LIMIT}
 EOF
 
 apt-get update -qq
-apt-get install -y ufw iptables conntrack ethtool iproute2 jq irqbalance rsyslog cmake build-essential git > /dev/null 2>&1
+apt-get install -y ufw iptables conntrack ethtool iproute2 jq irqbalance rsyslog cmake build-essential git netcat-openbsd > /dev/null 2>&1
 
 modprobe sch_cake 2>/dev/null || true
+modprobe sch_fq_codel 2>/dev/null || true
 modprobe tcp_bbr 2>/dev/null || true
 echo "tcp_bbr" > /etc/modules-load.d/tunnel.conf
 
+CAKE_AVAILABLE=1
+lsmod | grep -q sch_cake || CAKE_AVAILABLE=0
+
+if [ "$APP_CPU" -ge 0 ]; then
+  mkdir -p /etc/default
+  if [ -f /etc/default/irqbalance ]; then
+    sed -i '/^IRQBALANCE_BANNED_CPULIST=/d' /etc/default/irqbalance
+  fi
+  echo "IRQBALANCE_BANNED_CPULIST=${APP_CPU}" >> /etc/default/irqbalance
+fi
 systemctl enable --now irqbalance > /dev/null 2>&1 || true
+systemctl restart irqbalance > /dev/null 2>&1 || true
 
 ZRAM_ACTIVE=0
 swapon --show=NAME --noheadings 2>/dev/null | grep -q '^/dev/zram' && ZRAM_ACTIVE=1
@@ -103,7 +170,6 @@ if ! swapon --show | grep -qv '^/dev/zram' 2>/dev/null; then
     chmod 600 /swapfile
     mkswap /swapfile > /dev/null
     if [ "$ZRAM_ACTIVE" -eq 1 ]; then
-      # zram stays untouched and preferred; swapfile is only a last-resort spillover
       swapon -p 0 /swapfile
       grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw,pri=0 0 0' >> /etc/fstab
     else
@@ -118,10 +184,6 @@ sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
 ufw default deny incoming > /dev/null
 ufw default allow outgoing > /dev/null
 ufw default deny routed > /dev/null
-# Per request: open everything except a short genuinely-dangerous list —
-# SMB/NetBIOS, RPC, RDP, Redis, Memcached, Telnet. Everything else (FTP, SMTP,
-# rexec/rlogin/rsh, MSSQL, NFS, MySQL, PostgreSQL, VNC, MongoDB, chargen, TFTP,
-# NTP, SNMP, SSDP, mDNS, and outbound DNS/DoT to any resolver) is now open.
 for p in 23 111 135 137 138 139 445 3389 6379 11211; do
   ufw deny "${p}/tcp" > /dev/null
 done
@@ -204,17 +266,17 @@ EOF
 cat > /usr/local/sbin/set-multiqueue.sh << 'RUNTIME'
 #!/bin/bash
 source /etc/tunnel-qos.conf 2>/dev/null || true
-NCPU=$(nproc)
 Q=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Combined:/ {print $2; exit}')
 if [ -n "$Q" ] && [ "$Q" -gt 1 ] 2>/dev/null && [ "$Q" != "$NCPU" ]; then
   ethtool -L "$IFACE" combined "$NCPU" 2>/dev/null || true
 fi
+ethtool -K "$IFACE" gro on gso on tso on 2>/dev/null || true
 RUNTIME
 chmod +x /usr/local/sbin/set-multiqueue.sh
 
 cat > /etc/systemd/system/set-multiqueue.service << 'EOF'
 [Unit]
-Description=Restore NIC multi-queue (combined) count across all vCPU after reboot
+Description=Restore NIC multi-queue combined count across all vCPU after reboot
 After=network-online.target
 Wants=network-online.target
 
@@ -229,10 +291,10 @@ EOF
 systemctl daemon-reload
 systemctl enable --now set-multiqueue.service > /dev/null 2>&1
 
-MSS_V4=$((TUNNEL_MTU - 40))
 cat > /usr/local/sbin/mss-clamp.sh << EOF
 #!/bin/bash
-MSS_V4=${MSS_V4}
+MSS_V4=${TCP_MSS_V4}
+MSS_V6=${TCP_MSS_V6}
 apply() {
   local table="\$1" chain="\$2"; shift 2
   iptables -t "\$table" -C "\$chain" "\$@" 2>/dev/null || iptables -t "\$table" -A "\$chain" "\$@"
@@ -240,7 +302,6 @@ apply() {
 apply mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V4"
 apply mangle OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V4"
 if command -v ip6tables >/dev/null 2>&1; then
-  MSS_V6=\$((MSS_V4 - 20))
   apply6() {
     local chain="\$1"; shift
     ip6tables -t mangle -C "\$chain" "\$@" 2>/dev/null || ip6tables -t mangle -A "\$chain" "\$@"
@@ -254,7 +315,7 @@ chmod +x /usr/local/sbin/mss-clamp.sh
 
 cat > /etc/systemd/system/mss-clamp.service << EOF
 [Unit]
-Description=Clamp TCP MSS to match tunnel MTU
+Description=Clamp TCP MSS to fixed value (${TCP_MSS_V4}/${TCP_MSS_V6})
 After=network-online.target
 Wants=network-online.target
 
@@ -269,65 +330,9 @@ EOF
 systemctl daemon-reload
 systemctl enable --now set-mtu.service mss-clamp.service > /dev/null 2>&1
 
-RMEM_MIN=262144
-RMEM_CEILING=50331648
-
-BDP_FULLPIPE_DOWN=$(( DOWNLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
-BDP_FULLPIPE_UP=$(( UPLOAD_SHAPE_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
-RMEM_MAX=$(( BDP_FULLPIPE_DOWN * 4 ))
-WMEM_MAX=$(( BDP_FULLPIPE_UP * 4 ))
-[ "$RMEM_MAX" -lt "$RMEM_MIN" ]     && RMEM_MAX=$RMEM_MIN
-[ "$RMEM_MAX" -gt "$RMEM_CEILING" ] && RMEM_MAX=$RMEM_CEILING
-[ "$WMEM_MAX" -lt "$RMEM_MIN" ]     && WMEM_MAX=$RMEM_MIN
-[ "$WMEM_MAX" -gt "$RMEM_CEILING" ] && WMEM_MAX=$RMEM_CEILING
-
-VM_MIN_FREE_KB=$(( TOTAL_RAM_MB * 1024 * 2 / 100 ))
-[ "$VM_MIN_FREE_KB" -lt 65536 ] && VM_MIN_FREE_KB=65536
-
-NF_CONNTRACK_MAX=$(( MAX_USERS * 5000 ))
-[ "$NF_CONNTRACK_MAX" -lt 20000 ] && NF_CONNTRACK_MAX=20000
-NF_CONNTRACK_HASHSIZE=$(( NF_CONNTRACK_MAX / 4 ))
-
-# Per-user BDP, asymmetric: down matches client RX 2Mbit cap, up matches client TX 10Mbit cap.
-# Client's advertised receive window is tiny, so we deliberately do NOT inflate buffers
-# beyond ~2x this per-user BDP — bigger buffers just sit unused behind the client's own
-# flow-control ceiling and add queuing delay instead of throughput.
-BDP_PER_USER_DOWN=$(( PER_USER_DOWN_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
-BDP_PER_USER_UP=$(( PER_USER_UP_MBIT * 1000000 / 8 * RTT_MS / 1000 ))
-
-TOTAL_FLOWS=$(( MAX_USERS * FLOWS_PER_USER ))
-BUDGET_PER_FLOW=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / TOTAL_FLOWS / 2 ))
-BUDGET_PER_USER=$(( TCP_SAFE_BUDGET_MB * 1024 * 1024 / MAX_USERS / 2 ))
-
-TCP_DEFAULT_RMEM=$(( BDP_PER_USER_DOWN * 2 ))
-TCP_DEFAULT_WMEM=$(( BDP_PER_USER_UP * 2 ))
-[ "$TCP_DEFAULT_RMEM" -lt 87380 ] && TCP_DEFAULT_RMEM=87380
-[ "$TCP_DEFAULT_WMEM" -lt 65536 ] && TCP_DEFAULT_WMEM=65536
-[ "$TCP_DEFAULT_RMEM" -gt "$RMEM_MAX" ]       && TCP_DEFAULT_RMEM=$RMEM_MAX
-[ "$TCP_DEFAULT_WMEM" -gt "$WMEM_MAX" ]       && TCP_DEFAULT_WMEM=$WMEM_MAX
-[ "$TCP_DEFAULT_RMEM" -gt "$BUDGET_PER_FLOW" ] && TCP_DEFAULT_RMEM=$BUDGET_PER_FLOW
-[ "$TCP_DEFAULT_WMEM" -gt "$BUDGET_PER_FLOW" ] && TCP_DEFAULT_WMEM=$BUDGET_PER_FLOW
-
-# udp-custom buffers: RBUF is what the server receives on (client's upload direction = TX 10Mbit),
-# SBUF is what the server sends on (client's download direction = RX 2Mbit). Capped at 2x per-user
-# BDP rather than 4x, matching the client's tiny receive window so we don't build a standing queue
-# it can never drain — that queue is exactly what causes the "ping spikes / stalls" this profile
-# is meant to avoid.
-UDP_CUSTOM_RBUF=$(( BDP_PER_USER_UP * 2 ))
-[ "$UDP_CUSTOM_RBUF" -gt "$BUDGET_PER_USER" ] && UDP_CUSTOM_RBUF=$BUDGET_PER_USER
-[ "$UDP_CUSTOM_RBUF" -lt 65536 ]              && UDP_CUSTOM_RBUF=65536
-
-UDP_CUSTOM_SBUF=$(( BDP_PER_USER_DOWN * 2 ))
-[ "$UDP_CUSTOM_SBUF" -gt "$BUDGET_PER_USER" ] && UDP_CUSTOM_SBUF=$BUDGET_PER_USER
-[ "$UDP_CUSTOM_SBUF" -lt 32768 ]              && UDP_CUSTOM_SBUF=32768
-
-# Client's remote payload buffer is locked at 32768B — round server-side buffers to
-# multiples of that chunk size so reads/writes stay aligned with what the client actually sends
-CHUNK=32768
-UDP_CUSTOM_RBUF=$(( (UDP_CUSTOM_RBUF / CHUNK) * CHUNK ))
-UDP_CUSTOM_SBUF=$(( (UDP_CUSTOM_SBUF / CHUNK) * CHUNK ))
-[ "$UDP_CUSTOM_RBUF" -lt "$CHUNK" ] && UDP_CUSTOM_RBUF=$CHUNK
-[ "$UDP_CUSTOM_SBUF" -lt "$CHUNK" ] && UDP_CUSTOM_SBUF=$CHUNK
+UDP_MEM_MIN_PAGES=$(( UDP_KERNEL_MEM_MIN_MB * 1024 * 1024 / 4096 ))
+UDP_MEM_PRESSURE_PAGES=$(( UDP_KERNEL_MEM_PRESSURE_MB * 1024 * 1024 / 4096 ))
+UDP_MEM_MAX_PAGES=$(( UDP_KERNEL_MEM_MAX_MB * 1024 * 1024 / 4096 ))
 
 cat > /etc/sysctl.d/99-tunnel-optimize.conf << EOF
 net.ipv4.tcp_congestion_control = bbr
@@ -344,28 +349,35 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_keepalive_time = 60
 net.ipv4.tcp_keepalive_intvl = 10
 net.ipv4.tcp_keepalive_probes = 3
-net.core.rmem_max = ${RMEM_MAX}
-net.core.wmem_max = ${WMEM_MAX}
-net.core.rmem_default = ${TCP_DEFAULT_RMEM}
-net.core.wmem_default = ${TCP_DEFAULT_WMEM}
-net.ipv4.tcp_rmem = 4096 ${TCP_DEFAULT_RMEM} ${RMEM_MAX}
-net.ipv4.tcp_wmem = 4096 ${TCP_DEFAULT_WMEM} ${WMEM_MAX}
-net.core.netdev_max_backlog = 32768
-net.core.netdev_budget = 600
-net.core.netdev_budget_usecs = 5000
-net.core.rps_sock_flow_entries = 32768
-net.core.somaxconn = 8192
-net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_retries2 = ${TCP_RETRIES2}
+net.ipv4.tcp_syn_retries = ${TCP_SYN_RETRIES}
+net.core.rmem_max = ${TCP_RMEM_MAX}
+net.core.wmem_max = ${TCP_WMEM_MAX}
+net.core.rmem_default = ${TCP_RMEM_DEFAULT}
+net.core.wmem_default = ${TCP_WMEM_DEFAULT}
+net.ipv4.tcp_rmem = 4096 ${TCP_RMEM_DEFAULT} ${TCP_RMEM_MAX}
+net.ipv4.tcp_wmem = 4096 ${TCP_WMEM_DEFAULT} ${TCP_WMEM_MAX}
+net.ipv4.udp_mem = ${UDP_MEM_MIN_PAGES} ${UDP_MEM_PRESSURE_PAGES} ${UDP_MEM_MAX_PAGES}
+net.ipv4.udp_rmem_min = ${UDP_RMEM_MIN}
+net.ipv4.udp_wmem_min = ${UDP_WMEM_MIN}
+net.core.netdev_max_backlog = ${NETDEV_MAX_BACKLOG}
+net.core.netdev_budget = ${NETDEV_BUDGET}
+net.core.netdev_budget_usecs = ${NETDEV_BUDGET_USECS}
+net.core.rps_sock_flow_entries = ${RPS_SOCK_FLOW_ENTRIES}
+net.core.somaxconn = ${SOMAXCONN}
+net.ipv4.tcp_max_syn_backlog = ${TCP_MAX_SYN_BACKLOG}
 net.ipv4.tcp_tw_reuse = 1
 net.ipv4.tcp_fin_timeout = 15
 net.netfilter.nf_conntrack_max = ${NF_CONNTRACK_MAX}
-net.netfilter.nf_conntrack_udp_timeout = 30
-net.netfilter.nf_conntrack_udp_timeout_stream = 180
+net.netfilter.nf_conntrack_udp_timeout = ${NF_CONNTRACK_UDP_TIMEOUT}
+net.netfilter.nf_conntrack_udp_timeout_stream = ${NF_CONNTRACK_UDP_TIMEOUT_STREAM}
+net.netfilter.nf_conntrack_tcp_timeout_established = ${NF_CONNTRACK_TCP_TIMEOUT_ESTABLISHED}
 fs.file-max = 1048576
 vm.swappiness = 1
 vm.dirty_ratio = 10
 vm.dirty_background_ratio = 5
 vm.min_free_kbytes = ${VM_MIN_FREE_KB}
+vm.overcommit_memory = 1
 EOF
 echo "options nf_conntrack hashsize=${NF_CONNTRACK_HASHSIZE}" > /etc/modprobe.d/nf_conntrack.conf
 echo "$NF_CONNTRACK_HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
@@ -374,13 +386,15 @@ if [ -f /etc/sysctl.conf ]; then
   cp /etc/sysctl.conf "/etc/sysctl.conf.bak.$(date +%s)"
   for key in net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.ip_forward \
              net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default \
-             net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+             net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.udp_mem net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min \
              net.core.netdev_max_backlog net.core.netdev_budget net.core.netdev_budget_usecs net.core.somaxconn \
              net.ipv4.tcp_max_syn_backlog net.core.rps_sock_flow_entries net.ipv4.tcp_frto \
              net.ipv4.tcp_ecn net.ipv4.tcp_syncookies net.ipv4.tcp_keepalive_time \
-             net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes \
-             vm.dirty_ratio vm.dirty_background_ratio vm.min_free_kbytes \
-             net.netfilter.nf_conntrack_max fs.file-max vm.swappiness; do
+             net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes net.ipv4.tcp_retries2 net.ipv4.tcp_syn_retries \
+             vm.dirty_ratio vm.dirty_background_ratio vm.min_free_kbytes vm.overcommit_memory \
+             net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_udp_timeout \
+             net.netfilter.nf_conntrack_udp_timeout_stream net.netfilter.nf_conntrack_tcp_timeout_established \
+             fs.file-max vm.swappiness; do
     esc_key=$(printf '%s' "$key" | sed 's/\./\\./g')
     sed -i -E "/^[[:space:]]*${esc_key}[[:space:]]*=/d" /etc/sysctl.conf
   done
@@ -397,7 +411,7 @@ chmod +x /usr/local/sbin/set-thp-madvise.sh
 
 cat > /etc/systemd/system/set-thp-madvise.service << 'EOF'
 [Unit]
-Description=Keep THP in madvise mode to avoid compaction stalls under high memory pressure
+Description=Keep THP in madvise mode
 After=multi-user.target
 
 [Service]
@@ -416,29 +430,45 @@ cat > /usr/local/sbin/qos-root-init.sh << 'RUNTIME'
 source /etc/tunnel-qos.conf
 
 modprobe sch_cake 2>/dev/null || true
+modprobe sch_fq_codel 2>/dev/null || true
 modprobe ifb numifbs=1 2>/dev/null || true
 ip link set dev ifb0 up 2>/dev/null || true
+
+ip link set dev "$IFACE" txqueuelen "${TXQUEUELEN:-20000}" 2>/dev/null || true
+ip link set dev ifb0 txqueuelen "${TXQUEUELEN:-20000}" 2>/dev/null || true
 
 tc qdisc del dev "$IFACE" root 2>/dev/null || true
 tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
 tc qdisc del dev ifb0 root 2>/dev/null || true
 
-tc qdisc add dev "$IFACE" root cake \
-  bandwidth "${DOWNLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
-  besteffort triple-isolate
+CAKE_EXTRA=""
+if [ "${NAT_MODE:-0}" = "1" ]; then
+  CAKE_EXTRA="nat"
+fi
 
-tc qdisc add dev "$IFACE" handle ffff: ingress
-tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
+if lsmod | grep -q sch_cake; then
+  tc qdisc add dev "$IFACE" root cake \
+    bandwidth "${DOWNLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
+    besteffort triple-isolate ack-filter ${CAKE_EXTRA}
 
-tc qdisc add dev ifb0 root cake \
-  bandwidth "${UPLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
-  besteffort triple-isolate
+  tc qdisc add dev "$IFACE" handle ffff: ingress
+  tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
+
+  tc qdisc add dev ifb0 root cake \
+    bandwidth "${UPLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
+    besteffort triple-isolate ack-filter ${CAKE_EXTRA}
+else
+  tc qdisc add dev "$IFACE" root fq_codel
+  tc qdisc add dev "$IFACE" handle ffff: ingress
+  tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
+  tc qdisc add dev ifb0 root fq_codel
+fi
 RUNTIME
 chmod +x /usr/local/sbin/qos-root-init.sh
 
 cat > /etc/systemd/system/tunnel-shaper.service << 'EOF'
 [Unit]
-Description=CAKE best-effort QoS
+Description=CAKE best-effort QoS (fair-share, no per-user cap)
 After=network-online.target set-multiqueue.service
 Wants=network-online.target
 
@@ -458,8 +488,14 @@ systemctl restart tunnel-shaper.service
 cat > /usr/local/sbin/set-rps.sh << 'RUNTIME'
 #!/bin/bash
 source /etc/tunnel-qos.conf 2>/dev/null || true
-NCPU=$(nproc)
-MASK=$(printf '%x' $(( (1 << NCPU) - 1 )))
+FULL_MASK=$(( (1 << NCPU) - 1 ))
+if [ -n "$APP_CPU" ] && [ "$APP_CPU" -ge 0 ] 2>/dev/null; then
+  RPS_MASK_DEC=$(( FULL_MASK & ~(1 << APP_CPU) ))
+  [ "$RPS_MASK_DEC" -eq 0 ] && RPS_MASK_DEC=$FULL_MASK
+else
+  RPS_MASK_DEC=$FULL_MASK
+fi
+MASK=$(printf '%x' "$RPS_MASK_DEC")
 for rx in /sys/class/net/"${IFACE}"/queues/rx-*/rps_cpus; do
   [ -e "$rx" ] && echo "$MASK" > "$rx" 2>/dev/null || true
 done
@@ -483,7 +519,7 @@ chmod +x /usr/local/sbin/set-rps.sh
 
 cat > /etc/systemd/system/set-rps.service << 'EOF'
 [Unit]
-Description=Spread RX+TX packet steering across all CPU cores
+Description=Spread RX+TX packet steering across CPU cores reserved for networking
 After=network-online.target set-multiqueue.service tunnel-shaper.service
 Wants=network-online.target
 
@@ -501,23 +537,56 @@ systemctl enable --now set-rps.service > /dev/null 2>&1
 cat > /usr/local/sbin/tunnel-selfheal.sh << 'RUNTIME'
 #!/bin/bash
 source /etc/tunnel-qos.conf 2>/dev/null || true
+STATE_FILE=/run/tunnel-selfheal.state
+FAILS=0
+[ -f "$STATE_FILE" ] && FAILS=$(cat "$STATE_FILE" 2>/dev/null || echo 0)
 
 CUR_MTU=$(cat /sys/class/net/"${IFACE}"/mtu 2>/dev/null || echo 0)
 [ "$CUR_MTU" != "$TUNNEL_MTU" ] && ip link set dev "${IFACE}" mtu "$TUNNEL_MTU" 2>/dev/null || true
 
-if ! tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc cake" || \
-   ! tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc cake"; then
-  /usr/local/sbin/qos-root-init.sh >/dev/null 2>&1
+QDISC_OK=1
+if lsmod | grep -q sch_cake; then
+  tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc cake" || QDISC_OK=0
+  tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc cake" || QDISC_OK=0
+else
+  tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc fq_codel" || QDISC_OK=0
+  tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc fq_codel" || QDISC_OK=0
 fi
+[ "$QDISC_OK" -eq 0 ] && /usr/local/sbin/qos-root-init.sh >/dev/null 2>&1
 
 /usr/local/sbin/set-multiqueue.sh >/dev/null 2>&1
 /usr/local/sbin/set-rps.sh >/dev/null 2>&1
+
+UDP_CUSTOM_OK=1
+UDPGW_OK=1
+systemctl is-active --quiet udp-custom 2>/dev/null || UDP_CUSTOM_OK=0
+systemctl is-active --quiet udpgw 2>/dev/null || UDPGW_OK=0
+
+if [ -n "$UDPGW_PORT" ] && command -v nc >/dev/null 2>&1; then
+  timeout 1 nc -u -z 127.0.0.1 "$UDPGW_PORT" >/dev/null 2>&1 || UDPGW_OK=0
+fi
+
+if [ "$UDP_CUSTOM_OK" -eq 0 ] || [ "$UDPGW_OK" -eq 0 ]; then
+  FAILS=$((FAILS+1))
+else
+  FAILS=0
+fi
+echo "$FAILS" > "$STATE_FILE"
+
+[ "$UDP_CUSTOM_OK" -eq 0 ] && systemctl restart udp-custom >/dev/null 2>&1 || true
+[ "$UDPGW_OK" -eq 0 ] && systemctl restart udpgw >/dev/null 2>&1 || true
+
+if [ "$FAILS" -ge "${HEALTHCHECK_FAIL_STREAK_LIMIT:-3}" ]; then
+  systemctl restart tunnel-shaper.service >/dev/null 2>&1 || true
+  systemctl restart set-rps.service >/dev/null 2>&1 || true
+  echo 0 > "$STATE_FILE"
+fi
 RUNTIME
 chmod +x /usr/local/sbin/tunnel-selfheal.sh
 
 cat > /etc/systemd/system/tunnel-selfheal.service << 'EOF'
 [Unit]
-Description=Detect and silently repair tunnel network config drift (MTU/CAKE/multiqueue/RPS)
+Description=Detect and repair tunnel network config drift (MTU/CAKE/multiqueue/RPS) and restart dead tunnel services
 After=tunnel-shaper.service set-rps.service
 
 [Service]
@@ -525,16 +594,13 @@ Type=oneshot
 ExecStart=/usr/local/sbin/tunnel-selfheal.sh
 EOF
 
-# Client has auto-reconnect OFF and stop-on-failure OFF, so it will never recover a
-# stuck tunnel on its own — the server side has to notice and fix drift fast.
-# Tightened from 5min to 30s for that reason.
-cat > /etc/systemd/system/tunnel-selfheal.timer << 'EOF'
+cat > /etc/systemd/system/tunnel-selfheal.timer << EOF
 [Unit]
-Description=Run tunnel-selfheal every 30 seconds (client won't auto-reconnect, so server self-heal must be fast)
+Description=Run tunnel-selfheal every ${SELFHEAL_INTERVAL_SEC} seconds
 
 [Timer]
-OnBootSec=30s
-OnUnitActiveSec=30s
+OnBootSec=${SELFHEAL_INTERVAL_SEC}s
+OnUnitActiveSec=${SELFHEAL_INTERVAL_SEC}s
 Persistent=true
 
 [Install]
@@ -553,6 +619,11 @@ if [ -f "$UDP_CUSTOM_SERVICE" ]; then
   cp "$UDP_CUSTOM_SERVICE" "${UDP_CUSTOM_SERVICE}.bak.$(date +%s)"
   sed -i '/99-tunnel-optimize/d' "$UDP_CUSTOM_SERVICE" 2>/dev/null || true
 
+  UDPCUSTOM_CPU_DIRECTIVE=""
+  if [ -n "$UDPCUSTOM_CPU_RANGE" ]; then
+    UDPCUSTOM_CPU_DIRECTIVE="CPUAffinity=${UDPCUSTOM_CPU_RANGE}"
+  fi
+
   mkdir -p "${UDP_CUSTOM_SERVICE}.d"
   cat > "${UDP_CUSTOM_SERVICE}.d/99-tuning.conf" << EOF
 [Unit]
@@ -560,9 +631,10 @@ StartLimitIntervalSec=60
 StartLimitBurst=20
 
 [Service]
-Environment=GOMAXPROCS=${NCPU}
+Environment=GOMAXPROCS=${UDPCUSTOM_GOMAXPROCS}
 Environment=GOGC=400
 Environment=GOMEMLIMIT=${UDP_CUSTOM_MEM_HIGH_MB}MiB
+${UDPCUSTOM_CPU_DIRECTIVE}
 Nice=-5
 IOSchedulingClass=best-effort
 IOSchedulingPriority=2
@@ -572,7 +644,7 @@ MemoryHigh=${UDP_CUSTOM_MEM_HIGH_MB}M
 MemoryMax=${UDP_CUSTOM_MEM_MAX_MB}M
 CPUWeight=600
 Restart=always
-RestartSec=2
+RestartSec=1
 ExecStartPost=/bin/bash -c 'sleep 3; sysctl -p /etc/sysctl.d/99-tunnel-optimize.conf >/dev/null 2>&1; /usr/local/sbin/set-rps.sh >/dev/null 2>&1'
 EOF
   systemctl daemon-reload
@@ -584,13 +656,17 @@ if [ ! -x /usr/local/bin/badvpn-udpgw ]; then
   mkdir -p /usr/local/src/badvpn/badvpn-build
   cd /usr/local/src/badvpn/badvpn-build
   cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 > /dev/null 2>&1
-  make -j"$(nproc)" > /dev/null 2>&1
+  make -j4 > /dev/null 2>&1
   cp udpgw/badvpn-udpgw /usr/local/bin/badvpn-udpgw
   cd /
 fi
 
-UDPGW_MAX_CLIENTS=$(( MAX_USERS + 3 ))
-UDPGW_MAX_CONN_PER_CLIENT=64
+UDPGW_CPU_DIRECTIVES=""
+if [ "$APP_CPU" -ge 0 ]; then
+  UDPGW_CPU_DIRECTIVES="CPUAffinity=${APP_CPU}
+CPUSchedulingPolicy=rr
+CPUSchedulingPriority=${UDPGW_RT_PRIORITY}"
+fi
 
 cat > /etc/systemd/system/udpgw.service << EOF
 [Unit]
@@ -602,8 +678,9 @@ StartLimitBurst=20
 [Service]
 ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:${UDPGW_PORT} --max-clients ${UDPGW_MAX_CLIENTS} --max-connections-for-client ${UDPGW_MAX_CONN_PER_CLIENT}
 Restart=always
-RestartSec=2
+RestartSec=1
 LimitNOFILE=51200
+${UDPGW_CPU_DIRECTIVES}
 Nice=-5
 IOSchedulingClass=best-effort
 IOSchedulingPriority=2
@@ -620,6 +697,7 @@ systemctl enable --now udpgw.service > /dev/null 2>&1
 systemctl restart udp-custom 2>/dev/null || true
 systemctl restart udpgw 2>/dev/null || true
 systemctl restart tunnel-shaper.service
+systemctl restart set-rps.service
 
 systemctl disable --now safe-reboot.timer > /dev/null 2>&1 || true
 rm -f /etc/systemd/system/safe-reboot.timer /etc/systemd/system/safe-reboot.service /usr/local/sbin/safe-reboot.sh
@@ -688,10 +766,10 @@ EOF
 
 cat > /etc/systemd/system/daily-cache-log-clear.timer << EOF
 [Unit]
-Description=Run daily-cache-log-clear every day at ${DAILY_CLEAR_TIME}
+Description=Run daily-cache-log-clear every day at ${DAILY_CLEAR_TIME} ${CLEAR_TIMEZONE}
 
 [Timer]
-OnCalendar=*-*-* ${DAILY_CLEAR_TIME}
+OnCalendar=*-*-* ${DAILY_CLEAR_TIME} ${CLEAR_TIMEZONE}
 Persistent=true
 
 [Install]
@@ -707,5 +785,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ติดตั้ง/ปรับจูนระบบเรียบร้อย | RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU (ใช้เต็มถึง 90%, ${UDP_CUSTOM_MEM_HIGH_MB}MB เป็นจุดหน่วงก่อนแตะเพดาน ${UDP_CUSTOM_MEM_MAX_MB}MB) | MTU ${TUNNEL_MTU} | pipe ${DOWNLOAD_SHAPE_MBIT}↓/${UPLOAD_SHAPE_MBIT}↑ Mbit @ RTT ${RTT_MS}ms | ต่อ user: down ${PER_USER_DOWN_MBIT}mbit / up ${PER_USER_UP_MBIT}mbit (rmem default ${TCP_DEFAULT_RMEM}B, wmem default ${TCP_DEFAULT_WMEM}B, udp rbuf ${UDP_CUSTOM_RBUF}B sbuf ${UDP_CUSTOM_SBUF}B) | สูงสุด ${MAX_USERS} IP/connect, ${FLOWS_PER_USER} flow/user | UDPGW พอร์ต ${UDPGW_PORT} | GOMAXPROCS=${NCPU} GOGC=400 GOMEMLIMIT=${UDP_CUSTOM_MEM_HIGH_MB}MiB + CPUWeight/priority สูงให้ udp-custom/udpgw + auto-restart | ECN+syncookies+keepalive+dirty-ratio+min_free_kbytes(${VM_MIN_FREE_KB}KB)+THP=madvise | self-heal watchdog เช็ค MTU/CAKE/RPS ทุก 30 วินาที (client ไม่ auto-reconnect) | log เก็บดิสก์ ล้าง log+cache เต็มทุกวัน ${DAILY_CLEAR_TIME} น. | ตั้งค่าทั้งหมดรอดรีบูต${NC}"
+echo -e "${GREEN}เธ•เธดเธ”เธ•เธฑเนเธ/เธเธฃเธฑเธเธเธนเธเธฃเธฐเธเธเน€เธฃเธตเธขเธเธฃเนเธญเธข | SPEC เธเธเธ—เธตเน RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU AMD Ubuntu 24.04 (udp-custom เนเธเนเนเธ”เนเธ–เธถเธ ${UDP_CUSTOM_MEM_HIGH_MB}MB=80% เน€เธเนเธเธเธธเธ”เน€เธ•เธทเธญเธ, ${UDP_CUSTOM_MEM_MAX_MB}MB=90% เน€เธเนเธเน€เธเธ”เธฒเธเธ•เธฒเธข) | MTU ${TUNNEL_MTU} | MSS fix v4=${TCP_MSS_V4}/v6=${TCP_MSS_V6} overhead=${CAKE_OVERHEAD} | pipe เธฃเธงเธก ${DOWNLOAD_SHAPE_MBIT}โ“/${UPLOAD_SHAPE_MBIT}โ‘ Mbit @ RTT ${RTT_MS}ms โ€” เนเธกเนเธเธณเธเธฑเธ”เธเธณเธเธงเธเธเธ เนเธกเนเธกเธต per-user cap (CAKE triple-isolate ack-filter fair-queue เนเธเธฃเนเน€เธญเธ เนเธเธฃเธ”เธถเธเนเธ”เนเน€เธ—เนเธฒเนเธซเธฃเนเธเนเธ”เธถเธ, fallback fq_codel เธ–เนเธฒ cake เนเธซเธฅเธ”เนเธกเนเนเธ”เน) | TCP rmem/wmem default ${TCP_RMEM_DEFAULT}B max ${TCP_RMEM_MAX}B | tcp_retries2=${TCP_RETRIES2} syn_retries=${TCP_SYN_RETRIES} (เธ—เธเธชเธฑเธเธเธฒเธ“เธชเธฐเธ”เธธเธ”เนเธ”เนเธเธฒเธเธเธถเนเธเธเนเธญเธเธซเธฅเธธเธ”) | UDP kernel mem ${UDP_KERNEL_MEM_MIN_MB}/${UDP_KERNEL_MEM_PRESSURE_MB}/${UDP_KERNEL_MEM_MAX_MB}MB | udp-custom rbuf ${UDP_CUSTOM_RBUF}B sbuf ${UDP_CUSTOM_SBUF}B | conntrack ${NF_CONNTRACK_MAX} hashsize ${NF_CONNTRACK_HASHSIZE} udp_timeout=${NF_CONNTRACK_UDP_TIMEOUT}/${NF_CONNTRACK_UDP_TIMEOUT_STREAM}s tcp_established=${NF_CONNTRACK_TCP_TIMEOUT_ESTABLISHED}s (เธเธญเธเนเธ—เธฃเนเธเนเธกเนเธ•เธฑเธ”เธเธฅเธฒเธเธเธฑเธเธ•เธญเธเธ”เธนเธงเธดเธ”เธตเนเธญ/เนเธญเน€เธ”เธดเธฅ) | backlog ${NETDEV_MAX_BACKLOG} somaxconn ${SOMAXCONN} syn-backlog ${TCP_MAX_SYN_BACKLOG} | txqueuelen ${TXQUEUELEN} | UDPGW เธเธญเธฃเนเธ• ${UDPGW_PORT} max-clients ${UDPGW_MAX_CLIENTS} pinned-core=${APP_CPU} rt-priority=${UDPGW_RT_PRIORITY} | udp-custom GOMAXPROCS=${UDPCUSTOM_GOMAXPROCS} GOGC=400 GOMEMLIMIT=${UDP_CUSTOM_MEM_HIGH_MB}MiB cpu-range=${UDPCUSTOM_CPU_RANGE:-all} | RPS/IRQ เน€เธฅเธตเนเธขเธ core ${APP_CPU} เนเธซเน UDPGW เนเธเนเน€เธ”เธตเนเธขเธง jitter เธ•เนเธณ | selfheal เธ—เธธเธ ${SELFHEAL_INTERVAL_SEC}s เธ•เธฃเธงเธเธเธฃเธดเธเธ”เนเธงเธข UDP probe เธเธญเธฃเนเธ• ${UDPGW_PORT} + เธเธฑเธ fail streak เธเนเธญเธเธฃเธตเน€เธเนเธ•เธเธดเธงเธ—เธฑเนเธเธเธธเธ” (เธเธทเธ MTU/CAKE/RPS + เธฃเธตเธชเธ•เธฒเธฃเนเธ— udp-custom/udpgw เธ–เนเธฒเธ•เธฒเธข) | vm.overcommit_memory=1 เธเธฑเธ OOM เธ•เธญเธเนเธซเธฅเธ”เธซเธเธฑเธ | เธ—เธธเธเธเนเธฒเธเธณเธเธงเธ“เธฃเธญเธเธฃเธฑเธ 100 เธเธเน€เธเธทเนเธญเธกเธ•เนเธญเธเธฃเนเธญเธกเธเธฑเธเน€เธ•เนเธกเธชเน€เธเธ 80% | log เน€เธเนเธเธ”เธดเธชเธเนเธ—เธฑเนเธเธซเธกเธ” เธฅเนเธฒเธ log+cache เธ—เธธเธเธงเธฑเธ ${DAILY_CLEAR_TIME} เธ. เน€เธงเธฅเธฒเนเธ—เธข (${CLEAR_TIMEZONE}) | เธ•เธฑเนเธเธเนเธฒเธ—เธฑเนเธเธซเธกเธ”เธฃเธญเธ”เธฃเธตเธเธนเธ•${NC}"
 echo "=================================================="
