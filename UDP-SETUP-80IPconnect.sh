@@ -13,36 +13,40 @@ CAKE_OVERHEAD=40
 SWAP_GB=4
 UDPGW_PORT=7300
 
-DOWNLOAD_SHAPE_MBIT=300
-UPLOAD_SHAPE_MBIT=300
+DOWNLOAD_SHAPE_MBIT=1000
+UPLOAD_SHAPE_MBIT=1000
+PER_USER_DOWN_MBIT=20
+PER_USER_UP_MBIT=20
+PER_USER_GUAR_MBIT=2
+HASH_DIVISOR=1024
 
 TCP_MSS_V4=1380
 TCP_MSS_V6=1380
 
-TCP_RMEM_DEFAULT=262144
-TCP_RMEM_MAX=8388608
-TCP_WMEM_DEFAULT=262144
-TCP_WMEM_MAX=8388608
+TCP_RMEM_DEFAULT=131072
+TCP_RMEM_MAX=2097152
+TCP_WMEM_DEFAULT=131072
+TCP_WMEM_MAX=2097152
 
-UDP_CUSTOM_RBUF=4194304
-UDP_CUSTOM_SBUF=4194304
+UDP_CUSTOM_RBUF=2097152
+UDP_CUSTOM_SBUF=2097152
 
-NF_CONNTRACK_MAX=500000
-NF_CONNTRACK_HASHSIZE=125000
-NF_CONNTRACK_UDP_TIMEOUT=30
-NF_CONNTRACK_UDP_TIMEOUT_STREAM=300
-NF_CONNTRACK_TCP_TIMEOUT_ESTABLISHED=7200
+NF_CONNTRACK_MAX=1000000
+NF_CONNTRACK_HASHSIZE=250000
+NF_CONNTRACK_UDP_TIMEOUT=10
+NF_CONNTRACK_UDP_TIMEOUT_STREAM=120
+NF_CONNTRACK_TCP_TIMEOUT_ESTABLISHED=3600
 UDPGW_MAX_CLIENTS=2048
-UDPGW_MAX_CONN_PER_CLIENT=128
+UDPGW_MAX_CONN_PER_CLIENT=256
 
-NETDEV_MAX_BACKLOG=50000
-NETDEV_BUDGET=800
-NETDEV_BUDGET_USECS=5000
+NETDEV_MAX_BACKLOG=65536
+NETDEV_BUDGET=1000
+NETDEV_BUDGET_USECS=3000
 RPS_SOCK_FLOW_ENTRIES=65536
-SOMAXCONN=16384
-TCP_MAX_SYN_BACKLOG=16384
-TCP_RETRIES2=15
-TCP_SYN_RETRIES=6
+SOMAXCONN=32768
+TCP_MAX_SYN_BACKLOG=32768
+TCP_RETRIES2=10
+TCP_SYN_RETRIES=4
 
 UDP_CUSTOM_MEM_HIGH_MB=4915
 UDP_CUSTOM_MEM_MAX_MB=5530
@@ -57,7 +61,7 @@ UDP_CUSTOM_CONFIG="/root/udp/config.json"
 
 RESERVE_LAST_CPU_FOR_UDPGW=1
 UDPGW_RT_PRIORITY=15
-TXQUEUELEN=20000
+TXQUEUELEN=10000
 SELFHEAL_INTERVAL_SEC=10
 HEALTHCHECK_FAIL_STREAK_LIMIT=3
 
@@ -68,18 +72,18 @@ UDP_RMEM_MIN=131072
 UDP_WMEM_MIN=131072
 
 if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}เธ•เนเธญเธเธฃเธฑเธเธ”เนเธงเธข root: sudo bash $0${NC}"
+  echo -e "${RED}ต้องรันด้วย root: sudo bash $0${NC}"
   exit 1
 fi
 
 if [ ! -f "$UDP_CUSTOM_CONFIG" ]; then
-  echo -e "${RED}เนเธกเนเธเธ ${UDP_CUSTOM_CONFIG} เธเธฃเธธเธ“เธฒเธ•เธดเธ”เธ•เธฑเนเธ udp-custom เธเนเธญเธ${NC}"
+  echo -e "${RED}ไม่พบ ${UDP_CUSTOM_CONFIG} กรุณาติดตั้ง udp-custom ก่อน${NC}"
   exit 1
 fi
 
 IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
 if [ -z "$IFACE" ]; then
-  echo -e "${RED}เธซเธฒ default interface เนเธกเนเน€เธเธญ เธขเธเน€เธฅเธดเธ${NC}"
+  echo -e "${RED}หา default interface ไม่เจอ ยกเลิก${NC}"
   exit 1
 fi
 
@@ -104,23 +108,27 @@ DNS_LABEL="Cloudflare+Google"
 DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
 DNS_V6_A="2606:4700:4700::1111"; DNS_V6_B="2001:4860:4860::8888"
 
-echo "SPEC เธเธเธ—เธตเน: RAM=${TOTAL_RAM_MB}MB vCPU=${NCPU} (AMD, Ubuntu 24.04) | IFACE=${IFACE} | DNS=${DNS_LABEL} | MTU=${TUNNEL_MTU} MSS v4/v6=${TCP_MSS_V4}/${TCP_MSS_V6} overhead=${CAKE_OVERHEAD} | Pipe เธฃเธงเธก Down=${DOWNLOAD_SHAPE_MBIT}mbit Up=${UPLOAD_SHAPE_MBIT}mbit เนเธกเนเธเธณเธเธฑเธ”เธเธณเธเธงเธเธเธ เนเธกเนเธกเธต per-user cap (CAKE fair-queue เนเธเธฃเนเน€เธญเธ) | RTT=${RTT_MS}ms | เธเธฑเธเน€เธเธญเธฃเน/เธฅเธดเธกเธดเธ•เธเธณเธเธงเธ“เธชเธณเธซเธฃเธฑเธเนเธซเธฅเธ” 100 เธเธเธเธฃเนเธญเธกเธเธฑเธเน€เธ•เนเธกเธชเน€เธเธ | CPU เนเธขเธเธเธฒเธ: core เธชเธณเธซเธฃเธฑเธเน€เธเธฃเธทเธญเธเนเธฒเธข (RPS) เธเธฑเธ core เน€เธเธเธฒเธฐ UDPGW=${APP_CPU} (jitter เธ•เนเธณ) | NAT_MODE=${NAT_MODE}"
+echo "SPEC: RAM=${TOTAL_RAM_MB}MB vCPU=${NCPU} | IFACE=${IFACE} | MTU=${TUNNEL_MTU} | Per-User Down/Up=${PER_USER_DOWN_MBIT}/${PER_USER_UP_MBIT} Mbps | Hash Divisor=${HASH_DIVISOR} | Low Latency Buffer Tuned"
 
 if grep -qm1 aes /proc/cpuinfo 2>/dev/null; then
-  echo -e "${GREEN}AES-NI: เธเธฃเนเธญเธกเนเธเนเธเธฒเธ${NC}"
+  echo -e "${GREEN}AES-NI: พร้อมใช้งาน${NC}"
 else
-  echo -e "${YELLOW}AES-NI: เนเธกเนเน€เธเธญ flag เธเธตเนเนเธ /proc/cpuinfo โ€” เน€เธเนเธเธเธฑเธเธเธนเนเนเธซเนเธเธฃเธดเธเธฒเธฃเนเธฎเธชเธ•เนเธงเนเธฒ expose flag เธเธตเนเนเธซเน guest เธซเธฃเธทเธญเน€เธเธฅเนเธฒ${NC}"
+  echo -e "${YELLOW}AES-NI: ไม่พบ flag ใน /proc/cpuinfo${NC}"
 fi
 
 UDP_CUSTOM_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CUSTOM_CONFIG" || true)
 if [ -z "$UDP_CUSTOM_PORT" ]; then
-  read -rp "เนเธชเนเธเธญเธฃเนเธ• UDP เธ—เธตเน udp-custom เนเธเนเธเธฃเธดเธ: " UDP_CUSTOM_PORT
+  read -rp "ใส่พอร์ต UDP ที่ udp-custom ใช้จริง: " UDP_CUSTOM_PORT
 fi
 
 cat > /etc/tunnel-qos.conf << EOF
 IFACE=${IFACE}
 DOWNLOAD_SHAPE_MBIT=${DOWNLOAD_SHAPE_MBIT}
 UPLOAD_SHAPE_MBIT=${UPLOAD_SHAPE_MBIT}
+PER_USER_DOWN_MBIT=${PER_USER_DOWN_MBIT}
+PER_USER_UP_MBIT=${PER_USER_UP_MBIT}
+PER_USER_GUAR_MBIT=${PER_USER_GUAR_MBIT}
+HASH_DIVISOR=${HASH_DIVISOR}
 RTT_MS=${RTT_MS}
 TUNNEL_MTU=${TUNNEL_MTU}
 CAKE_OVERHEAD=${CAKE_OVERHEAD}
@@ -141,13 +149,10 @@ EOF
 apt-get update -qq
 apt-get install -y ufw iptables conntrack ethtool iproute2 jq irqbalance rsyslog cmake build-essential git netcat-openbsd > /dev/null 2>&1
 
-modprobe sch_cake 2>/dev/null || true
+modprobe sch_htb 2>/dev/null || true
 modprobe sch_fq_codel 2>/dev/null || true
 modprobe tcp_bbr 2>/dev/null || true
 echo "tcp_bbr" > /etc/modules-load.d/tunnel.conf
-
-CAKE_AVAILABLE=1
-lsmod | grep -q sch_cake || CAKE_AVAILABLE=0
 
 if [ "$APP_CPU" -ge 0 ]; then
   mkdir -p /etc/default
@@ -336,18 +341,19 @@ UDP_MEM_MAX_PAGES=$(( UDP_KERNEL_MEM_MAX_MB * 1024 * 1024 / 4096 ))
 
 cat > /etc/sysctl.d/99-tunnel-optimize.conf << EOF
 net.ipv4.tcp_congestion_control = bbr
-net.core.default_qdisc = cake
+net.core.default_qdisc = fq_codel
 net.ipv4.ip_forward = 1
 net.ipv4.tcp_slow_start_after_idle = 0
-net.ipv4.tcp_notsent_lowat = 16384
+net.ipv4.tcp_notsent_lowat = 4096
+net.ipv4.tcp_autocorking = 0
 net.ipv4.tcp_fastopen = 3
 net.ipv4.tcp_mtu_probing = 1
 net.ipv4.tcp_no_metrics_save = 1
 net.ipv4.tcp_frto = 2
 net.ipv4.tcp_ecn = 1
 net.ipv4.tcp_syncookies = 1
-net.ipv4.tcp_keepalive_time = 60
-net.ipv4.tcp_keepalive_intvl = 10
+net.ipv4.tcp_keepalive_time = 45
+net.ipv4.tcp_keepalive_intvl = 5
 net.ipv4.tcp_keepalive_probes = 3
 net.ipv4.tcp_retries2 = ${TCP_RETRIES2}
 net.ipv4.tcp_syn_retries = ${TCP_SYN_RETRIES}
@@ -394,7 +400,7 @@ if [ -f /etc/sysctl.conf ]; then
              vm.dirty_ratio vm.dirty_background_ratio vm.min_free_kbytes vm.overcommit_memory \
              net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_udp_timeout \
              net.netfilter.nf_conntrack_udp_timeout_stream net.netfilter.nf_conntrack_tcp_timeout_established \
-             fs.file-max vm.swappiness; do
+             fs.file-max vm.swappiness net.ipv4.tcp_notsent_lowat net.ipv4.tcp_autocorking; do
     esc_key=$(printf '%s' "$key" | sed 's/\./\\./g')
     sed -i -E "/^[[:space:]]*${esc_key}[[:space:]]*=/d" /etc/sysctl.conf
   done
@@ -429,46 +435,50 @@ cat > /usr/local/sbin/qos-root-init.sh << 'RUNTIME'
 #!/bin/bash
 source /etc/tunnel-qos.conf
 
-modprobe sch_cake 2>/dev/null || true
+modprobe sch_htb 2>/dev/null || true
 modprobe sch_fq_codel 2>/dev/null || true
 modprobe ifb numifbs=1 2>/dev/null || true
 ip link set dev ifb0 up 2>/dev/null || true
 
-ip link set dev "$IFACE" txqueuelen "${TXQUEUELEN:-20000}" 2>/dev/null || true
-ip link set dev ifb0 txqueuelen "${TXQUEUELEN:-20000}" 2>/dev/null || true
+ip link set dev "$IFACE" txqueuelen "${TXQUEUELEN:-10000}" 2>/dev/null || true
+ip link set dev ifb0 txqueuelen "${TXQUEUELEN:-10000}" 2>/dev/null || true
 
 tc qdisc del dev "$IFACE" root 2>/dev/null || true
 tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
 tc qdisc del dev ifb0 root 2>/dev/null || true
 
-CAKE_EXTRA=""
-if [ "${NAT_MODE:-0}" = "1" ]; then
-  CAKE_EXTRA="nat"
-fi
+DIV=${HASH_DIVISOR:-1024}
+GUAR=${PER_USER_GUAR_MBIT:-2}
+BASE=16
 
-if lsmod | grep -q sch_cake; then
-  tc qdisc add dev "$IFACE" root cake \
-    bandwidth "${DOWNLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
-    besteffort triple-isolate ack-filter ${CAKE_EXTRA}
+tc qdisc add dev "$IFACE" root handle 1: htb default 1
+tc class add dev "$IFACE" parent 1: classid 1:1 htb rate "${DOWNLOAD_SHAPE_MBIT}"mbit ceil "${DOWNLOAD_SHAPE_MBIT}"mbit
+for i in $(seq 0 $((DIV-1))); do
+  MINOR=$(printf '%x' $((BASE+i)))
+  HANDLE=$(printf '%x' $((0x2000+i)))
+  tc class add dev "$IFACE" parent 1:1 classid 1:"$MINOR" htb rate "${GUAR}"mbit ceil "${PER_USER_DOWN_MBIT}"mbit quantum 1514 prio 1
+  tc qdisc add dev "$IFACE" parent 1:"$MINOR" handle "$HANDLE": fq_codel target 3ms interval 40ms ecn
+done
+tc filter add dev "$IFACE" parent 1:0 protocol ip prio 1 flow hash keys dst divisor "$DIV" baseclass 1:$(printf '%x' $BASE)
 
-  tc qdisc add dev "$IFACE" handle ffff: ingress
-  tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
+tc qdisc add dev "$IFACE" handle ffff: ingress
+tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
 
-  tc qdisc add dev ifb0 root cake \
-    bandwidth "${UPLOAD_SHAPE_MBIT}"mbit rtt "${RTT_MS}"ms overhead "${CAKE_OVERHEAD}" \
-    besteffort triple-isolate ack-filter ${CAKE_EXTRA}
-else
-  tc qdisc add dev "$IFACE" root fq_codel
-  tc qdisc add dev "$IFACE" handle ffff: ingress
-  tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0
-  tc qdisc add dev ifb0 root fq_codel
-fi
+tc qdisc add dev ifb0 root handle 1: htb default 1
+tc class add dev ifb0 parent 1: classid 1:1 htb rate "${UPLOAD_SHAPE_MBIT}"mbit ceil "${UPLOAD_SHAPE_MBIT}"mbit
+for i in $(seq 0 $((DIV-1))); do
+  MINOR=$(printf '%x' $((BASE+i)))
+  HANDLE=$(printf '%x' $((0x3000+i)))
+  tc class add dev ifb0 parent 1:1 classid 1:"$MINOR" htb rate "${GUAR}"mbit ceil "${PER_USER_UP_MBIT}"mbit quantum 1514 prio 1
+  tc qdisc add dev ifb0 parent 1:"$MINOR" handle "$HANDLE": fq_codel target 3ms interval 40ms ecn
+done
+tc filter add dev ifb0 parent 1:0 protocol ip prio 1 flow hash keys src divisor "$DIV" baseclass 1:$(printf '%x' $BASE)
 RUNTIME
 chmod +x /usr/local/sbin/qos-root-init.sh
 
 cat > /etc/systemd/system/tunnel-shaper.service << 'EOF'
 [Unit]
-Description=CAKE best-effort QoS (fair-share, no per-user cap)
+Description=Low-latency Per-User Rate Limiter QoS (HTB + FQ_CoDel)
 After=network-online.target set-multiqueue.service
 Wants=network-online.target
 
@@ -545,13 +555,8 @@ CUR_MTU=$(cat /sys/class/net/"${IFACE}"/mtu 2>/dev/null || echo 0)
 [ "$CUR_MTU" != "$TUNNEL_MTU" ] && ip link set dev "${IFACE}" mtu "$TUNNEL_MTU" 2>/dev/null || true
 
 QDISC_OK=1
-if lsmod | grep -q sch_cake; then
-  tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc cake" || QDISC_OK=0
-  tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc cake" || QDISC_OK=0
-else
-  tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc fq_codel" || QDISC_OK=0
-  tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc fq_codel" || QDISC_OK=0
-fi
+tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc htb" || QDISC_OK=0
+tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc htb" || QDISC_OK=0
 [ "$QDISC_OK" -eq 0 ] && /usr/local/sbin/qos-root-init.sh >/dev/null 2>&1
 
 /usr/local/sbin/set-multiqueue.sh >/dev/null 2>&1
@@ -586,7 +591,7 @@ chmod +x /usr/local/sbin/tunnel-selfheal.sh
 
 cat > /etc/systemd/system/tunnel-selfheal.service << 'EOF'
 [Unit]
-Description=Detect and repair tunnel network config drift (MTU/CAKE/multiqueue/RPS) and restart dead tunnel services
+Description=Detect and repair tunnel network config drift and restart dead tunnel services
 After=tunnel-shaper.service set-rps.service
 
 [Service]
@@ -785,5 +790,5 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}เธ•เธดเธ”เธ•เธฑเนเธ/เธเธฃเธฑเธเธเธนเธเธฃเธฐเธเธเน€เธฃเธตเธขเธเธฃเนเธญเธข | SPEC เธเธเธ—เธตเน RAM ${TOTAL_RAM_MB}MB /${NCPU}vCPU AMD Ubuntu 24.04 (udp-custom เนเธเนเนเธ”เนเธ–เธถเธ ${UDP_CUSTOM_MEM_HIGH_MB}MB=80% เน€เธเนเธเธเธธเธ”เน€เธ•เธทเธญเธ, ${UDP_CUSTOM_MEM_MAX_MB}MB=90% เน€เธเนเธเน€เธเธ”เธฒเธเธ•เธฒเธข) | MTU ${TUNNEL_MTU} | MSS fix v4=${TCP_MSS_V4}/v6=${TCP_MSS_V6} overhead=${CAKE_OVERHEAD} | pipe เธฃเธงเธก ${DOWNLOAD_SHAPE_MBIT}โ“/${UPLOAD_SHAPE_MBIT}โ‘ Mbit @ RTT ${RTT_MS}ms โ€” เนเธกเนเธเธณเธเธฑเธ”เธเธณเธเธงเธเธเธ เนเธกเนเธกเธต per-user cap (CAKE triple-isolate ack-filter fair-queue เนเธเธฃเนเน€เธญเธ เนเธเธฃเธ”เธถเธเนเธ”เนเน€เธ—เนเธฒเนเธซเธฃเนเธเนเธ”เธถเธ, fallback fq_codel เธ–เนเธฒ cake เนเธซเธฅเธ”เนเธกเนเนเธ”เน) | TCP rmem/wmem default ${TCP_RMEM_DEFAULT}B max ${TCP_RMEM_MAX}B | tcp_retries2=${TCP_RETRIES2} syn_retries=${TCP_SYN_RETRIES} (เธ—เธเธชเธฑเธเธเธฒเธ“เธชเธฐเธ”เธธเธ”เนเธ”เนเธเธฒเธเธเธถเนเธเธเนเธญเธเธซเธฅเธธเธ”) | UDP kernel mem ${UDP_KERNEL_MEM_MIN_MB}/${UDP_KERNEL_MEM_PRESSURE_MB}/${UDP_KERNEL_MEM_MAX_MB}MB | udp-custom rbuf ${UDP_CUSTOM_RBUF}B sbuf ${UDP_CUSTOM_SBUF}B | conntrack ${NF_CONNTRACK_MAX} hashsize ${NF_CONNTRACK_HASHSIZE} udp_timeout=${NF_CONNTRACK_UDP_TIMEOUT}/${NF_CONNTRACK_UDP_TIMEOUT_STREAM}s tcp_established=${NF_CONNTRACK_TCP_TIMEOUT_ESTABLISHED}s (เธเธญเธเนเธ—เธฃเนเธเนเธกเนเธ•เธฑเธ”เธเธฅเธฒเธเธเธฑเธเธ•เธญเธเธ”เธนเธงเธดเธ”เธตเนเธญ/เนเธญเน€เธ”เธดเธฅ) | backlog ${NETDEV_MAX_BACKLOG} somaxconn ${SOMAXCONN} syn-backlog ${TCP_MAX_SYN_BACKLOG} | txqueuelen ${TXQUEUELEN} | UDPGW เธเธญเธฃเนเธ• ${UDPGW_PORT} max-clients ${UDPGW_MAX_CLIENTS} pinned-core=${APP_CPU} rt-priority=${UDPGW_RT_PRIORITY} | udp-custom GOMAXPROCS=${UDPCUSTOM_GOMAXPROCS} GOGC=400 GOMEMLIMIT=${UDP_CUSTOM_MEM_HIGH_MB}MiB cpu-range=${UDPCUSTOM_CPU_RANGE:-all} | RPS/IRQ เน€เธฅเธตเนเธขเธ core ${APP_CPU} เนเธซเน UDPGW เนเธเนเน€เธ”เธตเนเธขเธง jitter เธ•เนเธณ | selfheal เธ—เธธเธ ${SELFHEAL_INTERVAL_SEC}s เธ•เธฃเธงเธเธเธฃเธดเธเธ”เนเธงเธข UDP probe เธเธญเธฃเนเธ• ${UDPGW_PORT} + เธเธฑเธ fail streak เธเนเธญเธเธฃเธตเน€เธเนเธ•เธเธดเธงเธ—เธฑเนเธเธเธธเธ” (เธเธทเธ MTU/CAKE/RPS + เธฃเธตเธชเธ•เธฒเธฃเนเธ— udp-custom/udpgw เธ–เนเธฒเธ•เธฒเธข) | vm.overcommit_memory=1 เธเธฑเธ OOM เธ•เธญเธเนเธซเธฅเธ”เธซเธเธฑเธ | เธ—เธธเธเธเนเธฒเธเธณเธเธงเธ“เธฃเธญเธเธฃเธฑเธ 100 เธเธเน€เธเธทเนเธญเธกเธ•เนเธญเธเธฃเนเธญเธกเธเธฑเธเน€เธ•เนเธกเธชเน€เธเธ 80% | log เน€เธเนเธเธ”เธดเธชเธเนเธ—เธฑเนเธเธซเธกเธ” เธฅเนเธฒเธ log+cache เธ—เธธเธเธงเธฑเธ ${DAILY_CLEAR_TIME} เธ. เน€เธงเธฅเธฒเนเธ—เธข (${CLEAR_TIMEZONE}) | เธ•เธฑเนเธเธเนเธฒเธ—เธฑเนเธเธซเธกเธ”เธฃเธญเธ”เธฃเธตเธเธนเธ•${NC}"
+echo -e "${GREEN}ปรับแต่งระบบสำเร็จ | Per-User Limiter: ${PER_USER_DOWN_MBIT}Mbit↓ / ${PER_USER_UP_MBIT}Mbit↑ | Low-Latency BDP Buffer & FQ-CoDel Active${NC}"
 echo "=================================================="
