@@ -21,8 +21,8 @@ PER_USER_UP_MBIT=20
 PER_USER_GUAR_MBIT=2
 HASH_DIVISOR=1024
 
-TCP_MSS_V4=1380
-TCP_MSS_V6=1380
+# MSS ของ IPv4 (MTU=1500 - 40 byte header - 20 byte กันชนสำหรับ overhead ของ tunnel)
+TCP_MSS_V4=1440
 
 TCP_RMEM_DEFAULT=131072
 TCP_RMEM_MAX=2097152
@@ -105,11 +105,11 @@ if command -v iptables >/dev/null 2>&1; then
   iptables -t nat -S 2>/dev/null | grep -qi masquerade && NAT_MODE=1
 fi
 
-DNS_LABEL="Cloudflare+Google"
+# ===== IPv4 only: ไม่มี DNS v6 อีกต่อไป =====
+DNS_LABEL="Cloudflare+Google (IPv4 only)"
 DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
-DNS_V6_A="2606:4700:4700::1111"; DNS_V6_B="2001:4860:4860::8888"
 
-echo "SPEC: RAM=${TOTAL_RAM_MB}MB vCPU=${NCPU} | IFACE=${IFACE} | MTU=${TUNNEL_MTU} | Pipeline Down/Up=${DOWNLOAD_SHAPE_MBIT}/${UPLOAD_SHAPE_MBIT} Mbps | Per-User=${PER_USER_DOWN_MBIT}/${PER_USER_UP_MBIT} Mbps | Low Latency Buffer Tuned"
+echo "SPEC: RAM=${TOTAL_RAM_MB}MB vCPU=${NCPU} | IFACE=${IFACE} | MTU=${TUNNEL_MTU} | Pipeline Down/Up=${DOWNLOAD_SHAPE_MBIT}/${UPLOAD_SHAPE_MBIT} Mbps | Per-User=${PER_USER_DOWN_MBIT}/${PER_USER_UP_MBIT} Mbps | IPv4-only | MSS=${TCP_MSS_V4}"
 
 if grep -qm1 aes /proc/cpuinfo 2>/dev/null; then
   echo -e "${GREEN}AES-NI: พร้อมใช้งาน${NC}"
@@ -136,8 +136,6 @@ CAKE_OVERHEAD=${CAKE_OVERHEAD}
 DNS_LABEL=${DNS_LABEL}
 DNS_V4_A=${DNS_V4_A}
 DNS_V4_B=${DNS_V4_B}
-DNS_V6_A=${DNS_V6_A}
-DNS_V6_B=${DNS_V6_B}
 UDP_CUSTOM_PORT=${UDP_CUSTOM_PORT}
 UDPGW_PORT=${UDPGW_PORT}
 NCPU=${NCPU}
@@ -189,8 +187,13 @@ if ! swapon --show | grep -qv '^/dev/zram' 2>/dev/null; then
   fi
 fi
 
+# ===== UFW: บังคับปิด IPv6 ในตัว ufw เอง =====
 ufw --force reset > /dev/null
-sed -i 's/^IPV6=no/IPV6=yes/' /etc/default/ufw
+if grep -q '^IPV6=' /etc/default/ufw; then
+  sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
+else
+  echo 'IPV6=no' >> /etc/default/ufw
+fi
 ufw default deny incoming > /dev/null
 ufw default allow outgoing > /dev/null
 ufw default deny routed > /dev/null
@@ -232,18 +235,17 @@ for f in /etc/netplan/*.yaml; do
   chmod "$ORIG_PERM" "$f" 2>/dev/null || true
 done
 
+# เหลือแค่แก้ไอพี DNS ฝั่ง IPv4 เท่านั้น (ไม่มี IPv6 ให้แก้แล้ว)
 sed -i \
   -e 's/1\.0\.0\.1/8.8.8.8/g' \
   -e 's/8\.8\.4\.4/1.1.1.1/g' \
-  -e 's/2606:4700:4700::1001/2001:4860:4860::8888/g' \
-  -e 's/2001:4860:4860::8844/2606:4700:4700::1111/g' \
   /etc/netplan/*.yaml 2>/dev/null || true
 
 mkdir -p /etc/systemd/resolved.conf.d
 rm -rf /etc/systemd/resolved.conf.d/* 2>/dev/null
 cat > /etc/systemd/resolved.conf << EOF
 [Resolve]
-DNS=${DNS_V4_A} ${DNS_V4_B} ${DNS_V6_A} ${DNS_V6_B}
+DNS=${DNS_V4_A} ${DNS_V4_B}
 FallbackDNS=
 Domains=~.
 DNSStubListener=yes
@@ -301,23 +303,21 @@ EOF
 systemctl daemon-reload
 systemctl enable --now set-multiqueue.service > /dev/null 2>&1
 
+# ===== MSS clamp: IPv4 เท่านั้น ไม่มี ip6tables อีกต่อไป =====
 cat > /usr/local/sbin/mss-clamp.sh << EOF
 #!/bin/bash
 MSS_V4=${TCP_MSS_V4}
-MSS_V6=${TCP_MSS_V6}
 apply() {
   local table="\$1" chain="\$2"; shift 2
   iptables -t "\$table" -C "\$chain" "\$@" 2>/dev/null || iptables -t "\$table" -A "\$chain" "\$@"
 }
 apply mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V4"
 apply mangle OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V4"
+
+# กันหลุด: ลบกฎ ip6tables MSS เดิม (ถ้ามีจากรันครั้งก่อน) เพราะปิด IPv6 ทั้งระบบแล้ว
 if command -v ip6tables >/dev/null 2>&1; then
-  apply6() {
-    local chain="\$1"; shift
-    ip6tables -t mangle -C "\$chain" "\$@" 2>/dev/null || ip6tables -t mangle -A "\$chain" "\$@"
-  }
-  apply6 FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V6" 2>/dev/null || true
-  apply6 OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V6" 2>/dev/null || true
+  ip6tables -t mangle -F FORWARD 2>/dev/null || true
+  ip6tables -t mangle -F OUTPUT 2>/dev/null || true
 fi
 EOF
 chmod +x /usr/local/sbin/mss-clamp.sh
@@ -325,7 +325,7 @@ chmod +x /usr/local/sbin/mss-clamp.sh
 
 cat > /etc/systemd/system/mss-clamp.service << EOF
 [Unit]
-Description=Clamp TCP MSS to fixed value (${TCP_MSS_V4}/${TCP_MSS_V6})
+Description=Clamp TCP MSS to fixed value (${TCP_MSS_V4}, IPv4 only)
 After=network-online.target
 Wants=network-online.target
 
@@ -389,6 +389,10 @@ vm.dirty_ratio = 10
 vm.dirty_background_ratio = 5
 vm.min_free_kbytes = ${VM_MIN_FREE_KB}
 vm.overcommit_memory = 1
+# ===== ปิด IPv6 ทั้งระบบ (ทันที ไม่ต้องรีบูต) =====
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
 echo "options nf_conntrack hashsize=${NF_CONNTRACK_HASHSIZE}" > /etc/modprobe.d/nf_conntrack.conf
 echo "$NF_CONNTRACK_HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
@@ -405,13 +409,27 @@ if [ -f /etc/sysctl.conf ]; then
              vm.dirty_ratio vm.dirty_background_ratio vm.min_free_kbytes vm.overcommit_memory \
              net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_udp_timeout \
              net.netfilter.nf_conntrack_udp_timeout_stream net.netfilter.nf_conntrack_tcp_timeout_established \
-             fs.file-max vm.swappiness net.ipv4.tcp_notsent_lowat net.ipv4.tcp_autocorking; do
+             fs.file-max vm.swappiness net.ipv4.tcp_notsent_lowat net.ipv4.tcp_autocorking \
+             net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6; do
     esc_key=$(printf '%s' "$key" | sed 's/\./\\./g')
     sed -i -E "/^[[:space:]]*${esc_key}[[:space:]]*=/d" /etc/sysctl.conf
   done
 fi
 
 sysctl --system > /dev/null 2>&1 || true
+
+# ===== ปิด IPv6 ระดับ kernel/bootloader ให้ถาวร (มีผลเต็มที่หลังรีบูต) =====
+if [ -f /etc/default/grub ]; then
+  cp /etc/default/grub "/etc/default/grub.bak.$(date +%s)"
+  if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
+    if ! grep -q 'ipv6.disable=1' /etc/default/grub; then
+      sed -i -E 's/^GRUB_CMDLINE_LINUX="(.*)"/GRUB_CMDLINE_LINUX="\1 ipv6.disable=1"/' /etc/default/grub
+    fi
+  else
+    echo 'GRUB_CMDLINE_LINUX="ipv6.disable=1"' >> /etc/default/grub
+  fi
+  (update-grub > /dev/null 2>&1 || grub2-mkconfig -o /boot/grub2/grub.cfg > /dev/null 2>&1) || true
+fi
 
 cat > /usr/local/sbin/set-thp-madvise.sh << 'RUNTIME'
 #!/bin/bash
@@ -823,5 +841,6 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ปรับแต่งระบบสำเร็จ | Tunnel Pipeline: ${DOWNLOAD_SHAPE_MBIT}Mbit↓ / ${UPLOAD_SHAPE_MBIT}Mbit↑ | Per-User: ${PER_USER_DOWN_MBIT}Mbit↓ / ${PER_USER_UP_MBIT}Mbit↑${NC}"
+echo -e "${GREEN}ปรับแต่งระบบสำเร็จ | Tunnel Pipeline: ${DOWNLOAD_SHAPE_MBIT}Mbit↓ / ${UPLOAD_SHAPE_MBIT}Mbit↑ | Per-User: ${PER_USER_DOWN_MBIT}Mbit↓ / ${PER_USER_UP_MBIT}Mbit↑ | MSS(v4)=${TCP_MSS_V4} | IPv6=DISABLED (sysctl+ufw+grub)${NC}"
+echo -e "${YELLOW}หมายเหตุ: ปิด IPv6 ผ่าน sysctl มีผลทันที ส่วนพารามิเตอร์ kernel (ipv6.disable=1 ใน GRUB) จะสมบูรณ์ 100% หลัง reboot เครื่องหนึ่งครั้ง${NC}"
 echo "=================================================="
