@@ -9,6 +9,7 @@ NCPU=4
 
 RTT_MS=65
 TUNNEL_MTU=1500
+# ใช้จริงแล้ว: ส่งเข้า `tc qdisc ... cake overhead` เพื่อชดเชย encapsulation ของ tunnel
 CAKE_OVERHEAD=40
 SWAP_GB=4
 UDPGW_PORT=7300
@@ -16,13 +17,17 @@ UDPGW_PORT=7300
 # ปรับจำกัดท่อหลักเป็น 300 Mbps ให้เหมาะกับสเปคเครื่อง
 DOWNLOAD_SHAPE_MBIT=300
 UPLOAD_SHAPE_MBIT=300
+
+# ===== เดิมใช้กับ HTB (per-user guaranteed+ceiling) ตอนนี้เปลี่ยนไปใช้ CAKE (dual-dsthost/dual-srchost)
+# ซึ่งแบ่งแบนด์วิดท์แบบ fair-share อัตโนมัติต่อผู้ใช้ที่กำลัง active อยู่ ไม่ใช่ ceiling ตายตัวต่อคนแล้ว
+# ตัวแปรด้านล่างนี้จึงไม่ได้ถูกใช้ในการ shape จริงอีกต่อไป (เก็บไว้เผื่ออ้างอิง/ย้อนกลับไปใช้ HTB ในอนาคต)
 PER_USER_DOWN_MBIT=20
 PER_USER_UP_MBIT=20
 PER_USER_GUAR_MBIT=2
 HASH_DIVISOR=1024
 
-# MSS ของ IPv4 (MTU=1500 - 40 byte header - 20 byte กันชนสำหรับ overhead ของ tunnel)
-TCP_MSS_V4=1440
+# MSS ของ IPv4 (เผื่อกันชน overhead ของ tunnel มากขึ้น)
+TCP_MSS_V4=1360
 
 TCP_RMEM_DEFAULT=131072
 TCP_RMEM_MAX=2097152
@@ -148,9 +153,7 @@ EOF
 apt-get update -qq
 apt-get install -y ufw iptables conntrack ethtool iproute2 jq irqbalance rsyslog cmake build-essential git netcat-openbsd linux-modules-extra-$(uname -r) > /dev/null 2>&1 || true
 
-modprobe sch_htb 2>/dev/null || true
-modprobe sch_fq_codel 2>/dev/null || true
-modprobe cls_flow 2>/dev/null || true
+modprobe sch_cake 2>/dev/null || true
 modprobe cls_u32 2>/dev/null || true
 modprobe act_mirred 2>/dev/null || true
 modprobe ifb numifbs=1 2>/dev/null || true
@@ -462,16 +465,11 @@ source /etc/tunnel-qos.conf 2>/dev/null || true
 IFACE="${IFACE:-eth0}"
 DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-300}"
 UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-300}"
-PER_USER_DOWN_MBIT="${PER_USER_DOWN_MBIT:-20}"
-PER_USER_UP_MBIT="${PER_USER_UP_MBIT:-20}"
-PER_USER_GUAR_MBIT="${PER_USER_GUAR_MBIT:-2}"
-HASH_DIVISOR="${HASH_DIVISOR:-1024}"
+CAKE_OVERHEAD="${CAKE_OVERHEAD:-40}"
 TXQUEUELEN="${TXQUEUELEN:-10000}"
 
-# โหลด modules ที่จำเป็น
-modprobe sch_htb 2>/dev/null || true
-modprobe sch_fq_codel 2>/dev/null || true
-modprobe cls_flow 2>/dev/null || true
+# โหลด modules ที่จำเป็น (เปลี่ยนจาก HTB+fq_codel มาใช้ CAKE ล้วน)
+modprobe sch_cake 2>/dev/null || true
 modprobe cls_u32 2>/dev/null || true
 modprobe act_mirred 2>/dev/null || true
 modprobe ifb numifbs=1 2>/dev/null || true
@@ -484,24 +482,12 @@ tc qdisc del dev "$IFACE" root 2>/dev/null || true
 tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
 tc qdisc del dev ifb0 root 2>/dev/null || true
 
-DIV=$HASH_DIVISOR
-GUAR=$PER_USER_GUAR_MBIT
-BASE=16
-BASE_HEX=$(printf '%x' $BASE)
+# 1. Download Traffic Shaping (eth0, root/egress)
+# dual-dsthost = fair-share ต่อผู้ใช้ (แยกตาม dst host) + fair-share ต่อ flow ในตัวมันเอง
+# overhead = ชดเชย encapsulation ของ tunnel ให้ shaper คำนวณ rate ได้แม่นยำ ไม่เกิด bufferbloat
+tc qdisc add dev "$IFACE" root cake bandwidth "${DOWNLOAD_SHAPE_MBIT}mbit" besteffort dual-dsthost overhead "${CAKE_OVERHEAD}" mpu 64 2>/dev/null || true
 
-# 1. Download Traffic Shaping (eth0)
-tc qdisc add dev "$IFACE" root handle 1: htb default 1 2>/dev/null || true
-tc class add dev "$IFACE" parent 1: classid 1:1 htb rate "${DOWNLOAD_SHAPE_MBIT}mbit" ceil "${DOWNLOAD_SHAPE_MBIT}mbit" 2>/dev/null || true
-
-for i in $(seq 0 $((DIV-1))); do
-  MINOR=$(printf '%x' $((BASE+i)))
-  HANDLE=$(printf '%x' $((0x2000+i)))
-  tc class add dev "$IFACE" parent 1:1 classid 1:"$MINOR" htb rate "${GUAR}mbit" ceil "${PER_USER_DOWN_MBIT}mbit" quantum 1514 prio 1 2>/dev/null || true
-  tc qdisc add dev "$IFACE" parent 1:"$MINOR" handle "$HANDLE": fq_codel target 3ms interval 40ms ecn 2>/dev/null || true
-done
-tc filter add dev "$IFACE" parent 1: protocol ip prio 1 handle 1 flow hash keys dst divisor "$DIV" baseclass 1:"$BASE_HEX" 2>/dev/null || true
-
-# 2. Upload Traffic Shaping (ifb0)
+# 2. Upload Traffic Shaping (ifb0, ผ่าน ingress redirect จาก eth0)
 if ip link show ifb0 >/dev/null 2>&1; then
   ip link set dev ifb0 up 2>/dev/null || true
   ip link set dev ifb0 txqueuelen "$TXQUEUELEN" 2>/dev/null || true
@@ -509,16 +495,8 @@ if ip link show ifb0 >/dev/null 2>&1; then
   tc qdisc add dev "$IFACE" handle ffff: ingress 2>/dev/null || true
   tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
 
-  tc qdisc add dev ifb0 root handle 1: htb default 1 2>/dev/null || true
-  tc class add dev ifb0 parent 1: classid 1:1 htb rate "${UPLOAD_SHAPE_MBIT}mbit" ceil "${UPLOAD_SHAPE_MBIT}mbit" 2>/dev/null || true
-
-  for i in $(seq 0 $((DIV-1))); do
-    MINOR=$(printf '%x' $((BASE+i)))
-    HANDLE=$(printf '%x' $((0x3000+i)))
-    tc class add dev ifb0 parent 1:1 classid 1:"$MINOR" htb rate "${GUAR}mbit" ceil "${PER_USER_UP_MBIT}mbit" quantum 1514 prio 1 2>/dev/null || true
-    tc qdisc add dev ifb0 parent 1:"$MINOR" handle "$HANDLE": fq_codel target 3ms interval 40ms ecn 2>/dev/null || true
-  done
-  tc filter add dev ifb0 parent 1: protocol ip prio 1 handle 1 flow hash keys src divisor "$DIV" baseclass 1:"$BASE_HEX" 2>/dev/null || true
+  # dual-srchost = fair-share ต่อผู้ใช้บนขาอัปโหลด (แยกตาม src host)
+  tc qdisc add dev ifb0 root cake bandwidth "${UPLOAD_SHAPE_MBIT}mbit" besteffort dual-srchost overhead "${CAKE_OVERHEAD}" mpu 64 2>/dev/null || true
 fi
 
 exit 0
@@ -527,7 +505,7 @@ chmod +x /usr/local/sbin/qos-root-init.sh
 
 cat > /etc/systemd/system/tunnel-shaper.service << 'EOF'
 [Unit]
-Description=Low-latency Per-User Rate Limiter QoS (HTB + FQ_CoDel)
+Description=Low-latency Per-User Fair-Share QoS (CAKE)
 After=network-online.target set-multiqueue.service
 Wants=network-online.target
 
@@ -604,8 +582,8 @@ CUR_MTU=$(cat /sys/class/net/"${IFACE}"/mtu 2>/dev/null || echo 0)
 [ "$CUR_MTU" != "$TUNNEL_MTU" ] && ip link set dev "${IFACE}" mtu "$TUNNEL_MTU" 2>/dev/null || true
 
 QDISC_OK=1
-tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc htb" || QDISC_OK=0
-tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc htb" || QDISC_OK=0
+tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc cake" || QDISC_OK=0
+tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc cake" || QDISC_OK=0
 [ "$QDISC_OK" -eq 0 ] && /usr/local/sbin/qos-root-init.sh >/dev/null 2>&1
 
 /usr/local/sbin/set-multiqueue.sh >/dev/null 2>&1
@@ -841,6 +819,6 @@ systemctl restart ssh 2>/dev/null || true
 
 echo ""
 echo "=================================================="
-echo -e "${GREEN}ปรับแต่งระบบสำเร็จ | Tunnel Pipeline: ${DOWNLOAD_SHAPE_MBIT}Mbit↓ / ${UPLOAD_SHAPE_MBIT}Mbit↑ | Per-User: ${PER_USER_DOWN_MBIT}Mbit↓ / ${PER_USER_UP_MBIT}Mbit↑ | MSS(v4)=${TCP_MSS_V4} | IPv6=DISABLED (sysctl+ufw+grub)${NC}"
+echo -e "${GREEN}ปรับแต่งระบบสำเร็จ | Tunnel Pipeline: ${DOWNLOAD_SHAPE_MBIT}Mbit↓ / ${UPLOAD_SHAPE_MBIT}Mbit↑ (CAKE fair-share ต่อผู้ใช้ + overhead comp ${CAKE_OVERHEAD}byte) | MSS(v4)=${TCP_MSS_V4} | IPv6=DISABLED (sysctl+ufw+grub)${NC}"
 echo -e "${YELLOW}หมายเหตุ: ปิด IPv6 ผ่าน sysctl มีผลทันที ส่วนพารามิเตอร์ kernel (ipv6.disable=1 ใน GRUB) จะสมบูรณ์ 100% หลัง reboot เครื่องหนึ่งครั้ง${NC}"
 echo "=================================================="
