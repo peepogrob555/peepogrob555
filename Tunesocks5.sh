@@ -1,219 +1,245 @@
 #!/bin/bash
-set -e
-export DEBIAN_FRONTEND=noninteractive
+# ============================================================================
+# tunnel-stack-master.sh — สคริปต์รวมไฟล์เดียวจบ (v4.0)
+#
+# รวม 3 ไฟล์เดิมเข้าด้วยกัน + แก้บั๊กจริงที่เจอทั้งหมด:
+#   1) Tunesocks5.sh          (kernel/QoS/HTB tuning ตัวแรก)
+#   2) finalize-tunnel-stack_fixed.sh (ตัวเชื่อม/แก้ conflict รอบสอง)
+#   3) diagnose-htb-shaping.sh (ใช้หาสาเหตุ HTB พัง -> เจอสาเหตุจริงแล้ว แก้ในนี้เลย)
+#
+# ระบบเป้าหมาย: dropbear + danted(SOCKS5 TCP/UDP) + udp-custom (ติดตั้งจาก
+# smng/install-server.sh) — hev-socks5-tunnel คือแอปฝั่ง "ไคลเอนต์" (ในสกรีนช็อต)
+# ไม่ใช่ service บนเซิร์ฟเวอร์ จึงไม่มีการยุ่งกับมันในสคริปต์นี้อีกต่อไป
+#
+# บั๊กจริงที่แก้แล้วในไฟล์นี้ (สรุปสั้น เหตุผลละเอียดอยู่ในคอมเมนต์แต่ละจุด):
+#   [FIX-1] HASH_DIVISOR เดิม=16384 เกิน limit จริงของ kernel (u32 hash table
+#           ต้องเป็นเลขยกกำลัง 2 และ exponent ห้ามเกิน 8 => ค่าสูงสุดคือ 256)
+#           ทำให้ "tc filter ... divisor 16384" fail เงียบๆ มาตลอด (ของเดิม 2>/dev/null)
+#           เป็นสาเหตุตรงของ "HTB shaping: ไม่ทำงานบน eth0" — แก้เป็น 256 (ค่าสูงสุดที่ทำได้จริง)
+#   [FIX-2] ufw กับ nftables ทำงานพร้อมกัน -> nftables.service restart จะ
+#           "flush ruleset" ทั้งระบบ ล้างกฎ ufw ทิ้งแบบสุ่ม -> เป็นสาเหตุ "หลุดๆ ติดๆ" ที่พบบ่อยสุด
+#           แก้โดยปิด ufw ทิ้ง เหลือ nftables ตัวเดียว (มี safety-check ก่อนปิดเสมอ กันล็อกตัวเองออก)
+#   [FIX-3] sysctl 2 ไฟล์ชนกัน (99-smng-proxy.conf จาก install-server.sh
+#           vs 99-tunnel-optimize.conf จาก QoS script) ค่า rmem/wmem/backlog ไม่ตรงกัน
+#           แก้โดยรวมเป็นไฟล์เดียว /etc/sysctl.d/99-tunnel-final.conf แล้วลบไฟล์เก่าทิ้ง
+#   [FIX-4] watchdog 2 ตัวแย่งกัน restart service เดียวกัน (tunnel-watchdog + tunnel-selfheal)
+#           แก้โดยเหลือ tunnel-selfheal ตัวเดียว เช็คพอร์ตฟังจริง ไม่ใช่แค่ is-active
+#   [FIX-5] SOCKS5_SERVICES เดิมมี "hev-socks5-tunnel" ซึ่งไม่มีจริงบนเซิร์ฟเวอร์
+#           (เป็นแอปฝั่งไคลเอนต์) แก้เป็นรายชื่อ service จริงบนเครื่อง: dropbear danted udp-custom
+#   [FIX-6] ตัวเลขสเปค (RAM/CPU) เดิม hardcode 6144MB/4vCPU ในสคริปต์ตัวแรก
+#           แก้เป็นอ่านจากเครื่องจริงเสมอ (/proc/meminfo, nproc)
+#
+# ระบบคำนวณสเปค (ใหม่ตามที่ขอ): 1 vCPU รองรับได้สูงสุด 25 คน
+#   เช่น 4 vCPU -> รองรับได้จริง 100 คน (ปรับ CAPACITY_PER_VCPU ด้านล่างได้ถ้าอยากเปลี่ยนสัดส่วน)
+#   ตัวเลข "สเปคเน็ต" (ขนาด pool แบนด์วิดท์ PIPE_BYTES) คงค่าเดิมตายตัวตามไฟล์ต้นฉบับ
+#   ไม่ได้ปรับตาม RAM/CPU — ปรับแค่สิ่งที่ควรปรับตามสเปคจริง (conntrack, per-user guarantee,
+#   ค่าที่ผูกกับจำนวนคนสูงสุดที่รองรับได้)
+#
+# วิธีใช้:
+#   sudo bash tunnel-stack-master.sh              # รันทุกอย่าง (ปลอดภัยรันซ้ำได้ idempotent)
+#   sudo bash tunnel-stack-master.sh --check-only  # ไม่แก้อะไร แค่พิมพ์ผลตรวจสุขภาพ/conflict
+# ============================================================================
+set -uo pipefail
+[ "$EUID" -ne 0 ] && { echo "ต้องรันด้วย root: sudo bash $0"; exit 1; }
 
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; NC='\033[0m'
+G='\033[0;32m'; Y='\033[1;33m'; R='\033[0;31m'; C='\033[0;36m'; NC='\033[0m'
+ok(){ echo -e "${G}  ✓ $1${NC}"; }
+warn(){ echo -e "${Y}  ! $1${NC}"; }
+bad(){ echo -e "${R}  ✗ $1${NC}"; }
+step(){ echo -e "\n${C}== $1 ==${NC}"; }
 
-TOTAL_RAM_MB=6144
-NCPU=4
+CHECK_ONLY=0
+[ "${1:-}" = "--check-only" ] && CHECK_ONLY=1
 
-RTT_MS=65
-TUNNEL_MTU=1500
-SWAP_GB=4
+UDP_DIR="/root/udp"
+UDP_CFG="${UDP_DIR}/config.json"
+SSHMGR_DB="/etc/ssh-manager/db"
+SOCKS5_PORT_FILE="/etc/ssh-manager/socks5-port"
+SOCKS5_CONF="/etc/danted.conf"
 
+# ============================================================================
+step "1/10 — อ่านสเปคเครื่องจริง + คำนวณความจุ (capacity calculator)"
+# ============================================================================
+# [FIX-6] ไม่มีเลข hardcode อีกต่อไป อ่านจากเครื่องจริงเสมอทุกครั้งที่รัน
+TOTAL_RAM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
+NCPU=$(nproc)
+IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
+[ -z "$IFACE" ] && IFACE=$(ip -o link show | awk -F': ' '$2!="lo"{print $2; exit}')
+if [ -z "$IFACE" ]; then bad "หา default network interface ไม่เจอ ยกเลิก"; exit 1; fi
+
+# ---- ตัวคำนวณความจุที่ขอ: 1 vCPU = 25 คน ----
+CAPACITY_PER_VCPU="${CAPACITY_PER_VCPU:-25}"
+MAX_CAPACITY_USERS=$(( NCPU * CAPACITY_PER_VCPU ))
+
+# จำนวนผู้ใช้จริงตอนนี้จาก smng db (ถ้ามี) — ใช้แค่ "แจ้งเตือน" ว่าเกินความจุออกแบบไว้หรือยัง
+# ไม่เอามาคำนวณ per-user guarantee โดยตรง เพราะถ้าใช้ค่าจากจำนวนคนจริงที่เปลี่ยนไปเรื่อยๆ
+# ค่า guarantee จะขยับทุกครั้งที่มีคนสมัคร/ลบ ทำให้ QoS "ไม่นิ่ง" — จึงคำนวณจาก "ความจุที่ออกแบบไว้"
+# (MAX_CAPACITY_USERS) แทน เพื่อความเสถียร ไม่ต้องคำนวณใหม่ทุกครั้งที่ผู้ใช้เปลี่ยน
+CURRENT_USERS=0
+if [ -f "$SSHMGR_DB" ]; then
+    CURRENT_USERS=$(wc -l < "$SSHMGR_DB" 2>/dev/null)
+elif [ -d "$SSHMGR_DB" ]; then
+    CURRENT_USERS=$(find "$SSHMGR_DB" -maxdepth 1 -type f 2>/dev/null | wc -l)
+fi
+CURRENT_USERS=$(printf '%s' "$CURRENT_USERS" | tr -cd '0-9')
+[ -z "$CURRENT_USERS" ] && CURRENT_USERS=0
+
+# ---- สเปคเน็ต: คงค่าเดิมตายตัวตามไฟล์ต้นฉบับ (ไม่ผูกกับ RAM/CPU) ----
+# ดึงจาก config.json ของ udp-custom ถ้ามี (single source of truth เหมือนเดิม) ไม่งั้น fallback ค่าเดิม
 PIPE_BYTES=39375000
+if [ -f "$UDP_CFG" ] && command -v jq >/dev/null 2>&1; then
+    JSON_BUF=$(jq -r '.stream_buffer // empty' "$UDP_CFG" 2>/dev/null)
+    [ -n "$JSON_BUF" ] && [ "$JSON_BUF" -gt 0 ] 2>/dev/null && PIPE_BYTES="$JSON_BUF"
+fi
 PIPE_MBIT=$(( PIPE_BYTES * 8 / 1000000 ))
 DOWNLOAD_SHAPE_MBIT=$PIPE_MBIT
 UPLOAD_SHAPE_MBIT=$PIPE_MBIT
+RTT_MS="${RTT_MS:-65}"
+TUNNEL_MTU="${TUNNEL_MTU:-1500}"
+TCP_MSS_V4="${TCP_MSS_V4:-1360}"
+SWAP_GB="${SWAP_GB:-4}"
+DNS_V4_A="${DNS_V4_A:-1.1.1.1}"
+DNS_V4_B="${DNS_V4_B:-8.8.8.8}"
 
-TCP_MSS_V4=1360
-
-BDP_BYTES=$(( PIPE_BYTES * RTT_MS / 1000 ))
-TCP_RMEM_MAX=$(( BDP_BYTES * 2 ))
-TCP_WMEM_MAX=$(( BDP_BYTES * 2 ))
-TCP_RMEM_DEFAULT=131072
-TCP_WMEM_DEFAULT=131072
-
-RAM_BYTES=$(( TOTAL_RAM_MB * 1024 * 1024 ))
-UDP_RMEM_MIN=262144
-UDP_WMEM_MIN=262144
-UDP_MEM_MAX_BYTES=$(( RAM_BYTES * 5 / 100 ))
-UDP_MEM_PRESSURE_BYTES=$(( UDP_MEM_MAX_BYTES * 3 / 4 ))
-UDP_MEM_MIN_BYTES=$(( UDP_MEM_MAX_BYTES / 8 ))
-
-NF_CONNTRACK_MAX=1000000
-NF_CONNTRACK_HASHSIZE=250000
-NF_CONNTRACK_UDP_TIMEOUT=10
-NF_CONNTRACK_UDP_TIMEOUT_STREAM=120
-NF_CONNTRACK_TCP_TIMEOUT_ESTABLISHED=3600
-
-NETDEV_MAX_BACKLOG=65536
-NETDEV_BUDGET=1000
-NETDEV_BUDGET_USECS=3000
-RPS_SOCK_FLOW_ENTRIES=65536
-SOMAXCONN=65535
-TCP_MAX_SYN_BACKLOG=65535
-TCP_RETRIES2=8
-TCP_SYN_RETRIES=4
-TCP_FIN_TIMEOUT=12
-IP_LOCAL_PORT_RANGE_LOW=1024
-IP_LOCAL_PORT_RANGE_HIGH=65535
-TCP_MAX_TW_BUCKETS=2000000
-
-FILE_MAX=2097152
-VM_MIN_FREE_KB=125829
-
-JOURNAL_MAX_RETENTION=1d
-JOURNAL_DISK_MAX_MB=4096
-DAILY_CLEAR_TIME=00:00:00
-CLEAR_TIMEZONE=Asia/Bangkok
-
-TXQUEUELEN=10000
-SELFHEAL_INTERVAL_SEC=10
-HEALTHCHECK_FAIL_STREAK_LIMIT=3
-
-HASH_DIVISOR=16384
-TARGET_USERS=100
-PER_USER_GUAR_KBIT=$(( PIPE_MBIT * 1000 / TARGET_USERS ))
-PER_USER_CEIL_MBIT=20
-
-SOCKS5_SERVICES="danted hev-socks5-tunnel"
-RESERVE_LAST_CPU_FOR_PROXY=1
-
-if [ "$EUID" -ne 0 ]; then
-  echo -e "${RED}เธ•เนเธญเธเธฃเธฑเธเธ”เนเธงเธข root: sudo bash $0${NC}"
-  exit 1
+# ---- [FIX-1] HASH_DIVISOR: ค่าสูงสุดจริงของ u32 hash table คือ 256 (2^8) ----
+# เดิมตั้ง 16384 (2^14) ซึ่งเกิน limit ของ kernel (tc-u32(8): "must be a power of
+# two with exponent not exceeding eight") -> tc filter ... divisor 16384 fail
+# ทุกครั้งแบบเงียบๆ (ของเดิม 2>/dev/null || true) ทำให้ HTB shaping ไม่เคยทำงานจริงเลย
+HASH_DIVISOR=256
+if [ "$MAX_CAPACITY_USERS" -gt "$HASH_DIVISOR" ]; then
+    warn "ความจุที่ออกแบบ (${MAX_CAPACITY_USERS} คน) มากกว่าจำนวน hash bucket สูงสุดที่ kernel รองรับ (256)"
+    warn "ผู้ใช้จะยัง shaping ได้ปกติ แต่หลายคนอาจ hash ตกบักเก็ตเดียวกัน (แชร์ guarantee กัน) เมื่อคนเกิน 256"
 fi
 
-IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
-if [ -z "$IFACE" ]; then
-  echo -e "${RED}เธซเธฒ default interface เนเธกเนเน€เธเธญ เธขเธเน€เธฅเธดเธ${NC}"
-  exit 1
-fi
+# per-user guarantee: คำนวณจาก "ความจุที่ออกแบบไว้" ไม่ใช่จำนวนคนจริงตอนนี้ (เพื่อความเสถียร)
+PER_USER_GUAR_KBIT=$(( PIPE_MBIT * 1000 / MAX_CAPACITY_USERS ))
+[ "$PER_USER_GUAR_KBIT" -lt 256 ] && PER_USER_GUAR_KBIT=256
+PER_USER_CEIL_MBIT="${PER_USER_CEIL_MBIT:-20}"
 
+# conntrack: ผูกกับความจุที่ออกแบบไว้ (ไม่ใช่จำนวนคนจริง) กันรีคำนวณสลับไปมา
+NF_CONNTRACK_MAX=$(( MAX_CAPACITY_USERS * 4000 ))
+[ "$NF_CONNTRACK_MAX" -lt 131072 ] && NF_CONNTRACK_MAX=131072
+[ "$NF_CONNTRACK_MAX" -gt 2000000 ] && NF_CONNTRACK_MAX=2000000
+NF_CONNTRACK_HASHSIZE=$(( NF_CONNTRACK_MAX / 4 ))
+
+RESERVE_LAST_CPU_FOR_PROXY="${RESERVE_LAST_CPU_FOR_PROXY:-1}"
 APP_CPU=-1
-if [ "$RESERVE_LAST_CPU_FOR_PROXY" -eq 1 ] && [ "$NCPU" -ge 3 ]; then
-  APP_CPU=$((NCPU-1))
+if [ "$RESERVE_LAST_CPU_FOR_PROXY" -eq 1 ] && [ "$NCPU" -ge 3 ]; then APP_CPU=$((NCPU-1)); fi
+PROXY_CPU_RANGE=""
+[ "$NCPU" -ge 3 ] && PROXY_CPU_RANGE="0-$((NCPU-2))"
+
+ok "RAM=${TOTAL_RAM_MB}MB  vCPU=${NCPU}  IFACE=${IFACE}"
+ok "ความจุออกแบบไว้ = ${NCPU} vCPU x ${CAPACITY_PER_VCPU} คน/vCPU = ${MAX_CAPACITY_USERS} คนสูงสุด  (ผู้ใช้จริงตอนนี้ใน smng: ${CURRENT_USERS} คน)"
+[ "$CURRENT_USERS" -gt "$MAX_CAPACITY_USERS" ] && bad "ผู้ใช้จริง (${CURRENT_USERS}) เกินความจุที่สเปครองรับ (${MAX_CAPACITY_USERS}) แล้ว! ควรอัพ vCPU หรือลดผู้ใช้"
+ok "Pool แบนด์วิดท์ = ${DOWNLOAD_SHAPE_MBIT}Mbit (คงค่าเดิม ไม่ผูกกับสเปคเครื่อง) | guarantee/user = ${PER_USER_GUAR_KBIT}kbit | ceil/user = ${PER_USER_CEIL_MBIT}mbit"
+ok "conntrack = ${NF_CONNTRACK_MAX} (ผูกกับความจุออกแบบ ${MAX_CAPACITY_USERS} คน x 4000)"
+
+if [ "$CHECK_ONLY" -eq 1 ]; then
+    echo -e "\n${Y}--check-only: ข้ามไปตรวจสุขภาพระบบทันที (ไม่แก้ไขอะไร)${NC}"
 fi
-if [ "$APP_CPU" -ge 0 ]; then
-  PROXY_CPU_RANGE="0-$((NCPU-2))"
+
+# ============================================================================
+step "2/10 — ติดตั้งแพ็กเกจ/kernel module ที่จำเป็น"
+# ============================================================================
+if [ "$CHECK_ONLY" -eq 0 ]; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -qq
+    apt-get install -y iptables conntrack ethtool iproute2 jq irqbalance rsyslog \
+        netcat-openbsd nftables dropbear dante-server curl coreutils zip unzip \
+        "linux-modules-extra-$(uname -r)" > /dev/null 2>&1 || true
+
+    for m in sch_fq_codel sch_htb cls_u32 act_mirred ifb tcp_bbr; do
+        modprobe "$m" 2>/dev/null || true
+    done
+    echo "tcp_bbr" > /etc/modules-load.d/tunnel.conf
+    echo "ifb numifbs=1" > /etc/modules-load.d/ifb.conf
+    ok "แพ็กเกจ/module พร้อมใช้งาน"
 else
-  PROXY_CPU_RANGE=""
+    ok "(ข้าม — check-only)"
 fi
 
-DNS_V4_A="1.1.1.1"; DNS_V4_B="8.8.8.8"
+# ============================================================================
+step "3/10 — [FIX-2] เคลียร์ ufw กับ nftables ที่ชนกัน (สาเหตุ 'หลุดสุ่ม' หลักที่สุด)"
+# ============================================================================
+UFW_ACTIVE=0
+systemctl is-active ufw >/dev/null 2>&1 && UFW_ACTIVE=1
+systemctl is-enabled ufw >/dev/null 2>&1 && UFW_ACTIVE=1
 
-echo "SPEC: RAM=${TOTAL_RAM_MB}MB vCPU=${NCPU} | IFACE=${IFACE} | MTU=${TUNNEL_MTU} | Pool=${DOWNLOAD_SHAPE_MBIT}/${UPLOAD_SHAPE_MBIT} Mbps (${PIPE_BYTES} B/s) | Per-user cap=${PER_USER_CEIL_MBIT}Mbit (guar ${PER_USER_GUAR_KBIT}kbit) | MSS=${TCP_MSS_V4}"
-
-if grep -qm1 aes /proc/cpuinfo 2>/dev/null; then
-  echo -e "${GREEN}AES-NI: เธเธฃเนเธญเธกเนเธเนเธเธฒเธ${NC}"
-else
-  echo -e "${YELLOW}AES-NI: เนเธกเนเธเธ flag เนเธ /proc/cpuinfo${NC}"
-fi
-
-cat > /etc/tunnel-qos.conf << EOF
-IFACE=${IFACE}
-DOWNLOAD_SHAPE_MBIT=${DOWNLOAD_SHAPE_MBIT}
-UPLOAD_SHAPE_MBIT=${UPLOAD_SHAPE_MBIT}
-RTT_MS=${RTT_MS}
-TUNNEL_MTU=${TUNNEL_MTU}
-DNS_V4_A=${DNS_V4_A}
-DNS_V4_B=${DNS_V4_B}
-NCPU=${NCPU}
-APP_CPU=${APP_CPU}
-TXQUEUELEN=${TXQUEUELEN}
-HEALTHCHECK_FAIL_STREAK_LIMIT=${HEALTHCHECK_FAIL_STREAK_LIMIT}
-SOCKS5_SERVICES="${SOCKS5_SERVICES}"
-HASH_DIVISOR=${HASH_DIVISOR}
-PER_USER_GUAR_KBIT=${PER_USER_GUAR_KBIT}
-PER_USER_CEIL_MBIT=${PER_USER_CEIL_MBIT}
-EOF
-
-apt-get update -qq
-apt-get install -y ufw iptables conntrack ethtool iproute2 jq irqbalance rsyslog netcat-openbsd linux-modules-extra-$(uname -r) > /dev/null 2>&1 || true
-
-modprobe sch_fq_codel 2>/dev/null || true
-modprobe sch_htb 2>/dev/null || true
-modprobe act_mirred 2>/dev/null || true
-modprobe ifb numifbs=1 2>/dev/null || true
-modprobe tcp_bbr 2>/dev/null || true
-echo "tcp_bbr" > /etc/modules-load.d/tunnel.conf
-
-if [ "$APP_CPU" -ge 0 ]; then
-  mkdir -p /etc/default
-  if [ -f /etc/default/irqbalance ]; then
-    sed -i '/^IRQBALANCE_BANNED_CPULIST=/d' /etc/default/irqbalance
-  fi
-  echo "IRQBALANCE_BANNED_CPULIST=${APP_CPU}" >> /etc/default/irqbalance
-fi
-systemctl enable --now irqbalance > /dev/null 2>&1 || true
-systemctl restart irqbalance > /dev/null 2>&1 || true
-
-ZRAM_ACTIVE=0
-swapon --show=NAME --noheadings 2>/dev/null | grep -q '^/dev/zram' && ZRAM_ACTIVE=1
-
-if ! swapon --show | grep -qv '^/dev/zram' 2>/dev/null; then
-  AVAIL_KB=$(df --output=avail -k / | tail -1)
-  NEED_KB=$(( SWAP_GB * 1024 * 1024 ))
-  if [ "$AVAIL_KB" -gt "$((NEED_KB + 2097152))" ]; then
-    fallocate -l "${SWAP_GB}G" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=$((SWAP_GB*1024)) status=none
-    chmod 600 /swapfile
-    mkswap /swapfile > /dev/null
-    if [ "$ZRAM_ACTIVE" -eq 1 ]; then
-      swapon -p 0 /swapfile
-      grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw,pri=0 0 0' >> /etc/fstab
+if [ "$UFW_ACTIVE" -eq 1 ]; then
+    if [ "$CHECK_ONLY" -eq 1 ]; then
+        bad "ufw ยังทำงานอยู่คู่กับ nftables -> เสี่ยงพอร์ตหลุดสุ่มตอน nftables restart (flush ruleset ล้าง ufw ด้วย)"
     else
-      swapon /swapfile
-      grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
+        warn "เจอ ufw ทำงานอยู่คู่กับ nftables -> จะปิด ufw เหลือ nftables ตัวเดียว"
+        # อ่านพอร์ตจริงก่อนปิด ufw กันล็อกตัวเองออกจากเครื่อง (safety-check เหมือน finalize script เดิม)
+        DROPBEAR_PORT=$(grep -oP 'DROPBEAR_PORT=\K[0-9]+' /etc/default/dropbear 2>/dev/null); [ -z "$DROPBEAR_PORT" ] && DROPBEAR_PORT=2345
+        SOCKS5_PORT=$(cat "$SOCKS5_PORT_FILE" 2>/dev/null); [ -z "$SOCKS5_PORT" ] && SOCKS5_PORT=1080
+        UDP_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CFG" 2>/dev/null); [ -z "$UDP_PORT" ] && UDP_PORT=36712
+
+        [ -f /etc/nftables.conf ] || cat > /etc/nftables.conf << 'NFTEOF'
+#!/usr/sbin/nft -f
+flush ruleset
+table inet filter {
+    set blocked_tcp { type inet_service; flags interval; }
+    set blocked_udp { type inet_service; flags interval; }
+    chain input {
+        type filter hook input priority 0; policy accept;
+        ct state established,related accept
+        iif "lo" accept
+        tcp dport @blocked_tcp drop
+        udp dport @blocked_udp drop
+    }
+    chain forward { type filter hook forward priority 0; policy accept; }
+    chain output  { type filter hook output priority 0; policy accept; }
+}
+NFTEOF
+        cp /etc/nftables.conf "/etc/nftables.conf.bak.$(date +%s)"
+        SAFE=1
+        if ! grep -q 'tunnel-stack-master-safety' /etc/nftables.conf; then
+            TMP_NFT=$(mktemp)
+            cp /etc/nftables.conf "$TMP_NFT"
+            sed -i "/chain input {/a\\        tcp dport { ${DROPBEAR_PORT}, ${SOCKS5_PORT} } accept comment \"tunnel-stack-master-safety\"\\n        udp dport ${UDP_PORT} accept comment \"tunnel-stack-master-safety\"" "$TMP_NFT"
+            if nft -c -f "$TMP_NFT" >/dev/null 2>&1; then
+                cp "$TMP_NFT" /etc/nftables.conf
+            else
+                bad "nftables.conf ใหม่ syntax ผิด -> จะไม่ปิด ufw รอบนี้ กันล็อกตัวเองออก"
+                SAFE=0
+            fi
+            rm -f "$TMP_NFT"
+        fi
+        if [ "$SAFE" -eq 1 ] && nft -c -f /etc/nftables.conf >/dev/null 2>&1 && nft -f /etc/nftables.conf 2>/dev/null && systemctl restart nftables 2>/dev/null; then
+            systemctl enable nftables >/dev/null 2>&1
+            ufw --force disable >/dev/null 2>&1 || true
+            systemctl disable --now ufw >/dev/null 2>&1 || true
+            ok "ปิด ufw แล้ว — ยืนยันแล้วว่าพอร์ต dropbear(${DROPBEAR_PORT})/socks5(${SOCKS5_PORT})/udp-custom(${UDP_PORT}) ยัง accept อยู่ใน nftables"
+        else
+            bad "โหลด nftables.conf ไม่ผ่าน -> ไม่ปิด ufw รอบนี้ ตรวจมือ: nft -c -f /etc/nftables.conf"
+        fi
     fi
-  fi
-fi
-
-ufw --force reset > /dev/null
-if grep -q '^IPV6=' /etc/default/ufw; then
-  sed -i 's/^IPV6=.*/IPV6=no/' /etc/default/ufw
 else
-  echo 'IPV6=no' >> /etc/default/ufw
+    ok "ไม่มี ufw ทำงานอยู่แล้ว — nftables เป็นไฟร์วอลล์เดียว (ถูกต้องแล้ว)"
 fi
-ufw default deny incoming > /dev/null
-ufw default allow outgoing > /dev/null
-ufw default deny routed > /dev/null
-for p in 23 111 135 137 138 139 445 3389 6379 11211; do
-  ufw deny "${p}/tcp" > /dev/null
-done
-for p in 111 137 138 3389 11211; do
-  ufw deny "${p}/udp" > /dev/null
-done
-ufw allow 1:65535/tcp > /dev/null
-ufw allow 1:65535/udp > /dev/null
-ufw --force enable > /dev/null
 
-rm -f /etc/netplan/90-dns-override.yaml
-
-mkdir -p /etc/cloud/cloud.cfg.d
-cat > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg << 'EOF'
-network: {config: disabled}
+# ============================================================================
+step "4/10 — MTU / DNS / netplan cleanup"
+# ============================================================================
+if [ "$CHECK_ONLY" -eq 0 ]; then
+    ip link set dev "$IFACE" mtu "$TUNNEL_MTU" 2>/dev/null || true
+    cat > /etc/systemd/system/set-mtu.service << EOF
+[Unit]
+Description=Set tunnel MTU
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/sbin/ip link set dev ${IFACE} mtu ${TUNNEL_MTU}
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
 EOF
 
-for f in /etc/netplan/*.yaml; do
-  [ -f "$f" ] || continue
-  cp "$f" "${f}.bak.$(date +%s)"
-  ORIG_PERM=$(stat -c '%a' "$f" 2>/dev/null || echo 600)
-  awk '
-  {
-    match($0, /^[ ]*/); indent = RLENGTH
-    if (skip) {
-      if (indent > skip_indent) next
-      skip = 0
-    }
-    if ($0 ~ /^[ ]*nameservers:[ ]*$/) {
-      skip = 1
-      skip_indent = indent
-      next
-    }
-    print
-  }' "$f" > "${f}.tmp" && mv "${f}.tmp" "$f"
-  chmod "$ORIG_PERM" "$f" 2>/dev/null || true
-done
-
-sed -i \
-  -e 's/1\.0\.0\.1/8.8.8.8/g' \
-  -e 's/8\.8\.4\.4/1.1.1.1/g' \
-  /etc/netplan/*.yaml 2>/dev/null || true
-
-mkdir -p /etc/systemd/resolved.conf.d
-rm -rf /etc/systemd/resolved.conf.d/* 2>/dev/null
-cat > /etc/systemd/resolved.conf << EOF
+    mkdir -p /etc/systemd/resolved.conf.d
+    rm -rf /etc/systemd/resolved.conf.d/* 2>/dev/null
+    cat > /etc/systemd/resolved.conf << EOF
 [Resolve]
 DNS=${DNS_V4_A} ${DNS_V4_B}
 FallbackDNS=
@@ -224,95 +250,38 @@ MulticastDNS=no
 DNSSEC=no
 DNSOverTLS=no
 EOF
-
-command -v netplan >/dev/null 2>&1 && netplan apply 2>/dev/null || true
-systemctl restart systemd-resolved 2>/dev/null || true
-systemctl restart systemd-networkd 2>/dev/null || true
-
-ip link set dev "$IFACE" mtu "$TUNNEL_MTU" 2>/dev/null || true
-cat > /etc/systemd/system/set-mtu.service << EOF
-[Unit]
-Description=Set tunnel MTU
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/sbin/ip link set dev ${IFACE} mtu ${TUNNEL_MTU}
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-cat > /usr/local/sbin/set-multiqueue.sh << 'RUNTIME'
-#!/bin/bash
-source /etc/tunnel-qos.conf 2>/dev/null || true
-Q=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Combined:/ {print $2; exit}')
-if [ -n "$Q" ] && [ "$Q" -gt 1 ] 2>/dev/null && [ "$Q" != "$NCPU" ]; then
-  ethtool -L "$IFACE" combined "$NCPU" 2>/dev/null || true
+    systemctl restart systemd-resolved 2>/dev/null || true
+    systemctl daemon-reload
+    systemctl enable --now set-mtu.service >/dev/null 2>&1
+    ok "MTU=${TUNNEL_MTU} ตั้งค่าถาวรผ่าน systemd + DNS=${DNS_V4_A},${DNS_V4_B}"
+else
+    ok "(ข้าม — check-only)"
 fi
-ethtool -K "$IFACE" gro on gso on tso on 2>/dev/null || true
-RUNTIME
-chmod +x /usr/local/sbin/set-multiqueue.sh
 
-cat > /etc/systemd/system/set-multiqueue.service << 'EOF'
-[Unit]
-Description=Restore NIC multi-queue combined count across all vCPU after reboot
-After=network-online.target
-Wants=network-online.target
+# ============================================================================
+step "5/10 — [FIX-3] รวม sysctl เป็นไฟล์เดียว (ลบไฟล์เก่าที่ชนกันทิ้ง)"
+# ============================================================================
+# เดิม: 99-smng-proxy.conf (จาก install-server.sh, ค่า fix ตายตัว) VS
+#       99-tunnel-optimize.conf / 99-tunnel-stability.conf (จาก QoS scripts, ค่าคำนวณจาก BDP)
+# ชื่อไฟล์ทั้งคู่ขึ้นต้น "99-" โหลดตามลำดับตัวอักษร ค่าใครทับใครไม่ชัดเจน/เปราะบาง
+# แก้ให้เหลือไฟล์เดียว: /etc/sysctl.d/99-tunnel-final.conf เป็นเจ้าเดียวเท่านั้น
+if [ "$CHECK_ONLY" -eq 0 ]; then
+    rm -f /etc/sysctl.d/99-smng-proxy.conf /etc/sysctl.d/99-tunnel-optimize.conf /etc/sysctl.d/99-tunnel-stability.conf
 
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/set-multiqueue.sh
-RemainAfterExit=yes
+    BDP_BYTES=$(( PIPE_BYTES * RTT_MS / 1000 ))
+    TCP_RMEM_MAX=$(( BDP_BYTES * 2 ))
+    TCP_WMEM_MAX=$(( BDP_BYTES * 2 ))
+    RAM_BYTES=$(( TOTAL_RAM_MB * 1024 * 1024 ))
+    UDP_MEM_MAX_BYTES=$(( RAM_BYTES * 5 / 100 ))
+    UDP_MEM_PRESSURE_BYTES=$(( UDP_MEM_MAX_BYTES * 3 / 4 ))
+    UDP_MEM_MIN_BYTES=$(( UDP_MEM_MAX_BYTES / 8 ))
+    UDP_MEM_MIN_PAGES=$(( UDP_MEM_MIN_BYTES / 4096 ))
+    UDP_MEM_PRESSURE_PAGES=$(( UDP_MEM_PRESSURE_BYTES / 4096 ))
+    UDP_MEM_MAX_PAGES=$(( UDP_MEM_MAX_BYTES / 4096 ))
+    VM_MIN_FREE_KB=$(( TOTAL_RAM_MB * 1024 * 2 / 100 ))   # ~2% ของ RAM กันชน OOM ตอนโหลดสูง
 
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable --now set-multiqueue.service > /dev/null 2>&1
-
-cat > /usr/local/sbin/mss-clamp.sh << EOF
-#!/bin/bash
-MSS_V4=${TCP_MSS_V4}
-apply() {
-  local table="\$1" chain="\$2"; shift 2
-  iptables -t "\$table" -C "\$chain" "\$@" 2>/dev/null || iptables -t "\$table" -A "\$chain" "\$@"
-}
-apply mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V4"
-apply mangle OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V4"
-
-if command -v ip6tables >/dev/null 2>&1; then
-  ip6tables -t mangle -F FORWARD 2>/dev/null || true
-  ip6tables -t mangle -F OUTPUT 2>/dev/null || true
-fi
-EOF
-chmod +x /usr/local/sbin/mss-clamp.sh
-/usr/local/sbin/mss-clamp.sh
-
-cat > /etc/systemd/system/mss-clamp.service << EOF
-[Unit]
-Description=Clamp TCP MSS to fixed value (${TCP_MSS_V4}, IPv4 only)
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/mss-clamp.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable --now set-mtu.service mss-clamp.service > /dev/null 2>&1
-
-UDP_MEM_MIN_PAGES=$(( UDP_MEM_MIN_BYTES / 4096 ))
-UDP_MEM_PRESSURE_PAGES=$(( UDP_MEM_PRESSURE_BYTES / 4096 ))
-UDP_MEM_MAX_PAGES=$(( UDP_MEM_MAX_BYTES / 4096 ))
-
-cat > /etc/sysctl.d/99-tunnel-optimize.conf << EOF
+    cat > /etc/sysctl.d/99-tunnel-final.conf << EOF
+# สร้างโดย tunnel-stack-master.sh — ไฟล์เดียวจบ ห้ามสร้างไฟล์ 99-*.conf อื่นซ้ำอีก
 net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = fq_codel
 net.ipv4.ip_forward = 1
@@ -328,32 +297,32 @@ net.ipv4.tcp_syncookies = 1
 net.ipv4.tcp_keepalive_time = 45
 net.ipv4.tcp_keepalive_intvl = 5
 net.ipv4.tcp_keepalive_probes = 3
-net.ipv4.tcp_retries2 = ${TCP_RETRIES2}
-net.ipv4.tcp_syn_retries = ${TCP_SYN_RETRIES}
-net.ipv4.tcp_fin_timeout = ${TCP_FIN_TIMEOUT}
+net.ipv4.tcp_retries2 = 8
+net.ipv4.tcp_syn_retries = 4
+net.ipv4.tcp_fin_timeout = 12
 net.ipv4.tcp_tw_reuse = 1
-net.ipv4.tcp_max_tw_buckets = ${TCP_MAX_TW_BUCKETS}
-net.ipv4.ip_local_port_range = ${IP_LOCAL_PORT_RANGE_LOW} ${IP_LOCAL_PORT_RANGE_HIGH}
+net.ipv4.tcp_max_tw_buckets = 2000000
+net.ipv4.ip_local_port_range = 1024 65535
 net.core.rmem_max = ${TCP_RMEM_MAX}
 net.core.wmem_max = ${TCP_WMEM_MAX}
-net.core.rmem_default = ${TCP_RMEM_DEFAULT}
-net.core.wmem_default = ${TCP_WMEM_DEFAULT}
-net.ipv4.tcp_rmem = 4096 ${TCP_RMEM_DEFAULT} ${TCP_RMEM_MAX}
-net.ipv4.tcp_wmem = 4096 ${TCP_WMEM_DEFAULT} ${TCP_WMEM_MAX}
+net.core.rmem_default = 131072
+net.core.wmem_default = 131072
+net.ipv4.tcp_rmem = 4096 131072 ${TCP_RMEM_MAX}
+net.ipv4.tcp_wmem = 4096 131072 ${TCP_WMEM_MAX}
 net.ipv4.udp_mem = ${UDP_MEM_MIN_PAGES} ${UDP_MEM_PRESSURE_PAGES} ${UDP_MEM_MAX_PAGES}
-net.ipv4.udp_rmem_min = ${UDP_RMEM_MIN}
-net.ipv4.udp_wmem_min = ${UDP_WMEM_MIN}
-net.core.netdev_max_backlog = ${NETDEV_MAX_BACKLOG}
-net.core.netdev_budget = ${NETDEV_BUDGET}
-net.core.netdev_budget_usecs = ${NETDEV_BUDGET_USECS}
-net.core.rps_sock_flow_entries = ${RPS_SOCK_FLOW_ENTRIES}
-net.core.somaxconn = ${SOMAXCONN}
-net.ipv4.tcp_max_syn_backlog = ${TCP_MAX_SYN_BACKLOG}
+net.ipv4.udp_rmem_min = 262144
+net.ipv4.udp_wmem_min = 262144
+net.core.netdev_max_backlog = 65536
+net.core.netdev_budget = 1000
+net.core.netdev_budget_usecs = 3000
+net.core.rps_sock_flow_entries = 65536
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 65535
 net.netfilter.nf_conntrack_max = ${NF_CONNTRACK_MAX}
-net.netfilter.nf_conntrack_udp_timeout = ${NF_CONNTRACK_UDP_TIMEOUT}
-net.netfilter.nf_conntrack_udp_timeout_stream = ${NF_CONNTRACK_UDP_TIMEOUT_STREAM}
-net.netfilter.nf_conntrack_tcp_timeout_established = ${NF_CONNTRACK_TCP_TIMEOUT_ESTABLISHED}
-fs.file-max = ${FILE_MAX}
+net.netfilter.nf_conntrack_udp_timeout = 10
+net.netfilter.nf_conntrack_udp_timeout_stream = 120
+net.netfilter.nf_conntrack_tcp_timeout_established = 3600
+fs.file-max = 2097152
 vm.swappiness = 1
 vm.dirty_ratio = 10
 vm.dirty_background_ratio = 5
@@ -363,76 +332,87 @@ net.ipv6.conf.all.disable_ipv6 = 1
 net.ipv6.conf.default.disable_ipv6 = 1
 net.ipv6.conf.lo.disable_ipv6 = 1
 EOF
-echo "options nf_conntrack hashsize=${NF_CONNTRACK_HASHSIZE}" > /etc/modprobe.d/nf_conntrack.conf
-echo "$NF_CONNTRACK_HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+    echo "options nf_conntrack hashsize=${NF_CONNTRACK_HASHSIZE}" > /etc/modprobe.d/nf_conntrack.conf
+    echo "$NF_CONNTRACK_HASHSIZE" > /sys/module/nf_conntrack/parameters/hashsize 2>/dev/null || true
+    sysctl --system >/dev/null 2>&1
 
-if [ -f /etc/sysctl.conf ]; then
-  cp /etc/sysctl.conf "/etc/sysctl.conf.bak.$(date +%s)"
-  for key in net.ipv4.tcp_congestion_control net.core.default_qdisc net.ipv4.ip_forward \
-             net.core.rmem_max net.core.wmem_max net.core.rmem_default net.core.wmem_default \
-             net.ipv4.tcp_rmem net.ipv4.tcp_wmem net.ipv4.udp_mem net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min \
-             net.core.netdev_max_backlog net.core.netdev_budget net.core.netdev_budget_usecs net.core.somaxconn \
-             net.ipv4.tcp_max_syn_backlog net.core.rps_sock_flow_entries net.ipv4.tcp_frto \
-             net.ipv4.tcp_ecn net.ipv4.tcp_syncookies net.ipv4.tcp_keepalive_time \
-             net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes net.ipv4.tcp_retries2 net.ipv4.tcp_syn_retries \
-             net.ipv4.tcp_tw_reuse net.ipv4.tcp_max_tw_buckets net.ipv4.ip_local_port_range net.ipv4.tcp_fin_timeout \
-             vm.dirty_ratio vm.dirty_background_ratio vm.min_free_kbytes vm.overcommit_memory \
-             net.netfilter.nf_conntrack_max net.netfilter.nf_conntrack_udp_timeout \
-             net.netfilter.nf_conntrack_udp_timeout_stream net.netfilter.nf_conntrack_tcp_timeout_established \
-             fs.file-max vm.swappiness net.ipv4.tcp_notsent_lowat net.ipv4.tcp_autocorking \
-             net.ipv6.conf.all.disable_ipv6 net.ipv6.conf.default.disable_ipv6 net.ipv6.conf.lo.disable_ipv6; do
-    esc_key=$(printf '%s' "$key" | sed 's/\./\\./g')
-    sed -i -E "/^[[:space:]]*${esc_key}[[:space:]]*=/d" /etc/sysctl.conf
-  done
-fi
-
-sysctl --system > /dev/null 2>&1 || true
-
-if [ -f /etc/default/grub ]; then
-  cp /etc/default/grub "/etc/default/grub.bak.$(date +%s)"
-  if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
-    if ! grep -q 'ipv6.disable=1' /etc/default/grub; then
-      sed -i -E 's/^GRUB_CMDLINE_LINUX="(.*)"/GRUB_CMDLINE_LINUX="\1 ipv6.disable=1"/' /etc/default/grub
+    if [ -f /etc/default/grub ] && ! grep -q 'ipv6.disable=1' /etc/default/grub; then
+        cp /etc/default/grub "/etc/default/grub.bak.$(date +%s)"
+        if grep -q '^GRUB_CMDLINE_LINUX=' /etc/default/grub; then
+            sed -i -E 's/^GRUB_CMDLINE_LINUX="(.*)"/GRUB_CMDLINE_LINUX="\1 ipv6.disable=1"/' /etc/default/grub
+        else
+            echo 'GRUB_CMDLINE_LINUX="ipv6.disable=1"' >> /etc/default/grub
+        fi
+        (update-grub >/dev/null 2>&1 || grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1) || true
+        warn "แก้ GRUB (ipv6.disable=1) แล้ว — ต้อง reboot 1 ครั้งถึงจะสมบูรณ์ 100%"
     fi
-  else
-    echo 'GRUB_CMDLINE_LINUX="ipv6.disable=1"' >> /etc/default/grub
-  fi
-  (update-grub > /dev/null 2>&1 || grub2-mkconfig -o /boot/grub2/grub.cfg > /dev/null 2>&1) || true
+    ok "sysctl ไฟล์เดียว: conntrack=${NF_CONNTRACK_MAX}, rmem/wmem_max=${TCP_RMEM_MAX}B (BDP=${BDP_BYTES}B), vm.min_free_kbytes=${VM_MIN_FREE_KB}KB"
+else
+    ok "(ข้าม — check-only)"
 fi
 
-cat > /usr/local/sbin/set-thp-madvise.sh << 'RUNTIME'
+# ============================================================================
+step "6/10 — [FIX-1] HTB per-user shaping ด้วย divisor ที่ kernel รองรับจริง (256)"
+# ============================================================================
+if [ "$CHECK_ONLY" -eq 0 ]; then
+    cat > /usr/local/sbin/set-multiqueue.sh << 'RUNTIME'
 #!/bin/bash
-[ -f /sys/kernel/mm/transparent_hugepage/enabled ] && echo madvise > /sys/kernel/mm/transparent_hugepage/enabled 2>/dev/null || true
-[ -f /sys/kernel/mm/transparent_hugepage/defrag ]  && echo madvise > /sys/kernel/mm/transparent_hugepage/defrag 2>/dev/null || true
+source /etc/tunnel-qos.conf 2>/dev/null || true
+Q=$(ethtool -l "$IFACE" 2>/dev/null | awk '/Combined:/ {print $2; exit}')
+if [ -n "$Q" ] && [ "$Q" -gt 1 ] 2>/dev/null && [ "$Q" != "$NCPU" ]; then
+  ethtool -L "$IFACE" combined "$NCPU" 2>/dev/null || true
+fi
+ethtool -K "$IFACE" gro on gso on tso on 2>/dev/null || true
 RUNTIME
-chmod +x /usr/local/sbin/set-thp-madvise.sh
-
-cat > /etc/systemd/system/set-thp-madvise.service << 'EOF'
+    chmod +x /usr/local/sbin/set-multiqueue.sh
+    cat > /etc/systemd/system/set-multiqueue.service << 'EOF'
 [Unit]
-Description=Keep THP in madvise mode
-After=multi-user.target
-
+Description=Restore NIC multi-queue combined count across all vCPU after reboot
+After=network-online.target
+Wants=network-online.target
 [Service]
 Type=oneshot
-ExecStart=/usr/local/sbin/set-thp-madvise.sh
+ExecStart=/usr/local/sbin/set-multiqueue.sh
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now set-thp-madvise.service > /dev/null 2>&1
 
-cat > /usr/local/sbin/qos-root-init.sh << 'RUNTIME'
+    cat > /usr/local/sbin/mss-clamp.sh << EOF
+#!/bin/bash
+MSS_V4=${TCP_MSS_V4}
+apply() {
+  local table="\$1" chain="\$2"; shift 2
+  iptables -t "\$table" -C "\$chain" "\$@" 2>/dev/null || iptables -t "\$table" -A "\$chain" "\$@"
+}
+apply mangle FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V4"
+apply mangle OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "\$MSS_V4"
+EOF
+    chmod +x /usr/local/sbin/mss-clamp.sh
+    cat > /etc/systemd/system/mss-clamp.service << EOF
+[Unit]
+Description=Clamp TCP MSS (${TCP_MSS_V4}, IPv4 only)
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/mss-clamp.sh
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # qos-root-init.sh: สร้าง HTB จริง — [FIX-1] ใช้ HASH_DIVISOR=256 ที่ kernel รับได้จริง
+    # ไม่ปิด stderr อีกต่อไปสำหรับคำสั่งสร้าง qdisc/filter หลัก เพื่อให้เห็น error จริงถ้าพังอีก
+    cat > /usr/local/sbin/qos-root-init.sh << 'RUNTIME'
 #!/bin/bash
 source /etc/tunnel-qos.conf 2>/dev/null || true
-
 IFACE="${IFACE:-eth0}"
 DOWNLOAD_SHAPE_MBIT="${DOWNLOAD_SHAPE_MBIT:-315}"
 UPLOAD_SHAPE_MBIT="${UPLOAD_SHAPE_MBIT:-315}"
 TXQUEUELEN="${TXQUEUELEN:-10000}"
-HASH_DIVISOR="${HASH_DIVISOR:-16384}"
-PER_USER_GUAR_KBIT="${PER_USER_GUAR_KBIT:-3150}"
+HASH_DIVISOR="${HASH_DIVISOR:-256}"
+PER_USER_GUAR_KBIT="${PER_USER_GUAR_KBIT:-1000}"
 PER_USER_CEIL_MBIT="${PER_USER_CEIL_MBIT:-20}"
 
 modprobe sch_fq_codel 2>/dev/null || true
@@ -442,16 +422,13 @@ modprobe act_mirred 2>/dev/null || true
 modprobe ifb numifbs=1 2>/dev/null || true
 
 ip link set dev "$IFACE" txqueuelen "$TXQUEUELEN" 2>/dev/null || true
-
 tc qdisc del dev "$IFACE" root 2>/dev/null || true
 tc qdisc del dev "$IFACE" ingress 2>/dev/null || true
 tc qdisc del dev ifb0 root 2>/dev/null || true
 
 build_per_user_htb() {
   local dev="$1" total_mbit="$2" match_field="$3"
-  local batch
-  batch=$(mktemp)
-
+  local batch; batch=$(mktemp)
   {
     echo "qdisc add dev $dev root handle 1: htb default 2"
     echo "class add dev $dev parent 1: classid 1:1 htb rate ${total_mbit}mbit ceil ${total_mbit}mbit"
@@ -459,7 +436,6 @@ build_per_user_htb() {
     echo "qdisc add dev $dev parent 1:2 handle 20: fq_codel limit 10240 flows 1024 target 4ms interval 100ms quantum 1514 ecn"
     echo "filter add dev $dev parent 1: protocol ip prio 1 u32 divisor ${HASH_DIVISOR}"
     echo "filter add dev $dev parent 1: protocol ip prio 1 u32 match ip ${match_field} 0.0.0.0/0 hashkey mask 0x0000ffff at 16 link 8:"
-
     for ((i = 0; i < HASH_DIVISOR; i++)); do
       hexid=$(printf '%x' $((0x100 + i)))
       echo "class add dev $dev parent 1:1 classid 1:${hexid} htb rate ${PER_USER_GUAR_KBIT}kbit ceil ${PER_USER_CEIL_MBIT}mbit burst 15k cburst 30k"
@@ -468,7 +444,10 @@ build_per_user_htb() {
     done
   } > "$batch"
 
-  tc -force -batch "$batch" 2>/dev/null || true
+  # ไม่ปิด stderr ของ batch หลัก — ถ้า divisor เกิน limit อีกในอนาคตจะเห็น error ทันที ไม่เงียบเหมือนเดิม
+  if ! tc -force -batch "$batch"; then
+    logger -t qos-root-init "tc batch มี error บางบรรทัดบน ${dev} — เช็ค: tc -force -batch ${batch} (ไฟล์ถูกลบแล้ว รันใหม่ด้วย qos-root-init.sh เพื่อดู error สด)"
+  fi
   rm -f "$batch"
 }
 
@@ -477,86 +456,208 @@ build_per_user_htb "$IFACE" "$DOWNLOAD_SHAPE_MBIT" "dst"
 if ip link show ifb0 >/dev/null 2>&1; then
   ip link set dev ifb0 up 2>/dev/null || true
   ip link set dev ifb0 txqueuelen "$TXQUEUELEN" 2>/dev/null || true
-
   tc qdisc add dev "$IFACE" handle ffff: ingress 2>/dev/null || true
   tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
-
   build_per_user_htb ifb0 "$UPLOAD_SHAPE_MBIT" "src"
 fi
-
 exit 0
 RUNTIME
-chmod +x /usr/local/sbin/qos-root-init.sh
+    chmod +x /usr/local/sbin/qos-root-init.sh
 
-cat > /etc/systemd/system/tunnel-shaper.service << 'EOF'
+    cat > /etc/systemd/system/tunnel-shaper.service << 'EOF'
 [Unit]
-Description=Per-user hashed HTB shaping (guar 2mbit / ceil 20mbit) with fq_codel AQM, 315mbit shared pool
+Description=Per-user hashed HTB shaping with fq_codel AQM
 After=network-online.target set-multiqueue.service
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/qos-root-init.sh
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now tunnel-shaper.service > /dev/null 2>&1
-systemctl restart tunnel-shaper.service
-
-cat > /usr/local/sbin/set-rps.sh << 'RUNTIME'
+    cat > /usr/local/sbin/set-rps.sh << 'RUNTIME'
 #!/bin/bash
 source /etc/tunnel-qos.conf 2>/dev/null || true
 FULL_MASK=$(( (1 << NCPU) - 1 ))
-if [ -n "$APP_CPU" ] && [ "$APP_CPU" -ge 0 ] 2>/dev/null; then
+if [ -n "${APP_CPU:-}" ] && [ "$APP_CPU" -ge 0 ] 2>/dev/null; then
   RPS_MASK_DEC=$(( FULL_MASK & ~(1 << APP_CPU) ))
   [ "$RPS_MASK_DEC" -eq 0 ] && RPS_MASK_DEC=$FULL_MASK
 else
   RPS_MASK_DEC=$FULL_MASK
 fi
 MASK=$(printf '%x' "$RPS_MASK_DEC")
-for rx in /sys/class/net/"${IFACE}"/queues/rx-*/rps_cpus; do
-  [ -e "$rx" ] && echo "$MASK" > "$rx" 2>/dev/null || true
+for path in /sys/class/net/"${IFACE}"/queues/rx-*/rps_cpus /sys/class/net/ifb0/queues/rx-*/rps_cpus; do
+  [ -e "$path" ] && echo "$MASK" > "$path" 2>/dev/null || true
 done
-for rx in /sys/class/net/ifb0/queues/rx-*/rps_cpus; do
-  [ -e "$rx" ] && echo "$MASK" > "$rx" 2>/dev/null || true
+for path in /sys/class/net/"${IFACE}"/queues/rx-*/rps_flow_cnt /sys/class/net/ifb0/queues/rx-*/rps_flow_cnt; do
+  [ -e "$path" ] && echo 4096 > "$path" 2>/dev/null || true
 done
-for rf in /sys/class/net/"${IFACE}"/queues/rx-*/rps_flow_cnt; do
-  [ -e "$rf" ] && echo 4096 > "$rf" 2>/dev/null || true
-done
-for rf in /sys/class/net/ifb0/queues/rx-*/rps_flow_cnt; do
-  [ -e "$rf" ] && echo 4096 > "$rf" 2>/dev/null || true
-done
-for tx in /sys/class/net/"${IFACE}"/queues/tx-*/xps_cpus; do
-  [ -e "$tx" ] && echo "$MASK" > "$tx" 2>/dev/null || true
-done
-for tx in /sys/class/net/ifb0/queues/tx-*/xps_cpus; do
-  [ -e "$tx" ] && echo "$MASK" > "$tx" 2>/dev/null || true
+for path in /sys/class/net/"${IFACE}"/queues/tx-*/xps_cpus /sys/class/net/ifb0/queues/tx-*/xps_cpus; do
+  [ -e "$path" ] && echo "$MASK" > "$path" 2>/dev/null || true
 done
 RUNTIME
-chmod +x /usr/local/sbin/set-rps.sh
+    chmod +x /usr/local/sbin/set-rps.sh
 
-cat > /etc/systemd/system/set-rps.service << 'EOF'
+    cat > /etc/systemd/system/set-rps.service << 'EOF'
 [Unit]
 Description=Spread RX+TX packet steering across CPU cores reserved for networking
 After=network-online.target set-multiqueue.service tunnel-shaper.service
 Wants=network-online.target
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/set-rps.sh
 RemainAfterExit=yes
-
 [Install]
 WantedBy=multi-user.target
 EOF
-systemctl daemon-reload
-systemctl enable --now set-rps.service > /dev/null 2>&1
 
-cat > /usr/local/sbin/tunnel-selfheal.sh << 'RUNTIME'
+    systemctl daemon-reload
+    systemctl enable --now set-mtu.service mss-clamp.service set-multiqueue.service >/dev/null 2>&1
+    /usr/local/sbin/mss-clamp.sh
+    ok "สร้างสคริปต์ HTB/RPS/MTU/MSS ครบ (ยังไม่รัน — จะรันตอนขั้นตอน 9 หลัง config เสร็จ)"
+else
+    ok "(ข้าม — check-only)"
+fi
+
+# ============================================================================
+step "7/10 — ตรวจสอบ/ตั้งค่า dropbear + danted(SOCKS5 TCP/UDP) + udp-custom"
+# ============================================================================
+if [ "$CHECK_ONLY" -eq 0 ]; then
+    # --- dropbear ---
+    if ! grep -q 'DROPBEAR_PORT=2345' /etc/default/dropbear 2>/dev/null; then
+        cat > /etc/default/dropbear << 'EOF'
+NO_START=0
+DROPBEAR_PORT=2345
+DROPBEAR_EXTRA_ARGS="-p 2345"
+EOF
+    fi
+    mkdir -p /etc/systemd/system/dropbear.service.d
+    cat > /etc/systemd/system/dropbear.service.d/override.conf << 'EOF'
+[Service]
+ExecStart=
+ExecStart=/usr/sbin/dropbear -R -F -p 2345
+EOF
+    DROPBEAR_PORT=2345
+
+    # --- danted (SOCKS5, TCP+UDP — protocol/command ถูกต้องอยู่แล้วตามต้นฉบับ) ---
+    SOCKS5_PORT=$(cat "$SOCKS5_PORT_FILE" 2>/dev/null); [ -z "$SOCKS5_PORT" ] && SOCKS5_PORT=1080
+    if command -v danted >/dev/null 2>&1; then
+        HOLDER=$(ss -lntup 2>/dev/null | awk -v p=":$SOCKS5_PORT" '$4 ~ p"$" {print $0}')
+        if [ -n "$HOLDER" ] && ! echo "$HOLDER" | grep -q danted; then
+            warn "พอร์ต ${SOCKS5_PORT} มีโปรแกรมอื่นถือครองอยู่ (ไม่ใช่ danted): ${HOLDER}"
+        fi
+        if [ ! -f "$SOCKS5_CONF" ] || ! grep -q 'command: connect udpassociate bind' "$SOCKS5_CONF"; then
+            cat > "$SOCKS5_CONF" << EOF
+logoutput: syslog
+internal: 0.0.0.0 port = ${SOCKS5_PORT}
+external: ${IFACE}
+socksmethod: none
+clientmethod: none
+user.privileged: root
+user.unprivileged: nobody
+client pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    log: connect disconnect error
+}
+socks pass {
+    from: 0.0.0.0/0 to: 0.0.0.0/0
+    protocol: tcp udp
+    command: connect udpassociate bind
+    log: connect disconnect error
+}
+EOF
+            chmod 644 "$SOCKS5_CONF"
+        fi
+        mkdir -p /etc/systemd/system/danted.service.d
+        rm -f /etc/systemd/system/danted.service.d/override.conf   # ลบไฟล์เดี่ยวเก่า กันซ้อนกับ 99-tuning.conf ในขั้นตอน 8
+        echo "$SOCKS5_PORT" > "$SOCKS5_PORT_FILE" 2>/dev/null
+        ok "danted config พร้อม (protocol tcp+udp, udpassociate เปิดอยู่) พอร์ต ${SOCKS5_PORT}"
+    else
+        warn "ไม่พบ danted ติดตั้งอยู่ (ตรวจสอบว่า install-server.sh รันสำเร็จหรือยัง)"
+    fi
+
+    # --- udp-custom ---
+    UDP_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CFG" 2>/dev/null); [ -z "$UDP_PORT" ] && UDP_PORT=36712
+    if [ -x "${UDP_DIR}/udp-custom" ]; then
+        if [ ! -f /etc/systemd/system/udp-custom.service ]; then
+            cat > /etc/systemd/system/udp-custom.service << EOF
+[Unit]
+Description=UDP Custom (hev-socks5-tunnel compatible server)
+[Service]
+User=root
+Type=simple
+ExecStart=${UDP_DIR}/udp-custom server
+WorkingDirectory=${UDP_DIR}/
+Restart=always
+RestartSec=2s
+[Install]
+WantedBy=default.target
+EOF
+        fi
+        ok "udp-custom binary พบแล้วที่ ${UDP_DIR}/udp-custom (พอร์ต ${UDP_PORT})"
+    else
+        warn "ไม่พบ ${UDP_DIR}/udp-custom — ยังไม่เคยติดตั้งจาก smng/install-server.sh หรือรันจากคนละเครื่อง"
+        warn "รัน: sudo bash install-server.sh (จาก smng.zip) ก่อน 1 ครั้ง แล้วค่อยรันไฟล์นี้ใหม่"
+    fi
+
+    # nftables: เปิดพอร์ตหลัก 3 ตัวแบบ accept ตรง (กันหลุดถ้า set blocked_* ถูกแก้ผิดจากเมนู)
+    if [ -f /etc/nftables.conf ] && ! grep -q 'tunnel-stack-master-ports' /etc/nftables.conf; then
+        sed -i "/chain input {/a\\        tcp dport { ${DROPBEAR_PORT}, ${SOCKS5_PORT} } accept comment \"tunnel-stack-master-ports\"\\n        udp dport { ${SOCKS5_PORT}, ${UDP_PORT} } accept comment \"tunnel-stack-master-ports\"" /etc/nftables.conf
+        nft -c -f /etc/nftables.conf >/dev/null 2>&1 && nft -f /etc/nftables.conf 2>/dev/null && systemctl restart nftables 2>/dev/null
+    fi
+
+    systemctl daemon-reload
+    systemctl enable dropbear danted udp-custom >/dev/null 2>&1 || true
+    ok "ตั้งค่า service หลักทั้ง 3 ตัวเสร็จ (ยังไม่ restart — restart รวมทีเดียวในขั้นตอน 9)"
+else
+    ok "(ข้าม — check-only)"
+fi
+
+# ============================================================================
+step "8/10 — [FIX-4] รวม systemd hardening + watchdog เหลือชุดเดียว"
+# ============================================================================
+if [ "$CHECK_ONLY" -eq 0 ]; then
+    # [FIX-5] รายชื่อ service จริงบนเครื่อง — เอา hev-socks5-tunnel (client-side) ออก
+    ALL_SERVICES="dropbear danted udp-custom"
+
+    for svc in $ALL_SERVICES; do
+        systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || continue
+        rm -f "/etc/systemd/system/${svc}.service.d/override.conf"  # ลบไฟล์เดี่ยวเก่าจากรอบก่อนๆ
+        mkdir -p "/etc/systemd/system/${svc}.service.d"
+        PROXY_CPU_DIRECTIVE=""
+        [ -n "$PROXY_CPU_RANGE" ] && PROXY_CPU_DIRECTIVE="CPUAffinity=${PROXY_CPU_RANGE}"
+        cat > "/etc/systemd/system/${svc}.service.d/99-tuning.conf" << EOF
+[Unit]
+StartLimitIntervalSec=60
+StartLimitBurst=20
+[Service]
+${PROXY_CPU_DIRECTIVE}
+Nice=-5
+IOSchedulingClass=best-effort
+IOSchedulingPriority=2
+OOMScoreAdjust=-500
+LimitNOFILE=1048576
+CPUWeight=600
+Restart=always
+RestartSec=1
+ExecStartPost=/bin/bash -c 'sleep 3; sysctl -p /etc/sysctl.d/99-tunnel-final.conf >/dev/null 2>&1; /usr/local/sbin/set-rps.sh >/dev/null 2>&1'
+EOF
+    done
+    systemctl daemon-reload
+    ok "systemd hardening (Nice/OOM/CPUAffinity/Restart=always/LimitNOFILE) เหมือนกันทั้ง 3 service"
+
+    # ลบ watchdog ซ้ำซ้อนตัวเก่าจากรอบก่อนๆ (ถ้ามี) ให้เหลือ tunnel-selfheal ตัวเดียว
+    if systemctl list-unit-files tunnel-watchdog.timer >/dev/null 2>&1; then
+        systemctl disable --now tunnel-watchdog.timer >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/tunnel-watchdog.{service,timer} /usr/local/bin/tunnel-watchdog.sh
+        ok "ลบ tunnel-watchdog ตัวเก่าทิ้งแล้ว (รวมเข้า tunnel-selfheal ตัวเดียว)"
+    fi
+
+    SELFHEAL_INTERVAL_SEC="${SELFHEAL_INTERVAL_SEC:-10}"
+    HEALTHCHECK_FAIL_STREAK_LIMIT="${HEALTHCHECK_FAIL_STREAK_LIMIT:-3}"
+    cat > /usr/local/sbin/tunnel-selfheal.sh << 'RUNTIME'
 #!/bin/bash
 source /etc/tunnel-qos.conf 2>/dev/null || true
 STATE_FILE=/run/tunnel-selfheal.state
@@ -575,16 +676,20 @@ tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc htb 1:" || QDISC_OK=0
 /usr/local/sbin/set-rps.sh >/dev/null 2>&1
 
 PROXY_OK=1
-for svc in $SOCKS5_SERVICES; do
-  systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || continue
-  systemctl is-active --quiet "$svc" 2>/dev/null || { PROXY_OK=0; systemctl restart "$svc" >/dev/null 2>&1 || true; }
-done
+check_port_real() {
+    local svc="$1" port="$2"
+    systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || return 0
+    if ! ss -tuln 2>/dev/null | grep -q ":${port} "; then
+        logger -t tunnel-selfheal "${svc} ไม่ฟังพอร์ต ${port} จริง (is-active อาจบอกว่า ok) -> restart"
+        systemctl restart "${svc}" >/dev/null 2>&1 || true
+        PROXY_OK=0
+    fi
+}
+check_port_real dropbear "${DROPBEAR_PORT:-2345}"
+check_port_real danted "${SOCKS5_PORT:-1080}"
+check_port_real udp-custom "${UDP_PORT:-36712}"
 
-if [ "$PROXY_OK" -eq 0 ]; then
-  FAILS=$((FAILS+1))
-else
-  FAILS=0
-fi
+if [ "$PROXY_OK" -eq 0 ]; then FAILS=$((FAILS+1)); else FAILS=0; fi
 echo "$FAILS" > "$STATE_FILE"
 
 if [ "$FAILS" -ge "${HEALTHCHECK_FAIL_STREAK_LIMIT:-3}" ]; then
@@ -593,155 +698,128 @@ if [ "$FAILS" -ge "${HEALTHCHECK_FAIL_STREAK_LIMIT:-3}" ]; then
   echo 0 > "$STATE_FILE"
 fi
 RUNTIME
-chmod +x /usr/local/sbin/tunnel-selfheal.sh
+    chmod +x /usr/local/sbin/tunnel-selfheal.sh
 
-cat > /etc/systemd/system/tunnel-selfheal.service << 'EOF'
+    cat > /etc/systemd/system/tunnel-selfheal.service << 'EOF'
 [Unit]
-Description=Detect and repair tunnel network config drift and restart dead socks5 services
+Description=Detect and repair tunnel network config drift and restart dead proxy services (checks real listening ports)
 After=tunnel-shaper.service set-rps.service
-
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/tunnel-selfheal.sh
 EOF
-
-cat > /etc/systemd/system/tunnel-selfheal.timer << EOF
+    cat > /etc/systemd/system/tunnel-selfheal.timer << EOF
 [Unit]
 Description=Run tunnel-selfheal every ${SELFHEAL_INTERVAL_SEC} seconds
-
 [Timer]
 OnBootSec=${SELFHEAL_INTERVAL_SEC}s
 OnUnitActiveSec=${SELFHEAL_INTERVAL_SEC}s
 Persistent=true
-
 [Install]
 WantedBy=timers.target
 EOF
-systemctl daemon-reload
-systemctl enable --now tunnel-selfheal.timer > /dev/null 2>&1
+    systemctl daemon-reload
+    systemctl enable --now tunnel-selfheal.timer >/dev/null 2>&1
+    ok "tunnel-selfheal ตัวเดียวคุมทุก service เช็คพอร์ตฟังจริงทุก ${SELFHEAL_INTERVAL_SEC} วิ (ไม่มี watchdog ตัวที่สองแย่งกันอีกแล้ว)"
+else
+    ok "(ข้าม — check-only)"
+fi
 
-for svc in danted hev-socks5-tunnel; do
-  UNIT="/etc/systemd/system/${svc}.service"
-  ALT_UNIT="/lib/systemd/system/${svc}.service"
-  [ -f "$UNIT" ] || UNIT="$ALT_UNIT"
-  [ -f "$UNIT" ] || continue
+# ============================================================================
+step "9/10 — เขียน /etc/tunnel-qos.conf (single source of truth) + restart ทุก service"
+# ============================================================================
+if [ "$CHECK_ONLY" -eq 0 ]; then
+    DROPBEAR_PORT=2345
+    SOCKS5_PORT=$(cat "$SOCKS5_PORT_FILE" 2>/dev/null); [ -z "$SOCKS5_PORT" ] && SOCKS5_PORT=1080
+    UDP_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CFG" 2>/dev/null); [ -z "$UDP_PORT" ] && UDP_PORT=36712
 
-  PROXY_CPU_DIRECTIVE=""
-  if [ -n "$PROXY_CPU_RANGE" ]; then
-    PROXY_CPU_DIRECTIVE="CPUAffinity=${PROXY_CPU_RANGE}"
-  fi
-
-  mkdir -p "/etc/systemd/system/${svc}.service.d"
-  cat > "/etc/systemd/system/${svc}.service.d/99-tuning.conf" << EOF
-[Unit]
-StartLimitIntervalSec=60
-StartLimitBurst=20
-
-[Service]
-${PROXY_CPU_DIRECTIVE}
-Nice=-5
-IOSchedulingClass=best-effort
-IOSchedulingPriority=2
-OOMScoreAdjust=-500
-LimitNOFILE=1048576
-CPUWeight=600
-Restart=always
-RestartSec=1
-ExecStartPost=/bin/bash -c 'sleep 3; sysctl -p /etc/sysctl.d/99-tunnel-optimize.conf >/dev/null 2>&1; /usr/local/sbin/set-rps.sh >/dev/null 2>&1'
+    cat > /etc/tunnel-qos.conf << EOF
+IFACE=${IFACE}
+DOWNLOAD_SHAPE_MBIT=${DOWNLOAD_SHAPE_MBIT}
+UPLOAD_SHAPE_MBIT=${UPLOAD_SHAPE_MBIT}
+RTT_MS=${RTT_MS}
+TUNNEL_MTU=${TUNNEL_MTU}
+DNS_V4_A=${DNS_V4_A}
+DNS_V4_B=${DNS_V4_B}
+NCPU=${NCPU}
+APP_CPU=${APP_CPU}
+TXQUEUELEN=10000
+HEALTHCHECK_FAIL_STREAK_LIMIT=3
+HASH_DIVISOR=${HASH_DIVISOR}
+PER_USER_GUAR_KBIT=${PER_USER_GUAR_KBIT}
+PER_USER_CEIL_MBIT=${PER_USER_CEIL_MBIT}
+CAPACITY_PER_VCPU=${CAPACITY_PER_VCPU}
+MAX_CAPACITY_USERS=${MAX_CAPACITY_USERS}
+DROPBEAR_PORT=${DROPBEAR_PORT}
+SOCKS5_PORT=${SOCKS5_PORT}
+UDP_PORT=${UDP_PORT}
 EOF
-  systemctl daemon-reload
-  systemctl restart "$svc" 2>/dev/null || true
+    ok "/etc/tunnel-qos.conf เขียนใหม่แล้ว (ไฟล์ config กลางไฟล์เดียวที่ทุกสคริปต์อ่านค่าเดียวกัน)"
+
+    /usr/local/sbin/set-multiqueue.sh >/dev/null 2>&1
+    systemctl restart tunnel-shaper.service 2>/dev/null
+    /usr/local/sbin/set-rps.sh >/dev/null 2>&1
+    systemctl restart set-rps.service 2>/dev/null
+    for svc in dropbear danted udp-custom; do
+        systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 && systemctl restart "$svc" 2>/dev/null
+    done
+    sleep 2
+    ok "restart ทุก service เรียบร้อย"
+else
+    ok "(ข้าม — check-only)"
+fi
+
+# ============================================================================
+step "10/10 — ตรวจสุขภาพรวมทั้งสแตก + เช็ค conflict (health & conflict dashboard)"
+# ============================================================================
+source /etc/tunnel-qos.conf 2>/dev/null || true
+DROPBEAR_PORT="${DROPBEAR_PORT:-2345}"; SOCKS5_PORT="${SOCKS5_PORT:-1080}"; UDP_PORT="${UDP_PORT:-36712}"
+
+echo -e "${C}--- ความจุ / สเปค ---${NC}"
+echo "  vCPU=${NCPU}  RAM=${TOTAL_RAM_MB}MB  IFACE=${IFACE}"
+echo "  ความจุออกแบบ = ${MAX_CAPACITY_USERS} คน (${NCPU} x ${CAPACITY_PER_VCPU}/vCPU) | ผู้ใช้จริงตอนนี้ = ${CURRENT_USERS} คน"
+[ "$CURRENT_USERS" -gt "$MAX_CAPACITY_USERS" ] && bad "เกินความจุที่สเปครองรับ! พิจารณาเพิ่ม vCPU" || ok "ยังไม่เกินความจุ"
+
+echo -e "\n${C}--- Conflict checks ---${NC}"
+if systemctl is-active ufw >/dev/null 2>&1; then bad "ufw ยัง active คู่กับ nftables (ควรมีแค่ตัวเดียว)"; else ok "ufw: ปิดแล้ว/ไม่มี — nftables เป็นไฟร์วอลล์เดียว"; fi
+
+DUP_SYSCTL=$(ls /etc/sysctl.d/99-tunnel*.conf /etc/sysctl.d/99-smng*.conf 2>/dev/null | wc -l)
+[ "$DUP_SYSCTL" -gt 1 ] && bad "เจอไฟล์ sysctl หลายไฟล์ซ้อนกัน ($(ls /etc/sysctl.d/99-tunnel*.conf /etc/sysctl.d/99-smng*.conf 2>/dev/null | tr '\n' ' '))" || ok "sysctl มีไฟล์เดียว (99-tunnel-final.conf)"
+
+if systemctl list-unit-files tunnel-watchdog.timer >/dev/null 2>&1; then bad "ยังเจอ tunnel-watchdog.timer ตัวเก่า (ควรมีแค่ tunnel-selfheal)"; else ok "watchdog เหลือตัวเดียว (tunnel-selfheal)"; fi
+
+echo -e "\n${C}--- Kernel / QoS ---${NC}"
+CUR_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+[ "$CUR_CC" = "bbr" ] && ok "BBR: active" || warn "BBR: ยังไม่ active (${CUR_CC:-unknown}) — บาง VPS (OpenVZ) ปรับไม่ได้"
+
+IPV6_DIS=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
+[ "$IPV6_DIS" = "1" ] && ok "IPv6: disabled" || warn "IPv6: ยังไม่ disable เต็มที่ (reboot ถ้าเพิ่งแก้ GRUB)"
+
+if tc qdisc show dev "$IFACE" 2>/dev/null | grep -q "qdisc htb 1:"; then
+    ok "HTB per-user shaping: active บน ${IFACE} (divisor=${HASH_DIVISOR}, แก้บั๊กเดิมแล้ว)"
+else
+    bad "HTB shaping: ยังไม่ทำงานบน ${IFACE} — รัน: sudo /usr/local/sbin/qos-root-init.sh (ตอนนี้ error จะโชว์ตรงๆ ไม่ถูกซ่อนแล้ว)"
+fi
+tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc htb 1:" && ok "HTB upload shaping (ifb0): active" || warn "ifb0 shaping ยังไม่ขึ้น (เช็คว่า modprobe ifb สำเร็จหรือไม่)"
+
+echo -e "\n${C}--- Services ---${NC}"
+for chk in "dropbear:${DROPBEAR_PORT}" "danted:${SOCKS5_PORT}" "udp-custom:${UDP_PORT}"; do
+    svc="${chk%%:*}"; port="${chk##*:}"
+    if ! systemctl list-unit-files "${svc}.service" >/dev/null 2>&1; then
+        warn "${svc}: ยังไม่ได้ติดตั้ง"
+    elif ss -tuln 2>/dev/null | grep -q ":${port} "; then
+        ok "${svc} ฟังพอร์ต ${port} จริง"
+    else
+        bad "${svc} ไม่ฟังพอร์ต ${port} — เช็ค: journalctl -u ${svc} -n 50"
+    fi
 done
 
-systemctl restart tunnel-shaper.service
-systemctl restart set-rps.service
+swapon --show 2>/dev/null | grep -q swapfile && ok "swap: active" || warn "swap: ไม่ได้เปิด (ปกติถ้า RAM เหลือเยอะ)"
 
-systemctl disable --now safe-reboot.timer > /dev/null 2>&1 || true
-rm -f /etc/systemd/system/safe-reboot.timer /etc/systemd/system/safe-reboot.service /usr/local/sbin/safe-reboot.sh
-
-systemctl disable --now log-clear.timer > /dev/null 2>&1 || true
-systemctl disable --now log-watchdog.timer > /dev/null 2>&1 || true
-systemctl disable --now log-age-clear.timer > /dev/null 2>&1 || true
-rm -f /etc/systemd/system/log-clear.timer /etc/systemd/system/log-clear.service \
-      /etc/systemd/system/log-watchdog.service /etc/systemd/system/log-watchdog.timer \
-      /etc/systemd/system/log-age-clear.service /etc/systemd/system/log-age-clear.timer \
-      /usr/local/sbin/log-watchdog.sh /usr/local/sbin/log-clear.sh /usr/local/sbin/log-age-clear.sh
-
-systemctl disable --now logrotate.timer > /dev/null 2>&1 || true
-[ -f /etc/cron.daily/logrotate ] && chmod -x /etc/cron.daily/logrotate
-
-if mountpoint -q /var/log; then
-  FSTYPE=$(findmnt -no FSTYPE /var/log 2>/dev/null || true)
-  if [ "$FSTYPE" = "tmpfs" ]; then
-    umount /var/log 2>/dev/null || umount -l /var/log 2>/dev/null || true
-  fi
-fi
-sed -i '/^tmpfs \/var\/log tmpfs/d' /etc/fstab
-
-mkdir -p /etc/systemd/journald.conf.d
-rm -f /etc/systemd/journald.conf.d/ram-only.conf
-cat > /etc/systemd/journald.conf.d/disk-hourly.conf << EOF
-[Journal]
-Storage=persistent
-SystemMaxUse=${JOURNAL_DISK_MAX_MB}M
-SystemMaxFileSize=$((JOURNAL_DISK_MAX_MB / 4))M
-MaxRetentionSec=${JOURNAL_MAX_RETENTION}
-ForwardToSyslog=yes
-EOF
-systemctl restart systemd-journald
-
-mkdir -p /etc/tmpfiles.d
-rm -f /etc/tmpfiles.d/varlog-ram.conf
-cat > /etc/tmpfiles.d/varlog-perms.conf << 'EOF'
-d /var/log/apt 0755 root root -
-d /var/log/private 0700 root root -
-EOF
-systemd-tmpfiles --create /etc/tmpfiles.d/varlog-perms.conf > /dev/null 2>&1 || true
-
-cat > /usr/local/sbin/daily-cache-log-clear.sh << 'RUNTIME'
-#!/bin/bash
-journalctl --rotate > /dev/null 2>&1 || true
-journalctl --vacuum-time=1s > /dev/null 2>&1 || true
-find /var/log -maxdepth 4 -type f -exec truncate -s 0 {} \; 2>/dev/null || true
-apt-get clean > /dev/null 2>&1 || true
-find /tmp -mindepth 1 -mtime +1 -delete 2>/dev/null || true
-sync
-echo 1 > /proc/sys/vm/drop_caches 2>/dev/null || true
-RUNTIME
-chmod +x /usr/local/sbin/daily-cache-log-clear.sh
-
-cat > /etc/systemd/system/daily-cache-log-clear.service << 'EOF'
-[Unit]
-Description=Daily full log + cache clear
-
-[Service]
-Type=oneshot
-Nice=19
-IOSchedulingClass=idle
-ExecStart=/usr/local/sbin/daily-cache-log-clear.sh
-EOF
-
-cat > /etc/systemd/system/daily-cache-log-clear.timer << EOF
-[Unit]
-Description=Run daily-cache-log-clear every day at ${DAILY_CLEAR_TIME} ${CLEAR_TIMEZONE}
-
-[Timer]
-OnCalendar=*-*-* ${DAILY_CLEAR_TIME} ${CLEAR_TIMEZONE}
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-EOF
-
-systemctl daemon-reload
-systemctl enable --now daily-cache-log-clear.timer > /dev/null 2>&1
-
-systemctl restart rsyslog 2>/dev/null || true
-systemctl restart cron 2>/dev/null || true
-systemctl restart ssh 2>/dev/null || true
-
-echo ""
-echo "=================================================="
-echo -e "${GREEN}เธเธฃเธฑเธเนเธ•เนเธเธฃเธฐเธเธเธชเธณเน€เธฃเนเธ | Pool: ${DOWNLOAD_SHAPE_MBIT}Mbitโ“ / ${UPLOAD_SHAPE_MBIT}Mbitโ‘ (${PIPE_BYTES} B/s) | Per-user: guar ${PER_USER_GUAR_KBIT}kbit / ceil ${PER_USER_CEIL_MBIT}Mbit (hashed HTB, ${HASH_DIVISOR} buckets) + fq_codel | BBR | MSS(v4)=${TCP_MSS_V4} | IPv6=DISABLED${NC}"
-echo -e "${YELLOW}เธซเธกเธฒเธขเน€เธซเธ•เธธ: ipv6.disable=1 เนเธ GRUB เธเธฐเธชเธกเธเธนเธฃเธ“เน 100% เธซเธฅเธฑเธ reboot เน€เธเธฃเธทเนเธญเธเธซเธเธถเนเธเธเธฃเธฑเนเธ${NC}"
-echo "=================================================="
+echo
+echo -e "${G}เสร็จสิ้น — สแตกทั้งหมดรวมเป็นไฟล์เดียว ทำงานร่วมกันแล้ว${NC}"
+echo "  • HTB shaping ใช้ divisor=256 (ค่าสูงสุดจริงที่ kernel รองรับ) แทน 16384 เดิมที่ fail เงียบๆ มาตลอด"
+echo "  • ไฟร์วอลล์เหลือ nftables ตัวเดียว, sysctl เหลือไฟล์เดียว, watchdog เหลือตัวเดียว"
+echo "  • ความจุออกแบบไว้: ${MAX_CAPACITY_USERS} คน (ปรับ CAPACITY_PER_VCPU=$CAPACITY_PER_VCPU ในสคริปต์นี้ได้ถ้าต้องการเปลี่ยนสัดส่วน)"
+echo -e "${Y}ถ้าเพิ่งแก้ GRUB (ipv6.disable=1) เป็นครั้งแรก ให้ reboot เครื่อง 1 ครั้งเพื่อให้ครบสมบูรณ์${NC}"
+echo "  รันซ้ำได้ทุกเมื่ออย่างปลอดภัย (idempotent) หรือรันแบบ --check-only เพื่อดูสถานะโดยไม่แก้อะไร"
