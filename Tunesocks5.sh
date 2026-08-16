@@ -1,44 +1,4 @@
 #!/bin/bash
-# ============================================================================
-# tunnel-stack-master.sh — สคริปต์รวมไฟล์เดียวจบ (v4.0)
-#
-# รวม 3 ไฟล์เดิมเข้าด้วยกัน + แก้บั๊กจริงที่เจอทั้งหมด:
-#   1) Tunesocks5.sh          (kernel/QoS/HTB tuning ตัวแรก)
-#   2) finalize-tunnel-stack_fixed.sh (ตัวเชื่อม/แก้ conflict รอบสอง)
-#   3) diagnose-htb-shaping.sh (ใช้หาสาเหตุ HTB พัง -> เจอสาเหตุจริงแล้ว แก้ในนี้เลย)
-#
-# ระบบเป้าหมาย: dropbear + danted(SOCKS5 TCP/UDP) + udp-custom (ติดตั้งจาก
-# smng/install-server.sh) — hev-socks5-tunnel คือแอปฝั่ง "ไคลเอนต์" (ในสกรีนช็อต)
-# ไม่ใช่ service บนเซิร์ฟเวอร์ จึงไม่มีการยุ่งกับมันในสคริปต์นี้อีกต่อไป
-#
-# บั๊กจริงที่แก้แล้วในไฟล์นี้ (สรุปสั้น เหตุผลละเอียดอยู่ในคอมเมนต์แต่ละจุด):
-#   [FIX-1] HASH_DIVISOR เดิม=16384 เกิน limit จริงของ kernel (u32 hash table
-#           ต้องเป็นเลขยกกำลัง 2 และ exponent ห้ามเกิน 8 => ค่าสูงสุดคือ 256)
-#           ทำให้ "tc filter ... divisor 16384" fail เงียบๆ มาตลอด (ของเดิม 2>/dev/null)
-#           เป็นสาเหตุตรงของ "HTB shaping: ไม่ทำงานบน eth0" — แก้เป็น 256 (ค่าสูงสุดที่ทำได้จริง)
-#   [FIX-2] ufw กับ nftables ทำงานพร้อมกัน -> nftables.service restart จะ
-#           "flush ruleset" ทั้งระบบ ล้างกฎ ufw ทิ้งแบบสุ่ม -> เป็นสาเหตุ "หลุดๆ ติดๆ" ที่พบบ่อยสุด
-#           แก้โดยปิด ufw ทิ้ง เหลือ nftables ตัวเดียว (มี safety-check ก่อนปิดเสมอ กันล็อกตัวเองออก)
-#   [FIX-3] sysctl 2 ไฟล์ชนกัน (99-smng-proxy.conf จาก install-server.sh
-#           vs 99-tunnel-optimize.conf จาก QoS script) ค่า rmem/wmem/backlog ไม่ตรงกัน
-#           แก้โดยรวมเป็นไฟล์เดียว /etc/sysctl.d/99-tunnel-final.conf แล้วลบไฟล์เก่าทิ้ง
-#   [FIX-4] watchdog 2 ตัวแย่งกัน restart service เดียวกัน (tunnel-watchdog + tunnel-selfheal)
-#           แก้โดยเหลือ tunnel-selfheal ตัวเดียว เช็คพอร์ตฟังจริง ไม่ใช่แค่ is-active
-#   [FIX-5] SOCKS5_SERVICES เดิมมี "hev-socks5-tunnel" ซึ่งไม่มีจริงบนเซิร์ฟเวอร์
-#           (เป็นแอปฝั่งไคลเอนต์) แก้เป็นรายชื่อ service จริงบนเครื่อง: dropbear danted udp-custom
-#   [FIX-6] ตัวเลขสเปค (RAM/CPU) เดิม hardcode 6144MB/4vCPU ในสคริปต์ตัวแรก
-#           แก้เป็นอ่านจากเครื่องจริงเสมอ (/proc/meminfo, nproc)
-#
-# ระบบคำนวณสเปค (ใหม่ตามที่ขอ): 1 vCPU รองรับได้สูงสุด 25 คน
-#   เช่น 4 vCPU -> รองรับได้จริง 100 คน (ปรับ CAPACITY_PER_VCPU ด้านล่างได้ถ้าอยากเปลี่ยนสัดส่วน)
-#   ตัวเลข "สเปคเน็ต" (ขนาด pool แบนด์วิดท์ PIPE_BYTES) คงค่าเดิมตายตัวตามไฟล์ต้นฉบับ
-#   ไม่ได้ปรับตาม RAM/CPU — ปรับแค่สิ่งที่ควรปรับตามสเปคจริง (conntrack, per-user guarantee,
-#   ค่าที่ผูกกับจำนวนคนสูงสุดที่รองรับได้)
-#
-# วิธีใช้:
-#   sudo bash tunnel-stack-master.sh              # รันทุกอย่าง (ปลอดภัยรันซ้ำได้ idempotent)
-#   sudo bash tunnel-stack-master.sh --check-only  # ไม่แก้อะไร แค่พิมพ์ผลตรวจสุขภาพ/conflict
-# ============================================================================
 set -uo pipefail
 [ "$EUID" -ne 0 ] && { echo "ต้องรันด้วย root: sudo bash $0"; exit 1; }
 
@@ -57,24 +17,16 @@ SSHMGR_DB="/etc/ssh-manager/db"
 SOCKS5_PORT_FILE="/etc/ssh-manager/socks5-port"
 SOCKS5_CONF="/etc/danted.conf"
 
-# ============================================================================
 step "1/10 — อ่านสเปคเครื่องจริง + คำนวณความจุ (capacity calculator)"
-# ============================================================================
-# [FIX-6] ไม่มีเลข hardcode อีกต่อไป อ่านจากเครื่องจริงเสมอทุกครั้งที่รัน
 TOTAL_RAM_MB=$(awk '/MemTotal/{printf "%d", $2/1024}' /proc/meminfo)
 NCPU=$(nproc)
 IFACE=$(ip route show default | awk '/default/ {print $5; exit}')
 [ -z "$IFACE" ] && IFACE=$(ip -o link show | awk -F': ' '$2!="lo"{print $2; exit}')
 if [ -z "$IFACE" ]; then bad "หา default network interface ไม่เจอ ยกเลิก"; exit 1; fi
 
-# ---- ตัวคำนวณความจุที่ขอ: 1 vCPU = 25 คน ----
 CAPACITY_PER_VCPU="${CAPACITY_PER_VCPU:-25}"
 MAX_CAPACITY_USERS=$(( NCPU * CAPACITY_PER_VCPU ))
 
-# จำนวนผู้ใช้จริงตอนนี้จาก smng db (ถ้ามี) — ใช้แค่ "แจ้งเตือน" ว่าเกินความจุออกแบบไว้หรือยัง
-# ไม่เอามาคำนวณ per-user guarantee โดยตรง เพราะถ้าใช้ค่าจากจำนวนคนจริงที่เปลี่ยนไปเรื่อยๆ
-# ค่า guarantee จะขยับทุกครั้งที่มีคนสมัคร/ลบ ทำให้ QoS "ไม่นิ่ง" — จึงคำนวณจาก "ความจุที่ออกแบบไว้"
-# (MAX_CAPACITY_USERS) แทน เพื่อความเสถียร ไม่ต้องคำนวณใหม่ทุกครั้งที่ผู้ใช้เปลี่ยน
 CURRENT_USERS=0
 if [ -f "$SSHMGR_DB" ]; then
     CURRENT_USERS=$(wc -l < "$SSHMGR_DB" 2>/dev/null)
@@ -84,8 +36,6 @@ fi
 CURRENT_USERS=$(printf '%s' "$CURRENT_USERS" | tr -cd '0-9')
 [ -z "$CURRENT_USERS" ] && CURRENT_USERS=0
 
-# ---- สเปคเน็ต: คงค่าเดิมตายตัวตามไฟล์ต้นฉบับ (ไม่ผูกกับ RAM/CPU) ----
-# ดึงจาก config.json ของ udp-custom ถ้ามี (single source of truth เหมือนเดิม) ไม่งั้น fallback ค่าเดิม
 PIPE_BYTES=39375000
 if [ -f "$UDP_CFG" ] && command -v jq >/dev/null 2>&1; then
     JSON_BUF=$(jq -r '.stream_buffer // empty' "$UDP_CFG" 2>/dev/null)
@@ -101,22 +51,16 @@ SWAP_GB="${SWAP_GB:-4}"
 DNS_V4_A="${DNS_V4_A:-1.1.1.1}"
 DNS_V4_B="${DNS_V4_B:-8.8.8.8}"
 
-# ---- [FIX-1] HASH_DIVISOR: ค่าสูงสุดจริงของ u32 hash table คือ 256 (2^8) ----
-# เดิมตั้ง 16384 (2^14) ซึ่งเกิน limit ของ kernel (tc-u32(8): "must be a power of
-# two with exponent not exceeding eight") -> tc filter ... divisor 16384 fail
-# ทุกครั้งแบบเงียบๆ (ของเดิม 2>/dev/null || true) ทำให้ HTB shaping ไม่เคยทำงานจริงเลย
 HASH_DIVISOR=256
 if [ "$MAX_CAPACITY_USERS" -gt "$HASH_DIVISOR" ]; then
     warn "ความจุที่ออกแบบ (${MAX_CAPACITY_USERS} คน) มากกว่าจำนวน hash bucket สูงสุดที่ kernel รองรับ (256)"
     warn "ผู้ใช้จะยัง shaping ได้ปกติ แต่หลายคนอาจ hash ตกบักเก็ตเดียวกัน (แชร์ guarantee กัน) เมื่อคนเกิน 256"
 fi
 
-# per-user guarantee: คำนวณจาก "ความจุที่ออกแบบไว้" ไม่ใช่จำนวนคนจริงตอนนี้ (เพื่อความเสถียร)
 PER_USER_GUAR_KBIT=$(( PIPE_MBIT * 1000 / MAX_CAPACITY_USERS ))
 [ "$PER_USER_GUAR_KBIT" -lt 256 ] && PER_USER_GUAR_KBIT=256
 PER_USER_CEIL_MBIT="${PER_USER_CEIL_MBIT:-20}"
 
-# conntrack: ผูกกับความจุที่ออกแบบไว้ (ไม่ใช่จำนวนคนจริง) กันรีคำนวณสลับไปมา
 NF_CONNTRACK_MAX=$(( MAX_CAPACITY_USERS * 4000 ))
 [ "$NF_CONNTRACK_MAX" -lt 131072 ] && NF_CONNTRACK_MAX=131072
 [ "$NF_CONNTRACK_MAX" -gt 2000000 ] && NF_CONNTRACK_MAX=2000000
@@ -138,9 +82,7 @@ if [ "$CHECK_ONLY" -eq 1 ]; then
     echo -e "\n${Y}--check-only: ข้ามไปตรวจสุขภาพระบบทันที (ไม่แก้ไขอะไร)${NC}"
 fi
 
-# ============================================================================
 step "2/10 — ติดตั้งแพ็กเกจ/kernel module ที่จำเป็น"
-# ============================================================================
 if [ "$CHECK_ONLY" -eq 0 ]; then
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -qq
@@ -158,9 +100,7 @@ else
     ok "(ข้าม — check-only)"
 fi
 
-# ============================================================================
 step "3/10 — [FIX-2] เคลียร์ ufw กับ nftables ที่ชนกัน (สาเหตุ 'หลุดสุ่ม' หลักที่สุด)"
-# ============================================================================
 UFW_ACTIVE=0
 systemctl is-active ufw >/dev/null 2>&1 && UFW_ACTIVE=1
 systemctl is-enabled ufw >/dev/null 2>&1 && UFW_ACTIVE=1
@@ -170,7 +110,6 @@ if [ "$UFW_ACTIVE" -eq 1 ]; then
         bad "ufw ยังทำงานอยู่คู่กับ nftables -> เสี่ยงพอร์ตหลุดสุ่มตอน nftables restart (flush ruleset ล้าง ufw ด้วย)"
     else
         warn "เจอ ufw ทำงานอยู่คู่กับ nftables -> จะปิด ufw เหลือ nftables ตัวเดียว"
-        # อ่านพอร์ตจริงก่อนปิด ufw กันล็อกตัวเองออกจากเครื่อง (safety-check เหมือน finalize script เดิม)
         DROPBEAR_PORT=$(grep -oP 'DROPBEAR_PORT=\K[0-9]+' /etc/default/dropbear 2>/dev/null); [ -z "$DROPBEAR_PORT" ] && DROPBEAR_PORT=2345
         SOCKS5_PORT=$(cat "$SOCKS5_PORT_FILE" 2>/dev/null); [ -z "$SOCKS5_PORT" ] && SOCKS5_PORT=1080
         UDP_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CFG" 2>/dev/null); [ -z "$UDP_PORT" ] && UDP_PORT=36712
@@ -219,9 +158,7 @@ else
     ok "ไม่มี ufw ทำงานอยู่แล้ว — nftables เป็นไฟร์วอลล์เดียว (ถูกต้องแล้ว)"
 fi
 
-# ============================================================================
 step "4/10 — MTU / DNS / netplan cleanup"
-# ============================================================================
 if [ "$CHECK_ONLY" -eq 0 ]; then
     ip link set dev "$IFACE" mtu "$TUNNEL_MTU" 2>/dev/null || true
     cat > /etc/systemd/system/set-mtu.service << EOF
@@ -258,13 +195,7 @@ else
     ok "(ข้าม — check-only)"
 fi
 
-# ============================================================================
 step "5/10 — [FIX-3] รวม sysctl เป็นไฟล์เดียว (ลบไฟล์เก่าที่ชนกันทิ้ง)"
-# ============================================================================
-# เดิม: 99-smng-proxy.conf (จาก install-server.sh, ค่า fix ตายตัว) VS
-#       99-tunnel-optimize.conf / 99-tunnel-stability.conf (จาก QoS scripts, ค่าคำนวณจาก BDP)
-# ชื่อไฟล์ทั้งคู่ขึ้นต้น "99-" โหลดตามลำดับตัวอักษร ค่าใครทับใครไม่ชัดเจน/เปราะบาง
-# แก้ให้เหลือไฟล์เดียว: /etc/sysctl.d/99-tunnel-final.conf เป็นเจ้าเดียวเท่านั้น
 if [ "$CHECK_ONLY" -eq 0 ]; then
     rm -f /etc/sysctl.d/99-smng-proxy.conf /etc/sysctl.d/99-tunnel-optimize.conf /etc/sysctl.d/99-tunnel-stability.conf
 
@@ -278,10 +209,9 @@ if [ "$CHECK_ONLY" -eq 0 ]; then
     UDP_MEM_MIN_PAGES=$(( UDP_MEM_MIN_BYTES / 4096 ))
     UDP_MEM_PRESSURE_PAGES=$(( UDP_MEM_PRESSURE_BYTES / 4096 ))
     UDP_MEM_MAX_PAGES=$(( UDP_MEM_MAX_BYTES / 4096 ))
-    VM_MIN_FREE_KB=$(( TOTAL_RAM_MB * 1024 * 2 / 100 ))   # ~2% ของ RAM กันชน OOM ตอนโหลดสูง
+    VM_MIN_FREE_KB=$(( TOTAL_RAM_MB * 1024 * 2 / 100 ))
 
     cat > /etc/sysctl.d/99-tunnel-final.conf << EOF
-# สร้างโดย tunnel-stack-master.sh — ไฟล์เดียวจบ ห้ามสร้างไฟล์ 99-*.conf อื่นซ้ำอีก
 net.ipv4.tcp_congestion_control = bbr
 net.core.default_qdisc = fq_codel
 net.ipv4.ip_forward = 1
@@ -351,9 +281,7 @@ else
     ok "(ข้าม — check-only)"
 fi
 
-# ============================================================================
 step "6/10 — [FIX-1] HTB per-user shaping ด้วย divisor ที่ kernel รองรับจริง (256)"
-# ============================================================================
 if [ "$CHECK_ONLY" -eq 0 ]; then
     cat > /usr/local/sbin/set-multiqueue.sh << 'RUNTIME'
 #!/bin/bash
@@ -402,8 +330,6 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
-    # qos-root-init.sh: สร้าง HTB จริง — [FIX-1] ใช้ HASH_DIVISOR=256 ที่ kernel รับได้จริง
-    # ไม่ปิด stderr อีกต่อไปสำหรับคำสั่งสร้าง qdisc/filter หลัก เพื่อให้เห็น error จริงถ้าพังอีก
     cat > /usr/local/sbin/qos-root-init.sh << 'RUNTIME'
 #!/bin/bash
 source /etc/tunnel-qos.conf 2>/dev/null || true
@@ -428,39 +354,54 @@ tc qdisc del dev ifb0 root 2>/dev/null || true
 
 build_per_user_htb() {
   local dev="$1" total_mbit="$2" match_field="$3"
+  local hk_off=16
+  [ "$match_field" = "src" ] && hk_off=12
   local batch; batch=$(mktemp)
   {
     echo "qdisc add dev $dev root handle 1: htb default 2"
     echo "class add dev $dev parent 1: classid 1:1 htb rate ${total_mbit}mbit ceil ${total_mbit}mbit"
     echo "class add dev $dev parent 1:1 classid 1:2 htb rate 1mbit ceil ${total_mbit}mbit"
     echo "qdisc add dev $dev parent 1:2 handle 20: fq_codel limit 10240 flows 1024 target 4ms interval 100ms quantum 1514 ecn"
-    echo "filter add dev $dev parent 1: protocol ip prio 1 u32 divisor ${HASH_DIVISOR}"
-    echo "filter add dev $dev parent 1: protocol ip prio 1 u32 match ip ${match_field} 0.0.0.0/0 hashkey mask 0x0000ffff at 16 link 8:"
+    echo "filter add dev $dev parent 1: protocol ip prio 1 handle 8: u32 divisor ${HASH_DIVISOR}"
+    echo "filter add dev $dev parent 1: protocol ip prio 1 u32 match ip ${match_field} 0.0.0.0/0 hashkey mask 0x0000ffff at ${hk_off} link 8:"
     for ((i = 0; i < HASH_DIVISOR; i++)); do
       hexid=$(printf '%x' $((0x100 + i)))
+      bkt=$(printf '%x' "$i")
       echo "class add dev $dev parent 1:1 classid 1:${hexid} htb rate ${PER_USER_GUAR_KBIT}kbit ceil ${PER_USER_CEIL_MBIT}mbit burst 15k cburst 30k"
       echo "qdisc add dev $dev parent 1:${hexid} handle ${hexid}0: fq_codel limit 1024 flows 128 target 4ms interval 100ms quantum 1514 ecn"
-      echo "filter add dev $dev parent 1: protocol ip prio 1 u32 ht 8:${i}: match u32 0 0 0 classid 1:${hexid}"
+      echo "filter add dev $dev parent 1: protocol ip prio 1 u32 ht 8:${bkt}: match u32 0 0 classid 1:${hexid}"
     done
   } > "$batch"
 
-  # ไม่ปิด stderr ของ batch หลัก — ถ้า divisor เกิน limit อีกในอนาคตจะเห็น error ทันที ไม่เงียบเหมือนเดิม
   if ! tc -force -batch "$batch"; then
-    logger -t qos-root-init "tc batch มี error บางบรรทัดบน ${dev} — เช็ค: tc -force -batch ${batch} (ไฟล์ถูกลบแล้ว รันใหม่ด้วย qos-root-init.sh เพื่อดู error สด)"
+    echo "  ✗ tc batch มี error บางบรรทัดบน ${dev} — เช็ค: tc -force -batch ${batch}" >&2
+    logger -t qos-root-init "tc batch มี error บางบรรทัดบน ${dev} — batch เก็บไว้ที่ ${batch}"
+    return 1
   fi
+
+  local linked; linked=$(tc filter show dev "$dev" 2>/dev/null | grep -c "ht 8:")
+  if [ "$linked" -lt "$HASH_DIVISOR" ]; then
+    echo "  ✗ per-user hash filter บน ${dev} ผูกได้แค่ ${linked}/${HASH_DIVISOR} bucket — shaping ไม่สมบูรณ์" >&2
+    logger -t qos-root-init "${dev}: linked ${linked}/${HASH_DIVISOR} hash buckets — batch เก็บไว้ที่ ${batch}"
+    return 1
+  fi
+
   rm -f "$batch"
+  return 0
 }
 
-build_per_user_htb "$IFACE" "$DOWNLOAD_SHAPE_MBIT" "dst"
+DL_OK=1; UL_OK=1
+build_per_user_htb "$IFACE" "$DOWNLOAD_SHAPE_MBIT" "dst" || DL_OK=0
 
 if ip link show ifb0 >/dev/null 2>&1; then
   ip link set dev ifb0 up 2>/dev/null || true
   ip link set dev ifb0 txqueuelen "$TXQUEUELEN" 2>/dev/null || true
   tc qdisc add dev "$IFACE" handle ffff: ingress 2>/dev/null || true
   tc filter add dev "$IFACE" parent ffff: protocol ip u32 match u32 0 0 action mirred egress redirect dev ifb0 2>/dev/null || true
-  build_per_user_htb ifb0 "$UPLOAD_SHAPE_MBIT" "src"
+  build_per_user_htb ifb0 "$UPLOAD_SHAPE_MBIT" "src" || UL_OK=0
 fi
-exit 0
+[ "$DL_OK" -eq 1 ] && [ "$UL_OK" -eq 1 ] && exit 0
+exit 1
 RUNTIME
     chmod +x /usr/local/sbin/qos-root-init.sh
 
@@ -521,11 +462,8 @@ else
     ok "(ข้าม — check-only)"
 fi
 
-# ============================================================================
 step "7/10 — ตรวจสอบ/ตั้งค่า dropbear + danted(SOCKS5 TCP/UDP) + udp-custom"
-# ============================================================================
 if [ "$CHECK_ONLY" -eq 0 ]; then
-    # --- dropbear ---
     if ! grep -q 'DROPBEAR_PORT=2345' /etc/default/dropbear 2>/dev/null; then
         cat > /etc/default/dropbear << 'EOF'
 NO_START=0
@@ -541,7 +479,6 @@ ExecStart=/usr/sbin/dropbear -R -F -p 2345
 EOF
     DROPBEAR_PORT=2345
 
-    # --- danted (SOCKS5, TCP+UDP — protocol/command ถูกต้องอยู่แล้วตามต้นฉบับ) ---
     SOCKS5_PORT=$(cat "$SOCKS5_PORT_FILE" 2>/dev/null); [ -z "$SOCKS5_PORT" ] && SOCKS5_PORT=1080
     if command -v danted >/dev/null 2>&1; then
         HOLDER=$(ss -lntup 2>/dev/null | awk -v p=":$SOCKS5_PORT" '$4 ~ p"$" {print $0}')
@@ -571,14 +508,13 @@ EOF
             chmod 644 "$SOCKS5_CONF"
         fi
         mkdir -p /etc/systemd/system/danted.service.d
-        rm -f /etc/systemd/system/danted.service.d/override.conf   # ลบไฟล์เดี่ยวเก่า กันซ้อนกับ 99-tuning.conf ในขั้นตอน 8
+        rm -f /etc/systemd/system/danted.service.d/override.conf
         echo "$SOCKS5_PORT" > "$SOCKS5_PORT_FILE" 2>/dev/null
         ok "danted config พร้อม (protocol tcp+udp, udpassociate เปิดอยู่) พอร์ต ${SOCKS5_PORT}"
     else
         warn "ไม่พบ danted ติดตั้งอยู่ (ตรวจสอบว่า install-server.sh รันสำเร็จหรือยัง)"
     fi
 
-    # --- udp-custom ---
     UDP_PORT=$(grep -oP '"listen"\s*:\s*"[^"]*:\K[0-9]+' "$UDP_CFG" 2>/dev/null); [ -z "$UDP_PORT" ] && UDP_PORT=36712
     if [ -x "${UDP_DIR}/udp-custom" ]; then
         if [ ! -f /etc/systemd/system/udp-custom.service ]; then
@@ -602,7 +538,6 @@ EOF
         warn "รัน: sudo bash install-server.sh (จาก smng.zip) ก่อน 1 ครั้ง แล้วค่อยรันไฟล์นี้ใหม่"
     fi
 
-    # nftables: เปิดพอร์ตหลัก 3 ตัวแบบ accept ตรง (กันหลุดถ้า set blocked_* ถูกแก้ผิดจากเมนู)
     if [ -f /etc/nftables.conf ] && ! grep -q 'tunnel-stack-master-ports' /etc/nftables.conf; then
         sed -i "/chain input {/a\\        tcp dport { ${DROPBEAR_PORT}, ${SOCKS5_PORT} } accept comment \"tunnel-stack-master-ports\"\\n        udp dport { ${SOCKS5_PORT}, ${UDP_PORT} } accept comment \"tunnel-stack-master-ports\"" /etc/nftables.conf
         nft -c -f /etc/nftables.conf >/dev/null 2>&1 && nft -f /etc/nftables.conf 2>/dev/null && systemctl restart nftables 2>/dev/null
@@ -615,16 +550,13 @@ else
     ok "(ข้าม — check-only)"
 fi
 
-# ============================================================================
 step "8/10 — [FIX-4] รวม systemd hardening + watchdog เหลือชุดเดียว"
-# ============================================================================
 if [ "$CHECK_ONLY" -eq 0 ]; then
-    # [FIX-5] รายชื่อ service จริงบนเครื่อง — เอา hev-socks5-tunnel (client-side) ออก
     ALL_SERVICES="dropbear danted udp-custom"
 
     for svc in $ALL_SERVICES; do
         systemctl list-unit-files "${svc}.service" >/dev/null 2>&1 || continue
-        rm -f "/etc/systemd/system/${svc}.service.d/override.conf"  # ลบไฟล์เดี่ยวเก่าจากรอบก่อนๆ
+        rm -f "/etc/systemd/system/${svc}.service.d/override.conf"
         mkdir -p "/etc/systemd/system/${svc}.service.d"
         PROXY_CPU_DIRECTIVE=""
         [ -n "$PROXY_CPU_RANGE" ] && PROXY_CPU_DIRECTIVE="CPUAffinity=${PROXY_CPU_RANGE}"
@@ -648,7 +580,6 @@ EOF
     systemctl daemon-reload
     ok "systemd hardening (Nice/OOM/CPUAffinity/Restart=always/LimitNOFILE) เหมือนกันทั้ง 3 service"
 
-    # ลบ watchdog ซ้ำซ้อนตัวเก่าจากรอบก่อนๆ (ถ้ามี) ให้เหลือ tunnel-selfheal ตัวเดียว
     if systemctl list-unit-files tunnel-watchdog.timer >/dev/null 2>&1; then
         systemctl disable --now tunnel-watchdog.timer >/dev/null 2>&1 || true
         rm -f /etc/systemd/system/tunnel-watchdog.{service,timer} /usr/local/bin/tunnel-watchdog.sh
@@ -670,7 +601,14 @@ CUR_MTU=$(cat /sys/class/net/"${IFACE}"/mtu 2>/dev/null || echo 0)
 QDISC_OK=1
 tc qdisc show dev "${IFACE}" 2>/dev/null | grep -q "qdisc htb 1:" || QDISC_OK=0
 tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc htb 1:" || QDISC_OK=0
-[ "$QDISC_OK" -eq 0 ] && /usr/local/sbin/qos-root-init.sh >/dev/null 2>&1
+LINKED_DL=$(tc filter show dev "${IFACE}" 2>/dev/null | grep -c "ht 8:")
+LINKED_UL=$(tc filter show dev ifb0 2>/dev/null | grep -c "ht 8:")
+[ "$LINKED_DL" -lt "${HASH_DIVISOR:-256}" ] && QDISC_OK=0
+[ "$LINKED_UL" -lt "${HASH_DIVISOR:-256}" ] && QDISC_OK=0
+if [ "$QDISC_OK" -eq 0 ]; then
+    logger -t tunnel-selfheal "HTB per-user hash ไม่ครบ (dl=${LINKED_DL} ul=${LINKED_UL} ต้องการ ${HASH_DIVISOR:-256}) -> rebuild qos-root-init.sh"
+    /usr/local/sbin/qos-root-init.sh >/dev/null 2>&1
+fi
 
 /usr/local/sbin/set-multiqueue.sh >/dev/null 2>&1
 /usr/local/sbin/set-rps.sh >/dev/null 2>&1
@@ -725,9 +663,7 @@ else
     ok "(ข้าม — check-only)"
 fi
 
-# ============================================================================
 step "9/10 — เขียน /etc/tunnel-qos.conf (single source of truth) + restart ทุก service"
-# ============================================================================
 if [ "$CHECK_ONLY" -eq 0 ]; then
     DROPBEAR_PORT=2345
     SOCKS5_PORT=$(cat "$SOCKS5_PORT_FILE" 2>/dev/null); [ -z "$SOCKS5_PORT" ] && SOCKS5_PORT=1080
@@ -769,9 +705,7 @@ else
     ok "(ข้าม — check-only)"
 fi
 
-# ============================================================================
 step "10/10 — ตรวจสุขภาพรวมทั้งสแตก + เช็ค conflict (health & conflict dashboard)"
-# ============================================================================
 source /etc/tunnel-qos.conf 2>/dev/null || true
 DROPBEAR_PORT="${DROPBEAR_PORT:-2345}"; SOCKS5_PORT="${SOCKS5_PORT:-1080}"; UDP_PORT="${UDP_PORT:-36712}"
 
@@ -795,12 +729,18 @@ CUR_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
 IPV6_DIS=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null)
 [ "$IPV6_DIS" = "1" ] && ok "IPv6: disabled" || warn "IPv6: ยังไม่ disable เต็มที่ (reboot ถ้าเพิ่งแก้ GRUB)"
 
-if tc qdisc show dev "$IFACE" 2>/dev/null | grep -q "qdisc htb 1:"; then
-    ok "HTB per-user shaping: active บน ${IFACE} (divisor=${HASH_DIVISOR}, แก้บั๊กเดิมแล้ว)"
+DL_LINKED=$(tc filter show dev "$IFACE" 2>/dev/null | grep -c "ht 8:")
+UL_LINKED=$(tc filter show dev ifb0 2>/dev/null | grep -c "ht 8:")
+if tc qdisc show dev "$IFACE" 2>/dev/null | grep -q "qdisc htb 1:" && [ "$DL_LINKED" -ge "$HASH_DIVISOR" ]; then
+    ok "HTB per-user shaping (download): active บน ${IFACE} — ${DL_LINKED}/${HASH_DIVISOR} bucket ผูกครบ"
 else
-    bad "HTB shaping: ยังไม่ทำงานบน ${IFACE} — รัน: sudo /usr/local/sbin/qos-root-init.sh (ตอนนี้ error จะโชว์ตรงๆ ไม่ถูกซ่อนแล้ว)"
+    bad "HTB shaping (download): ไม่สมบูรณ์บน ${IFACE} (${DL_LINKED}/${HASH_DIVISOR} bucket) — รัน: sudo /usr/local/sbin/qos-root-init.sh เพื่อดู error สด"
 fi
-tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc htb 1:" && ok "HTB upload shaping (ifb0): active" || warn "ifb0 shaping ยังไม่ขึ้น (เช็คว่า modprobe ifb สำเร็จหรือไม่)"
+if tc qdisc show dev ifb0 2>/dev/null | grep -q "qdisc htb 1:" && [ "$UL_LINKED" -ge "$HASH_DIVISOR" ]; then
+    ok "HTB per-user shaping (upload/ifb0): active — ${UL_LINKED}/${HASH_DIVISOR} bucket ผูกครบ"
+else
+    warn "HTB shaping (upload/ifb0): ไม่สมบูรณ์ (${UL_LINKED}/${HASH_DIVISOR} bucket) — เช็คว่า modprobe ifb สำเร็จหรือไม่"
+fi
 
 echo -e "\n${C}--- Services ---${NC}"
 for chk in "dropbear:${DROPBEAR_PORT}" "danted:${SOCKS5_PORT}" "udp-custom:${UDP_PORT}"; do
@@ -818,7 +758,7 @@ swapon --show 2>/dev/null | grep -q swapfile && ok "swap: active" || warn "swap:
 
 echo
 echo -e "${G}เสร็จสิ้น — สแตกทั้งหมดรวมเป็นไฟล์เดียว ทำงานร่วมกันแล้ว${NC}"
-echo "  • HTB shaping ใช้ divisor=256 (ค่าสูงสุดจริงที่ kernel รองรับ) แทน 16384 เดิมที่ fail เงียบๆ มาตลอด"
+echo "  • HTB shaping: divisor=256, handle 8: ระบุชัด, hashkey offset แยก src(12)/dst(16), bucket เป็น hex, leaf match แก้ syntax แล้ว"
 echo "  • ไฟร์วอลล์เหลือ nftables ตัวเดียว, sysctl เหลือไฟล์เดียว, watchdog เหลือตัวเดียว"
 echo "  • ความจุออกแบบไว้: ${MAX_CAPACITY_USERS} คน (ปรับ CAPACITY_PER_VCPU=$CAPACITY_PER_VCPU ในสคริปต์นี้ได้ถ้าต้องการเปลี่ยนสัดส่วน)"
 echo -e "${Y}ถ้าเพิ่งแก้ GRUB (ipv6.disable=1) เป็นครั้งแรก ให้ reboot เครื่อง 1 ครั้งเพื่อให้ครบสมบูรณ์${NC}"
